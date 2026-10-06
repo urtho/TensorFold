@@ -6,6 +6,8 @@ pub const Error = @import("driver.zig").Error;
 pub const Context = @import("context.zig").Context;
 pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
 pub const HostBuffer = @import("memory.zig").HostBuffer;
+pub const carveout = @import("carveout.zig");
+pub const Carveout = carveout.Carveout;
 pub const Stream = @import("stream.zig").Stream;
 pub const Event = @import("stream.zig").Event;
 pub const Module = @import("module.zig").Module;
@@ -27,4 +29,5 @@ test {
     _ = abi;
     _ = aot;
     _ = segments;
+    _ = carveout;
 }
