@@ -261,7 +261,17 @@ copy none of it into this Apache-2.0 tree.
       compiles once on the first start that runs it (prebuild does not run kernels)
 - [ ] Exact-chunk TTFT mode
 - [ ] More narrow decode widths (each width's graphs cost ~40 MB a graph of driver memory)
-- [ ] L2 prefetch sweep (`TF_L2_PREFETCH=bulk` sites measured only together)
+- [x] L2 prefetch sweep: unpaced bulk sites alone / in pairs / together within 0.4 ms of off; paced at 150 GB/s
+      (`l2pace.cu`, after jayleaton's G14; all sites, joined at the step's end) the default: 1 / 2 / 4-row windows
+      25.2 / 29.9 / 37.9 -> 24.1 / 28.5 / 36.5 ms, single requests code +3.6%, prose +5%, structured +2.6%, c1 +2.3%
+- [x] In-engine measurement mode (`dsv41_serial_run.py --jaybench`, DEV.md) with the round split (`TF_ROUND_PROF`):
+      window graph ~89% of a round, drafter ~10%, host + sync ~0.5 ms
+- [x] Draft policy reset a request (`TF_DSV41_DRAFT_RESET`), prior 0.6 -> 0.8, relax 0.02 toward it in undrafted
+      rounds (a stream that stopped drafting never drafted again): prose 40.4 -> 42.3, hard 38.9 -> 47.4 single
+- [ ] Draft policy: 6-row windows (48.5 ms) vs 4 rows (37.9): a per-k cost model with the drafter's 5 ms and the
+      relax / prior under concurrent load (16 clients) not swept
+- [ ] jayleaton's 1-row window 21.7 ms vs ours 24.1 with pacing: his remaining levers (BRANCHES side priority,
+      ROCE_FAST, plan link) not ported
 - [ ] Engine vs reference layer-diff (94.5% -> ~99% agreement)
 - [ ] Eager == graph per width
 - [ ] Mapped-table accounting in capacity

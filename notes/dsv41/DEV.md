@@ -72,6 +72,48 @@ fresh run printed the suite's fingerprint (`out/suite-<stamp>/prove.txt`).
 equal from the prepared folders and from the checkpoint. chunk-prefill's fingerprint holds the whole prefill's
 last-row logits (sha256 of the bytes), the others the decoded tokens / view hashes.
 
+## Measurement mode: single requests as the server runs them
+
+    TF_COMM=rdma TF_ROUND_PROF=1 TF_DECODE_ROWS=1,2,4 tools/dsv41_run2.sh --cap 131072 --slots 2 --dspark 5 --graph \
+      --decode-bench 2048 --jaybench code,prose,structured,c1 [--jb-serial] [--jb-carry] [--jb-reps 3]
+
+`--jaybench` sends each workload as one request through `MultiDecoder` (the server's decoder at `PARALLEL` > 1: admit,
+rounds until done, finish; rank 1 follows), after one warm-up, `--jb-reps` times: code / prose / structured are
+jayleaton's m2bench prompts (greedy, thinking off, chat template, 384 tokens), c1 / hard bench_decode's C1 and C1hard
+prompts with a fixed nonce (T 0.2, top-k 20, top-p 0.95, 2048 tokens). Each line: the median first-to-last-token tok/s
+(as `out/jaybench/jaybench.py` measures over HTTP), rounds, tokens and rows verified a round, drafts proposed /
+accepted and the reply's token sha; `--jb-serial` decodes each workload once more without drafts and checks the sha.
+The draft policy's running estimate is reset before every request, so identical requests plan identical rounds in one
+process (the cost curves are timed at start: two processes can differ by a few rounds); `--jb-carry` keeps it across
+requests as `TF_DSV41_DRAFT_RESET=0` would. `--cap 131072` keeps the server's 65536-key narrow graphs in play, `--dspark
+5` its draft count, `TF_COMM=rdma` its all-gathers. With `--decode-bench 2048` and `TF_DECODE_ROWS` the window costs
+(1 / 2 / 4 rows) and the drafter graph come first, in the same process.
+
+`TF_ROUND_PROF=1` adds the round split (`multi.RoundSplit`, rank 0): host ms for plan, send (the ROUND message to rank 1),
+draft (the drafting pass with its sync), hash / gather0 / gather1 (Engram hashes, the table reads while the window
+runs), wait (for the window's end), post; GPU ms of the window graph and the drafting pass (CUDA events); the window by
+verified rows. Measured 2026-10-06 (the draft policy below, no L2 prefetch):
+
+| workload | round | window GPU | draft GPU | host + sync | tokens a round | rows a round |
+|---|---|---|---|---|---|---|
+| code | 51.2 ms | 45.6 | 5.1 | 0.5 (send 0.37) | 4.04 | 5.4 |
+| prose | 36.8 ms | 33.0 | 3.4 (4.9 in drafting rounds) | 0.5 (send 0.31) | 1.58 | 2.5 |
+| structured | 51.4 ms | 45.7 | 5.1 | 0.6 (send 0.44) | 5.91 | 5.9 |
+
+The window graph is ~89% of a round, the drafter ~10%, host and sync ~1%. Windows at 2048 tokens: 1 / 2 / 4 / 6 rows
+25.2 / 29.9 / 37.9 / 48.5 ms; drafter graph 5.1 ms.
+
+Draft policy (`multi.py`): each request's acceptance estimates start at `TF_DSV41_DRAFT_PRIOR` (0.8), and a stream that
+stopped drafting drifts back toward it (`TF_DSV41_DRAFT_RELAX`, 0.02 a round without drafts: its estimates only move in
+drafted rounds, so before this a stream that stopped never drafted again). `TF_DSV41_DRAFT_RESET=0` carries the running
+estimate across requests as before. Single requests: old start (0.6, carried) code 76.9-78.0, prose 39.8-41.5,
+structured 109.1-114.1, c1 98.7-99.3, hard 38.8; now 77.3-79.8 / 42.3 / 114.0 / 99.5, hard 47.4.
+
+L2 prefetch (`serial.py`, default `TF_L2_PREFETCH=bulk`, paced at `TF_L2_PACE_GBPS=150` through `l2pace.cu`, all three
+sites, joined at the step's end; `TF_L2_PREFETCH=0` off, `TF_L2_SITES`, `TF_L2_PACE_CTAS`, `TF_L2_PACE_DELAY_US`,
+`TF_L2_PACE_SITES`, `TF_L2_JOIN=use|end`): 1 / 2 / 4-row windows 25.2 / 29.9 / 37.9 -> 24.1 / 28.5 / 36.5 ms;
+unpaced, each site alone, in pairs or together: within 0.4 ms of off.
+
 ## Prepared weights in dev runs
 
 The compose server's `make prepare` writes each rank's built weights to `PREPARED_DIR`

@@ -121,11 +121,44 @@ class Caches:
 SKIP_READS = os.environ.get("TF_SKIP_READS") == "1"   # timing experiments: stale Engram rows (wrong output)
 # decode / verify: while an all-gather waits on the other rank, a side stream warms L2 with the weights read next
 # (the router and shared expert before the MoE, the next layer's first projections before its attention)
-L2_PREFETCH = os.environ.get("TF_L2_PREFETCH") in ("1", "bulk")
-# "bulk": the three sites (the MoE's router + shared expert during the attention's gather, the next layer's wq_a /
-# wkv during the MoE's, wo_a during the attention core) with cp.async.bulk.prefetch.L2 (kernels.l2_bulk), which holds
-# no SM for the transfer; "1": the older evict-last loads (measured no gain)
-L2_BULK = os.environ.get("TF_L2_PREFETCH") == "bulk"
+# "bulk" (default): the three sites (the MoE's router + shared expert during the attention's gather, the next layer's
+# wq_a / wkv during the MoE's, wo_a during the attention core) with cp.async.bulk.prefetch.L2, paced (below); "1": the
+# older evict-last loads (measured no gain); "0": off. 2026-10-06 (tools/dsv41_serial_run.py --decode-bench 2048
+# --jaybench, TF_DECODE_ROWS=1,2,4): unpaced bulk, every site alone, in pairs or all: windows within 0.4 ms of off (no
+# gain, as measured before); paced at 150 GB/s, all sites, joined at the step's end: 1 / 2 / 4-row windows 25.2 / 29.9
+# / 37.9 -> 24.1 / 28.5 / 36.5 ms, code 78.2 -> 81.1, prose 41.7 -> 43.9, structured 114.6 -> 117.6, c1 99.4 -> 101.6
+# tok/s, the same tokens (100 GB/s the same within noise; 75 and 200 less, 300 none; joined before the consumer: none)
+L2_MODE = os.environ.get("TF_L2_PREFETCH") or "bulk"           # (set and empty: the default)
+L2_PREFETCH = L2_MODE in ("1", "bulk")
+L2_BULK = L2_MODE == "bulk"
+# the bulk sites that run (TF_L2_SITES, a comma list; default all): moe (the router + shared expert during the
+# attention's wo_b all-gather), attn (the next layer's wq_a / wkv during the MoE's all-gather), woa (wo_a during the
+# indexer selection and attention core)
+L2_SITE_NAMES = ("moe", "attn", "woa")
+
+
+def _sites(name: str, default: str) -> frozenset:
+    got = frozenset(v for v in (os.environ.get(name) or default).split(",") if v)
+    if not got <= set(L2_SITE_NAMES) | {"none"}:
+        raise ValueError(f"{name}={os.environ.get(name)}: a comma list of {', '.join(L2_SITE_NAMES)} (or none)")
+    return got - {"none"}
+
+
+L2_SITES = _sites("TF_L2_SITES", ",".join(L2_SITE_NAMES))
+# paced bulk sites (kernels.l2_paced: l2pace.cu after Jay Leaton's G14): TF_L2_PACE_GBPS > 0 issues a site's 32 KiB
+# pieces in order at that rate from TF_L2_PACE_CTAS (2) one-thread CTAs, TF_L2_PACE_DELAY_US (0) after the fork, so
+# ~rate x latency bytes are in flight instead of the whole site (which queued the all-gather beside it behind them);
+# TF_L2_PACE_SITES (default: every running site) names the paced ones
+L2_PACE_GBPS = float(os.environ.get("TF_L2_PACE_GBPS") or 150)          # 0: unpaced (kernels.l2_bulk)
+L2_PACE_CTAS = int(os.environ.get("TF_L2_PACE_CTAS") or 2)
+L2_PACE_DELAY_US = float(os.environ.get("TF_L2_PACE_DELAY_US") or 0)
+L2_PACE_SITES = _sites("TF_L2_PACE_SITES", ",".join(L2_SITE_NAMES))
+# where the prefetch stream rejoins the main one: "use" (before the weights' consumer, as before) or "end" (only at
+# the step's end: a paced site still streaming never holds its consumer back; the default when paced). Prefetches
+# only read weights, so the join orders nothing the step computes.
+L2_JOIN = os.environ.get("TF_L2_JOIN") or ("end" if L2_PACE_GBPS > 0 else "use")
+if L2_JOIN not in ("use", "end"):
+    raise ValueError(f"TF_L2_JOIN={L2_JOIN}: use or end")
 PF_WOA = os.environ.get("TF_PF_WOA") == "1"            # (experiment) wo_a weights into L2 during the attention core   # measured: no gain at one row (and idle gaps before the gather)
 SKIP_SHARED = os.environ.get("TF_SKIP_SHARED") == "1"
 PF_PROGRAMS = int(os.environ.get("TF_PF_PROGRAMS") or 4)
@@ -463,7 +496,8 @@ class SerialEngine:
         self.par = Par()
         self._pf_stream, self._pf_moe, self._pf_attn, self._pf_woa = None, {}, {}, {}
         table = K.bulk_table if L2_BULK else K.prefetch_table
-        if PF_WOA or L2_BULK:
+        on = (lambda site: site in L2_SITES) if L2_BULK else (lambda site: True)
+        if PF_WOA or (L2_BULK and on("woa")):
             self._pf_stream = torch.cuda.Stream()
             for lw in w.layers:
                 if lw.attn.wo_a_grouped is not None:
@@ -475,11 +509,19 @@ class SerialEngine:
                 m = lw.moe
                 sh = [t for lin in m.shared[:2] for t in (lin.suh, lin.svh, lin.words)] if L2_BULK else \
                     [m.shared[0].words, m.shared[1].words]
-                self._pf_moe[lw.index] = table([m.gate, *sh])
-                if i + 1 < len(w.layers):
+                if on("moe"):
+                    self._pf_moe[lw.index] = table([m.gate, *sh])
+                if i + 1 < len(w.layers) and on("attn"):
                     a = w.layers[i + 1].attn
                     self._pf_attn[lw.index] = table([a.wq_a.suh, a.wq_a.words, a.wkv.suh, a.wkv.words] if L2_BULK
                                                     else [a.wq_a.words, a.wkv.words])
+        if L2_BULK and comm.rank == 0:
+            mib = {n: sum(int(t[1].sum()) for t in d.values()) / 2 ** 20 / max(len(d), 1)
+                   for n, d in (("moe", self._pf_moe), ("attn", self._pf_attn), ("woa", self._pf_woa)) if d}
+            pace = (f"; paced {','.join(sorted(L2_PACE_SITES & L2_SITES))} at {L2_PACE_GBPS:g} GB/s over "
+                    f"{L2_PACE_CTAS} CTA(s), delay {L2_PACE_DELAY_US:g} us" if L2_PACE_GBPS > 0 else "")
+            print(f"[serial] L2 bulk prefetch: sites {', '.join(f'{n} {v:.2f} MiB a layer' for n, v in mib.items())}"
+                  f"{pace}; join at {L2_JOIN}", flush=True)
         self._rp = RoundProfile() if os.environ.get("TF_ROUND_PROF") else None
         self.pool = None                                            # tensorfold.cuda.kv_pool.PrefixPool, when kept
         self.state = None
@@ -939,7 +981,7 @@ class SerialEngine:
             if self.debug is not None:
                 self.debug.append({"layer": layer.index, "moe_in": x.clone(), "X": X.clone(),
                                    "f": f.clone() if torch.is_tensor(f) else None})
-        self._join()                                                    # (a graph ends with every stream joined)
+        self._join(final=True)                                          # (a graph ends with every stream joined)
         self._deq_comp = None                                          # (its scratch back to the allocator)
         return X, pre, f, post, comb
 
@@ -1381,7 +1423,7 @@ class SerialEngine:
         if R <= PROMPT_ROWS:                                            # independent: q, window KV, compressor
             (qr, q), _, _ = self.par(q_branch, kv_branch, comp_branch)
             if L2_BULK and L in self._pf_woa:
-                self._prefetch(self._pf_woa[L])                         # wo_a streams in during selection + core
+                self._prefetch(self._pf_woa[L], site="woa")             # wo_a streams in during selection + core
         else:
             qr, q = q_branch()
             kv_branch()
@@ -1422,7 +1464,7 @@ class SerialEngine:
             z = torch.cat([wo(o[:, g]) for g, wo in enumerate(a.wo_a)], dim=1)
         pf = self._pf_moe.get(L) if R <= PROMPT_ROWS else None        # the MoE's router + shared expert, meanwhile
         return self.comm.partials_rows(lambda r0, r1: a.wo_b(z[r0:r1], out_dtype=F32 if R <= PROMPT_ROWS else BF), R,
-                                       during=(lambda: self._prefetch(pf)) if pf is not None else None)
+                                       during=(lambda: self._prefetch(pf, site="moe")) if pf is not None else None)
 
     def select(self, layer: LayerW, qr: torch.Tensor, x: torch.Tensor, pos: torch.Tensor,
                static: bool = True) -> torch.Tensor:
@@ -1520,19 +1562,26 @@ class SerialEngine:
             else:
                 ik_t.index_copy_(0, slot, K.rope(key, start, cos, sin))
 
-    def _prefetch(self, table, programs: int = 48) -> None:
+    def _prefetch(self, table, programs: int = 48, site: str = "") -> None:
         """Warm L2 with ``table``'s weights on the prefetch stream (joined by ``_join``)."""
 
         main, side = torch.cuda.current_stream(), self._pf_stream
         side.wait_stream(main)
         with torch.cuda.stream(side):
-            if L2_BULK:
+            if L2_BULK and L2_PACE_GBPS > 0 and site in L2_PACE_SITES:
+                K.l2_paced(table, L2_PACE_GBPS, L2_PACE_CTAS, L2_PACE_DELAY_US)
+            elif L2_BULK:
                 K.l2_bulk(table)
             else:
                 K.l2_prefetch(table, programs)
         self._pf_live = True
 
-    def _join(self) -> None:
+    def _join(self, final: bool = False) -> None:
+        """The prefetch stream back into the main one: before a consumer (TF_L2_JOIN=use), else only where ``layers``
+        ends (``final``: every captured graph or graph segment ends with its streams joined)."""
+
+        if not final and L2_JOIN == "end":
+            return
         if getattr(self, "_pf_live", False):
             torch.cuda.current_stream().wait_stream(self._pf_stream)
             self._pf_live = False
@@ -1569,7 +1618,8 @@ class SerialEngine:
             routed, shared = self.par(routed_rows, lambda: m.shared[2](shared_act(), out_dtype=F32))
             main_layer = layer.index < len(self.scratch) and scratch is self.scratch[layer.index]   # (not drafter)
             pf = self._pf_attn.get(layer.index) if main_layer else None
-            return self.comm.partials(routed + shared, during=(lambda: self._prefetch(pf)) if pf is not None else None)
+            return self.comm.partials(routed + shared,
+                                      during=(lambda: self._prefetch(pf, site="attn")) if pf is not None else None)
         pick, w = route()
         routed = routed_prompt(x.contiguous(), pick, w, m.experts, scratch, R, limit)
         act = shared_act()

@@ -8,6 +8,8 @@ per 16 heads; chunks of keys run as separate programs and a merge adds the sink 
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -1305,7 +1307,7 @@ def _l2_bulk(ADDR, BYTES, n, CHUNK: tl.constexpr, B: tl.constexpr):
                                       dtype=tl.int32, is_pure=False, pack=1)
 
 
-def bulk_table(tensors: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+def bulk_table(tensors: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(addresses, bytes) of tensors' storage for ``l2_bulk``: 16-byte aligned starts, sizes a multiple of 16."""
 
     dev = tensors[0].device
@@ -1317,12 +1319,33 @@ def bulk_table(tensors: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]
         if n > 0:
             addr.append(a + lead)
             size.append(n)
-    return (torch.tensor(addr, dtype=torch.int64, device=dev), torch.tensor(size, dtype=torch.int64, device=dev))
+    a = torch.tensor(addr, dtype=torch.int64, device=dev)
+    b = torch.tensor(size, dtype=torch.int64, device=dev)
+    return a, b, torch.stack([a, b], 1).contiguous()           # (the last: l2_paced's [n, 2] form)
 
 
-def l2_bulk(table: tuple[torch.Tensor, torch.Tensor], programs: int = 2) -> None:
-    addr, size = table
+def l2_bulk(table: tuple[torch.Tensor, ...], programs: int = 2) -> None:
+    addr, size = table[:2]
     _l2_bulk[(programs,)](addr, size, addr.numel(), CHUNK=32768, B=128, num_warps=4)
+
+
+@functools.lru_cache(maxsize=1)
+def _l2pace():
+    """l2pace.cu (adapted from Jay Leaton's G14 paced prefetch, MIT; THIRD_PARTY_NOTICES.md)."""
+
+    from pathlib import Path
+
+    from tensorfold.cuda.build import load
+
+    return load("tf_dsv41_l2pace_v1", [str(Path(__file__).with_name("l2pace.cu"))], extra_cuda_cflags=["-O3"])
+
+
+def l2_paced(table: tuple[torch.Tensor, ...], gbps: float, ctas: int = 2, delay_us: float = 0.0,
+             chunk: int = 32768) -> None:
+    """``l2_bulk``'s pieces issued in table order at ``gbps`` GB/s from ``ctas`` one-thread CTAs (l2pace.cu), the first
+    ``delay_us`` after the launch: ~gbps x latency bytes in flight instead of the whole site."""
+
+    _l2pace().paced(table[2], ctas, chunk, max(1, int(round(chunk / gbps))), int(round(delay_us * 1e3)))
 
 
 @triton.jit
