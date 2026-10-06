@@ -43,6 +43,17 @@ RELEASE_BELOW = int(float(os.environ.get("TF_DSV41_RELEASE_BELOW_GIB") or 2.5) *
 # the NVMe tier (``kvdisk``): a kept state on disk is restored when it covers this many more tokens than the best
 # kept state in the pool (a restore costs the read; fewer tokens prefill about as fast)
 DISK_GAIN = int(os.environ.get("TF_DSV41_DISK_GAIN") or 1024)
+# a request's draft acceptance estimates (by draft position) start at DRAFT_PRIOR when DRAFT_RESET is on: identical
+# requests then plan identical rounds, whatever ran before them (in one process: the cost curves are timed at start).
+# TF_DSV41_DRAFT_RESET=0: they start from the running estimate over earlier requests (``MultiDecoder.prior``), as
+# before. Draft counts never change a token.
+DRAFT_RESET = os.environ.get("TF_DSV41_DRAFT_RESET", "1") != "0"
+DRAFT_PRIOR = float(os.environ.get("TF_DSV41_DRAFT_PRIOR") or 0.8)
+# a stream's estimates move this share of the way back to DRAFT_PRIOR each round it verifies no drafts: one that
+# stopped drafting (its estimates are only updated by drafted rounds) tries again later instead of never (0: off).
+# 2026-10-06, single requests (tools/dsv41_serial_run.py --jaybench): prior 0.6 without it (the old start) code 78.0,
+# prose 40.4, structured 109.1, c1 98.7 tok/s; 0.8 + 0.02: 77.3-79.8 / 42.3 / 114.0 / 99.5, hard 38.9 -> 47.4
+DRAFT_RELAX = float(os.environ.get("TF_DSV41_DRAFT_RELAX") or 0.02)
 
 
 @dataclass(eq=False)
@@ -102,6 +113,69 @@ def unpack_sampling(words: list[int]):
 
 
 
+class RoundSplit:
+    """TF_ROUND_PROF=1: where each round's time goes on rank 0. Host marks (ms since the previous mark): fill (a
+    prompt step, if any), plan (draft allocation), send (the ROUND message to rank 1: an exchange), draft (the
+    drafting pass, its sync included), hash / gather0 / gather1 / wait (``step_multi``: Engram hashes before the
+    launch, the two table reads while the window runs, then the wait for its end), post (accept / sample / roll
+    back), emit (tokens to the stream); GPU spans by CUDA events: draft_gpu (drafting pass), window_gpu (the verify
+    window's graph, launch to end). Rounds are kept by verified rows."""
+
+    HOST = ("fill", "plan", "send", "draft", "hash", "gather0", "gather1", "wait", "post", "emit")
+
+    def __init__(self) -> None:
+        self.rounds: list[dict] = []
+        self.cur: dict = {}
+        self.ev: dict = {}
+        self.t = self.t0 = 0.0
+
+    def begin(self, t0: float) -> None:
+        self.cur, self.ev, self.t0, self.t = {}, {}, t0, t0
+
+    def mark(self, name: str) -> None:
+        now = time.perf_counter()
+        self.cur[name] = self.cur.get(name, 0.0) + 1e3 * (now - self.t)
+        self.t = now
+
+    def event(self, name: str) -> None:
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        self.ev[name] = e
+
+    def end(self, rows: int) -> None:
+        r = self.cur
+        r["round"] = 1e3 * (time.perf_counter() - self.t0)
+        r["rows"] = rows
+        ev = self.ev
+        if "d0" in ev and "d1" in ev:
+            r["draft_gpu"] = ev["d0"].elapsed_time(ev["d1"])
+        if "w0" in ev and "w1" in ev:
+            r["window_gpu"] = ev["w0"].elapsed_time(ev["w1"])
+        self.rounds.append(r)
+
+    def take(self) -> list[dict]:
+        out, self.rounds = self.rounds, []
+        return out
+
+    @staticmethod
+    def summary(rounds: list[dict]) -> dict:
+        """Mean ms a round of every part (over all rounds), and of the window by verified rows."""
+
+        n = max(len(rounds), 1)
+        keys = [*RoundSplit.HOST, "draft_gpu", "window_gpu", "round"]
+        out = {k: sum(r.get(k, 0.0) for r in rounds) / n for k in keys}
+        out["rounds"] = len(rounds)
+        by = {}
+        for r in rounds:
+            if "window_gpu" in r:
+                by.setdefault(r["rows"], []).append(r["window_gpu"])
+        out["window_by_rows"] = {k: (sum(v) / len(v), len(v)) for k, v in sorted(by.items())}
+        drafted = [r["draft_gpu"] for r in rounds if "draft_gpu" in r]
+        out["draft_gpu_when"] = sum(drafted) / len(drafted) if drafted else 0.0
+        out["drafting_rounds"] = len(drafted)
+        return out
+
+
 class MultiDecoder:
     """The ``tensorfold.cuda.scheduler.Scheduler``'s decoder over ``SerialEngine`` slots (rank 0 or 1 of two)."""
 
@@ -153,7 +227,13 @@ class MultiDecoder:
         self.draft_ms = 0.0
         self.draft_curve: list[float] = []
         self.overhead = 2.0                        # a round's host ms besides the forward and drafts
-        self.prior = [0.6] * max(self.drafts, 1)   # acceptance by draft position, over every stream (new ones start here)
+        # acceptance by draft position: a new stream starts at prior0 (DRAFT_RESET) or at prior, the running estimate
+        # over every stream so far
+        self.reset_prior = DRAFT_RESET
+        self.prior0 = [DRAFT_PRIOR] * max(self.drafts, 1)
+        self.prior = list(self.prior0)
+        # TF_ROUND_PROF=1 (rank 0): each round's host and GPU split (``RoundSplit``), read and cleared by the caller
+        self.rsplit = RoundSplit() if os.environ.get("TF_ROUND_PROF") and rank == 0 else None
         import os as _os
 
         # while streams decode, prompt steps take this share of the time (the rest: decode rounds)
@@ -320,6 +400,12 @@ class MultiDecoder:
             hit = 1.0 if j < m else 0.0
             s.acc[j] = (1 - a) * s.acc[j] + a * hit
             self.prior[j] = (1 - a / 4) * self.prior[j] + a / 4 * hit
+
+    def reset_policy(self) -> None:
+        """The running acceptance estimate back to its start (a measurement's requests then plan as a fresh server's
+        first request would, whatever ran before)."""
+
+        self.prior = list(self.prior0)
 
     # -- bookkeeping --------------------------------------------------------------------------------------------
     def live(self) -> int:
@@ -731,7 +817,7 @@ class MultiDecoder:
 
     def _queue(self, s: Stream, base: int = -1, size: int = -1, eid: int = -1, mode: int = FRESH,
                k: Kept | None = None, m: int = 0) -> None:
-        s.acc = list(self.prior)
+        s.acc = list(self.prior0 if self.reset_prior else self.prior)
         s.slot = self.free.pop(0)
         s.pos = -1                                 # prompt tokens prefilled so far (-1: not started)
         if base >= 0:                              # the stream's extent of the shared pool (rank 1: rank 0's place)
@@ -893,8 +979,14 @@ class MultiDecoder:
         live = [s for s in live if not s.done and not s.waiting and s not in self.yielded]
         if not live:
             return done
+        rs = self.rsplit
+        if rs is not None:
+            rs.begin(tr)
+            rs.mark("fill")
         plan = self._plan(live)
+        rs is not None and rs.mark("plan")
         self._send([ROUND, len(plan), *[x for item in plan for x in item]])
+        rs is not None and rs.mark("send")
         td = time.perf_counter()
         news = self._verify(plan)
         if self.filling:
@@ -906,6 +998,9 @@ class MultiDecoder:
                 s.take(new, self._ends(s))
             else:
                 s.done, s.finished = True, time.perf_counter()
+        if rs is not None:
+            rs.mark("emit")
+            rs.end(sum(k for _, k in plan) + len(plan))
         if self.prof is not None and self.rank == 0:
             self.prof["round"] += time.perf_counter() - tr
         return done + [s for s in live if s.done]
@@ -919,6 +1014,8 @@ class MultiDecoder:
             rows, spans = [], []
             t0 = time.perf_counter()
             want = [(sid, k) for sid, k in plan if k]
+            rs = self.rsplit
+            rs is not None and want and rs.event("d0")
             batched = getattr(e.drafter, "multi_graphs", None) if e.drafter is not None else None
             proposals: dict[int, list[int]] = {}
             if want and batched and len(want) in batched:     # one drafting pass for every drafting stream
@@ -938,8 +1035,14 @@ class MultiDecoder:
                     s.constraint.advance([pending])
                 spans.append((len(rows), len(drafts) + 1, len(e.views[s.slot].ids)))
                 rows += [(s.slot, t) for t in [pending, *drafts]]
+            if rs is not None:
+                want and rs.event("d1")
+                rs.mark("draft")
+                e._rsplit = rs                             # step_multi marks its parts and the window's GPU span
             t1 = time.perf_counter()
             logits, greedy = e.step_multi(rows)
+            if rs is not None:
+                e._rsplit = None
             if self.check and len(rows) > 1:               # debug: row 0 of each stream alone, at the same position
                 main = logits[:len(rows)].float().clone()
                 for (sid, k), (r0, nrows, p0) in zip(plan, spans):
@@ -991,6 +1094,8 @@ class MultiDecoder:
                 del e.views[s.slot].ids[p0 + 1 + m:]           # rejected rows: overwritten later
                 if k:
                     self._learn(s, k, m)
+                elif DRAFT_RELAX > 0:
+                    s.acc = [a + DRAFT_RELAX * (p - a) for a, p in zip(s.acc, self.prior0)]
                 if s.constraint is not None and m:
                     s.constraint.advance(drafts[:m])
                 s.counted(nrows)
@@ -998,6 +1103,7 @@ class MultiDecoder:
                 ends = self._ends(s)                           # a kept draft can be the end token: stop at it
                 cut = next((j + 1 for j, t in enumerate(new) if t in ends), len(new))
                 news.append(new[:min(cut, max(1, s.count - len(s.out)))])
+            rs is not None and rs.mark("post")
             if self.prof is not None and self.rank == 0:
                 self.prof["post"] += time.perf_counter() - t2
             return news

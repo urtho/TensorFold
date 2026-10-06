@@ -114,6 +114,18 @@ def build_parser() -> argparse.ArgumentParser:
                     "every slot, then greedy decode steps over all --slots streams timed (graphs)")
     ap.add_argument("--chunk-test", default="", help="N,k[,k..]: a prompt's rows as one chunk vs split at k: the "
                     "first sublayer where a row's values depend on its chunk (and, with --graph, a <=32-row tail)")
+    ap.add_argument("--jaybench", default="", help="comma list of code, prose, structured (jayleaton's m2bench "
+                    "prompts: greedy, thinking off, --jb-tokens), c1 (bench_decode's C1 prompt: T 0.2, top-k 20, top-p "
+                    "0.95, --jb-c1-tokens), hard: each a single request through MultiDecoder as the server runs it, "
+                    "first-to-last-token tok/s, rounds, rows, drafts (needs --dspark; TF_ROUND_PROF=1: the round split)")
+    ap.add_argument("--jb-reps", type=int, default=3, help="--jaybench: timed requests a workload (the median reported)")
+    ap.add_argument("--jb-tokens", type=int, default=384, help="--jaybench: tokens a code / prose / structured reply")
+    ap.add_argument("--jb-c1-tokens", type=int, default=2048, help="--jaybench: tokens a c1 / hard reply")
+    ap.add_argument("--jb-carry", action="store_true", help="--jaybench: keep the draft policy's running acceptance "
+                    "estimate across requests (TF_DSV41_DRAFT_RESET=0 as a server runs it: warm-ups and earlier "
+                    "workloads steer later ones) instead of resetting it before each request")
+    ap.add_argument("--jb-serial", action="store_true", help="--jaybench: also each workload once without drafts: "
+                    "its tokens must equal the drafted replies'")
     # several tests, one weight load (tools/dsv41_suite.py)
     ap.add_argument("--suite", default="", help="quick | full | long | test names (comma separated): run them in this "
                     "process; the construction (--cap/--slots/--graph/--dspark) comes from the group")
@@ -901,9 +913,146 @@ def mode_prefill_bench(eng, nccl, args, env) -> SU.Result:
                      ", ".join(f"{k} tokens {v:.0f} tok/s" for k, v in metrics["tps"].items()), metrics)
 
 
+# jayleaton's m2bench single-stream prompts (deepseek-v41-tensorfold-spark patches/0002 m2bench.py, MIT License,
+# Copyright (c) 2026 Jay Leaton; THIRD_PARTY_NOTICES.md) and bench_decode's C1 / C1hard prompts with a fixed nonce
+JAYBENCH = {
+    "code": ("Write a Python class `LRUCache` with `get(key)` and `put(key, value)` in O(1) using a dict and a doubly "
+             "linked\nlist, with docstrings and type hints, then three unit tests with pytest.", None),
+    "prose": ("Write a 400-word essay on why lighthouses were built where they were, how their keepers lived, and "
+              "what\nreplaced them. Plain prose, no lists or headings.", None),
+    "structured": ("Count from 1 to 200, separated by commas, nothing else.", None),
+    "c1": ("Benchmark jaybench0: Generate a JSON array of 120 objects with fields id (int), name (string), status "
+           "('active' or 'idle'). Output only JSON.", (0.2, 20, 0.95)),
+    "hard": ("Benchmark jaybench0: write a very long, detailed essay on the history of computing. Keep going until "
+             "you are cut off.", (0.2, 20, 0.95)),
+}
+
+
+def mode_jaybench(eng, nccl, args, env) -> SU.Result:
+    """Single requests through ``MultiDecoder`` (the server's decoder at --parallel > 1): admit, rounds until done,
+    finish; rank 1 follows. Per request: first-to-last-token tok/s (as jaybench.py over HTTP), rounds, tokens a round,
+    rows verified a round, drafts proposed / accepted, the reply's token sha; the median of --jb-reps timed requests
+    after one warm-up. The draft policy's running estimate is reset before every request (--jb-carry: not), so
+    identical requests plan identical rounds. With TF_ROUND_PROF=1 the round split (multi.RoundSplit)."""
+
+    import statistics
+
+    from tokenizers import Tokenizer
+
+    from tensorfold.cuda.chat_template import ChatTemplate
+    from tensorfold.cuda.streams import Stream
+    from tensorfold.engine.exact_sampling import Sampling, seed_for
+    from tensorfold.families.deepseek_v41.cuda import multi as MU
+
+    if eng.drafter is None:
+        raise SystemExit("--jaybench needs --dspark N (the server drafts)")
+    names = [n for n in args.jaybench.split(",") if n]
+    bad = [n for n in names if n not in JAYBENCH]
+    if bad:
+        raise SystemExit(f"--jaybench: unknown workloads {bad} (of {', '.join(JAYBENCH)})")
+    tok = Tokenizer.from_file(str(args.model / "tokenizer.json"))
+    tmpl = ChatTemplate(args.model)
+
+    def share(values):
+        n = torch.tensor([len(values) if args.rank == 0 else 0], dtype=torch.int64, device="cuda")
+        got = torch.empty((2,), dtype=torch.int64, device="cuda")
+        nccl.all_gather(n, got)
+        count = int(got[0])
+        if count == 0:
+            return []
+        mine = (torch.tensor(values, dtype=torch.int64, device="cuda") if args.rank == 0
+                else torch.zeros((count,), dtype=torch.int64, device="cuda"))
+        out = torch.empty((2 * count,), dtype=torch.int64, device="cuda")
+        nccl.all_gather(mine, out)
+        return out[:count].tolist()
+
+    def gather(values):
+        mine = torch.tensor(values, dtype=torch.int64, device="cuda")
+        out = torch.empty((2 * len(values),), dtype=torch.int64, device="cuda")
+        nccl.all_gather(mine, out)
+        return [out[:len(values)].tolist(), out[len(values):].tolist()]
+
+    with torch.no_grad():
+        if not getattr(eng.drafter, "multi_graphs", None):           # the server's batched drafting pass (1 stream too)
+            eng.drafter.capture_multi(max(1, min(args.slots, MU.ROWS // args.dspark)))
+        dec = MU.MultiDecoder(eng, share, rank=args.rank, drafts=args.dspark)
+        dec.model_dir = args.model
+        dec.calibrate(gather)
+        if args.jb_carry:
+            dec.reset_prior = False
+        if args.rank == 1:
+            dec.follow()
+            return SU.Result("jaybench", "INFO", None, "rank 1 followed")
+        if args.rank == 0:
+            print(f"[jaybench] verify ms by rows 1..4: {[round(c, 2) for c in dec.costs[:4]]}, a draft "
+                  f"{dec.draft_ms:.2f} ms; policy {'carried across requests' if args.jb_carry else 'reset a request'}"
+                  f" (prior {dec.prior0[0]:g})", flush=True)
+
+        def one(name: str, draft: bool = True) -> dict:
+            text, samp = JAYBENCH[name]
+            prompt = tok.encode(tmpl.render([{"role": "user", "content": text}], tools=None, enable_thinking=False),
+                                add_special_tokens=False).ids
+            sampling = Sampling(seed_for(prompt), samp[0], samp[1], samp[2], 0.0) if samp else None
+            count = args.jb_c1_tokens if samp else args.jb_tokens
+            times = []
+            s = Stream(list(prompt), count, sampling, draft=draft, stop_eos=True,
+                       emit=lambda new: times.append(time.perf_counter()) and None)
+            if not args.jb_carry:
+                dec.reset_policy()
+            if dec.rsplit is not None:
+                dec.rsplit.take()
+            dec.admit(s)
+            while not s.done:
+                dec.round()
+            dec.finish([s])
+            n = len(s.out)
+            r = {"tokens": n, "prompt": len(prompt), "rounds": s.rounds, "drafted": s.drafted, "accepted": s.accepted,
+                 "tok_s": (n - 1) / (times[-1] - times[0]) if n > 1 and times[-1] > times[0] else 0.0,
+                 "tpr": n / max(s.rounds, 1), "rows": (s.rounds + s.drafted) / max(s.rounds, 1),
+                 "sha": hashlib.sha256(",".join(map(str, s.out)).encode()).hexdigest()[:12]}
+            if dec.rsplit is not None:
+                rounds = [x for x in dec.rsplit.take() if x.get("fill", 0.0) < 1.0]    # (not the prefill's round)
+                r["split"] = MU.RoundSplit.summary(rounds)
+            return r
+
+        facts, metrics, lines = {}, {}, []
+        for name in names:
+            one(name)                                                   # warm-up (as jaybench.py)
+            runs = [one(name) for _ in range(args.jb_reps)]
+            med = statistics.median(r["tok_s"] for r in runs)
+            shas = sorted({r["sha"] for r in runs})
+            rounds = [r["rounds"] for r in runs]
+            m = {"tok_s": med, "runs": runs, "same_tokens": len(shas) == 1, "same_rounds": len(set(rounds)) == 1}
+            if args.jb_serial:
+                ref = one(name, draft=False)
+                m["serial_sha"] = ref["sha"]
+                m["drafted_eq_serial"] = shas == [ref["sha"]]
+            metrics[name] = m
+            facts[name] = shas
+            r = runs[rounds.index(sorted(rounds)[len(rounds) // 2])]
+            reps = ", ".join(f"{x['tok_s']:.2f}" for x in runs)
+            line = (f"[jaybench] {name}: {med:.2f} tok/s (reps {reps}), "
+                    f"{r['tokens']} tokens, rounds {rounds}, {r['tpr']:.3f} tokens a round, {r['rows']:.2f} rows "
+                    f"verified a round, drafts {r['drafted']} proposed / {r['accepted']} accepted, sha {shas}"
+                    + (f", drafted == serial {m['drafted_eq_serial']}" if args.jb_serial else ""))
+            print(line, flush=True)
+            lines.append(f"{name} {med:.2f}")
+            sp = r.get("split")
+            if sp:
+                host = {k: sp[k] for k in MU.RoundSplit.HOST if k != "fill"}
+                print(f"[jaybench] {name} round split (ms a round, {sp['rounds']} rounds): round {sp['round']:.2f} = "
+                      + ", ".join(f"{k} {v:.2f}" for k, v in host.items())
+                      + f"; GPU: window {sp['window_gpu']:.2f}, draft {sp['draft_gpu']:.2f} "
+                      f"({sp['draft_gpu_when']:.2f} in the {sp['drafting_rounds']} drafting rounds); window by rows "
+                      + ", ".join(f"{k}: {v[0]:.2f} (n={v[1]})" for k, v in sp["window_by_rows"].items()), flush=True)
+        share([])                                                       # rank 1's follow returns
+    ok = all(m["same_tokens"] and m.get("drafted_eq_serial", True) for m in metrics.values())
+    return SU.Result("jaybench", "INFO" if ok else "FAIL", facts, ", ".join(lines) + " tok/s", metrics)
+
+
 MODES = {"chunk_test": mode_chunk_test, "views_test": mode_views_test, "quality": mode_quality,
          "decode_bench": mode_decode_bench, "resume_test": mode_resume_test, "step_test": mode_step_test,
-         "multi_test": mode_multi_test, "prefill_bench": mode_prefill_bench}
+         "multi_test": mode_multi_test, "prefill_bench": mode_prefill_bench, "jaybench": mode_jaybench}
 
 
 def single_mode(args) -> str | None:
@@ -913,7 +1062,8 @@ def single_mode(args) -> str | None:
         return None
     for attr, mode in (("chunk_test", "chunk_test"), ("views_test", "views_test"), ("tf_compare", "quality"),
                        ("needle", "quality"), ("decode_bench", "decode_bench"), ("resume_test", "resume_test"),
-                       ("step_test", "step_test"), ("multi_test", "multi_test"), ("prefill_bench", "prefill_bench")):
+                       ("step_test", "step_test"), ("multi_test", "multi_test"), ("prefill_bench", "prefill_bench"),
+                       ("jaybench", "jaybench")):
         if getattr(args, attr):
             return mode
     return None
@@ -1036,6 +1186,12 @@ def main() -> None:
         line = SU.line(r)
         print(line if args.rank == 0 else f"[rank 1] {line}", flush=True)
         nccl.barrier()
+        if args.jaybench and mode == "decode_bench":            # (window costs, then the requests: one weight load)
+            fresh_state(eng)
+            r = mode_jaybench(eng, nccl, args, dict(os.environ))
+            line = SU.line(r)
+            print(line if args.rank == 0 else f"[rank 1] {line}", flush=True)
+            nccl.barrier()
         return
 
     from tensorfold.engine.exact_sampling import Sampling

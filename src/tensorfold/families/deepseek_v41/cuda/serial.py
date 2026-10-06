@@ -1246,14 +1246,18 @@ class SerialEngine:
         h = np.stack(h)                                                 # [R, 2, 24]
         g = self.graph_for(R, max(pos) + 1)
         threads = min(64, max(STEP_READ_THREADS, 4 * R))               # many streams' rows: more reads in flight
+        rs = getattr(self, "_rsplit", None)                             # (multi.RoundSplit, TF_ROUND_PROF)
+        rs is not None and rs.mark("hash")
         t1 = time.perf_counter()
         g["tok"].copy_(torch.tensor([t for _, t in rows]), non_blocking=True)
         g["pos"].copy_(torch.tensor(pos), non_blocking=True)
         g["sid"].copy_(torch.tensor(sid), non_blocking=True)
         one = "one" in g
+        rs is not None and rs.event("w0")
         self._launch(g)
         mine = self.read_cols
         self.tables.gather(h[:, 0, mine].reshape(1, -1), out=g["h_raw"][:1], layers=[0], threads=threads)
+        rs is not None and rs.mark("gather0")
         t2 = time.perf_counter()
         if one:
             self._publish()
@@ -1261,14 +1265,17 @@ class SerialEngine:
             g["raw"][0].copy_(g["h_raw"][0].view_as(g["raw"][0]), non_blocking=True)
             g["a1"].replay()
         self.tables.gather(h[:, 1, mine].reshape(1, -1), out=g["h_raw"][1:], layers=[1], threads=threads)
+        rs is not None and rs.mark("gather1")
         t3 = time.perf_counter()
         if one:
             self._publish()
         else:
             g["raw"][1].copy_(g["h_raw"][1].view_as(g["raw"][1]), non_blocking=True)
             g["b"].replay()
+        rs is not None and rs.event("w1")
         g["h_next"].copy_(g["next"], non_blocking=True)
         torch.cuda.current_stream().synchronize()
+        rs is not None and rs.mark("wait")
         self._check_flags()
         if mp is not None:
             for k, v in (("hash", t1 - t0), ("gather0", t2 - t1), ("gather1", t3 - t2), ("wait", time.perf_counter() - t3)):
