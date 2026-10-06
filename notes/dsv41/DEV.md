@@ -106,7 +106,7 @@ The window graph is ~89% of a round, the drafter ~10%, host and sync ~1%. Window
 Draft policy (`multi.py`): each request's acceptance estimates start at `TF_DSV41_DRAFT_PRIOR` (0.8), and a stream that
 stopped drafting drifts back toward it (`TF_DSV41_DRAFT_RELAX`, 0.02 a round without drafts: its estimates only move in
 drafted rounds, so before this a stream that stopped never drafted again). `TF_DSV41_DRAFT_RESET=0` carries the running
-estimate across requests as before. Single requests: old start (0.6, carried) code 76.9-78.0, prose 39.8-41.5,
+estimate across requests (the old behaviour in full: also `TF_DSV41_DRAFT_RELAX=0 TF_DSV41_DRAFT_PRIOR=0.6`). Single requests: old start (0.6, carried) code 76.9-78.0, prose 39.8-41.5,
 structured 109.1-114.1, c1 98.7-99.3, hard 38.8; now 77.3-79.8 / 42.3 / 114.0 / 99.5, hard 47.4.
 
 L2 prefetch (`serial.py`, default `TF_L2_PREFETCH=bulk`, paced at `TF_L2_PACE_GBPS=150` through `l2pace.cu`, all three

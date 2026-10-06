@@ -45,8 +45,9 @@ RELEASE_BELOW = int(float(os.environ.get("TF_DSV41_RELEASE_BELOW_GIB") or 2.5) *
 DISK_GAIN = int(os.environ.get("TF_DSV41_DISK_GAIN") or 1024)
 # a request's draft acceptance estimates (by draft position) start at DRAFT_PRIOR when DRAFT_RESET is on: identical
 # requests then plan identical rounds, whatever ran before them (in one process: the cost curves are timed at start).
-# TF_DSV41_DRAFT_RESET=0: they start from the running estimate over earlier requests (``MultiDecoder.prior``), as
-# before. Draft counts never change a token.
+# TF_DSV41_DRAFT_RESET=0: they start from the running estimate over earlier requests (``MultiDecoder.prior``); the
+# relax still pulls toward DRAFT_PRIOR (the old behaviour also needs DRAFT_RELAX=0 DRAFT_PRIOR=0.6). Draft counts never
+# change a token.
 DRAFT_RESET = os.environ.get("TF_DSV41_DRAFT_RESET", "1") != "0"
 DRAFT_PRIOR = float(os.environ.get("TF_DSV41_DRAFT_PRIOR") or 0.8)
 # a stream's estimates move this share of the way back to DRAFT_PRIOR each round it verifies no drafts: one that

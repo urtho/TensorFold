@@ -227,7 +227,8 @@ Parts of the DeepSeek-V4.1 serving path are adapted from Jay Leaton's
   `LICENSES/JayLeaton-MIT.txt`. The probe's go / no-go measurement follows the idea of its
   `families/deepseek_v41/cuda/l2probe.py` without its code.
 - The paced L2 prefetch (`src/tensorfold/families/deepseek_v41/cuda/l2pace.cu`, launched by `l2_paced` in `kernels.py`
-  for the `TF_L2_PREFETCH=bulk` sites of `serial.py` when `TF_L2_PACE_GBPS` is set) adapts its DeepSeek-V4.1 family's
+  for the bulk prefetch sites of `serial.py`, on by default at `TF_L2_PACE_GBPS=150`; `TF_L2_PREFETCH=0` or
+  `TF_L2_PACE_GBPS=0` turn it off) adapts its DeepSeek-V4.1 family's
   `l2pace.cu` and `l2pace.cpp` (G14, `TF_DSV41_L2PF_PACE_GBPS`; `patches/0002-deepseek-v41-family.patch`), MIT License,
   Copyright (c) 2026 Jay Leaton. The kernel is unchanged; the binding is merged into the `.cu` file and takes our
   `bulk_table`. The rate / CTA / delay knobs and the join of the prefetch stream at the step's end (`TF_L2_JOIN`) follow
