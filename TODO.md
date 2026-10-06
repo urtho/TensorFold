@@ -268,6 +268,10 @@ copy none of it into this Apache-2.0 tree.
       window graph ~89% of a round, drafter ~10%, host + sync ~0.5 ms
 - [x] Draft policy reset a request (`TF_DSV41_DRAFT_RESET`), prior 0.6 -> 0.8, relax 0.02 toward it in undrafted
       rounds (a stream that stopped drafting never drafted again): prose 40.4 -> 42.3, hard 38.9 -> 47.4 single
+- [x] Deployed (6c46ef7, make image): jaybench code / prose / structured / greedy c1_hard 79.7 / 41.5 / 114.0 / 41.7 ->
+      81.2 / 44.7 / 117.8 / 45.8 (jayleaton G19 84.7 / 46.8 / 121.3), same replies, identical round counts across reps;
+      C1 100.2 -> 106.0, C2 139.3, C3 154.7 -> 164.2, C4 154.2 -> 152.9, hard 38.3 -> 49.4, PP8192 1658 -> 1635,
+      100K prefill 2569 -> 2497 (decode 44.0), 16 clients 122.6 -> 124.4 (first start; PP / 100K prefill untouched)
 - [ ] Draft policy: 6-row windows (48.5 ms) vs 4 rows (37.9): a per-k cost model with the drafter's 5 ms and the
       relax / prior under concurrent load (16 clients) not swept
 - [ ] jayleaton's 1-row window 21.7 ms vs ours 24.1 with pacing: his remaining levers (BRANCHES side priority,
