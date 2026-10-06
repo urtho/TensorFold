@@ -9,6 +9,7 @@ pub const DeviceBuffer = struct {
     d: *const Driver,
     ptr: abi.DevicePtr,
     len: usize,
+    borrowed: bool = false, // a span of memory another value owns (a carveout's): free leaves it alone
 
     /// `len` bytes, 256-byte aligned by the driver; zero bytes allocate nothing and hold address 0.
     pub fn alloc(d: *const Driver, len: usize) Error!DeviceBuffer {
@@ -26,7 +27,7 @@ pub const DeviceBuffer = struct {
     }
 
     pub fn free(self: *DeviceBuffer) void {
-        if (self.ptr != 0) _ = self.d.api.cuMemFree_v2(self.ptr);
+        if (self.ptr != 0 and !self.borrowed) _ = self.d.api.cuMemFree_v2(self.ptr);
         self.* = undefined;
     }
 
