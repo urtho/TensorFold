@@ -44,7 +44,18 @@ hardware (2026-10-04, fp4 KV, 16 × 614K, 6.5M pool tokens): C1 98 tok/s, PP8192
 - TF32 (bertholomus 741a507, recipe #6): NGC PyTorch containers set `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`, so fp32
   cuBLAS GEMMs (router logits, indexer weights, mHC mixes) run in TF32. Seeded replies then differ from the reference,
   and one reported long agentic turn looped to the 32K cap. Our serving container has the variable set and
-  `allow_tf32` reads True (checked 2026-10-08). See whether our fp32 GEMMs are affected.
+  `allow_tf32` reads True (checked 2026-10-08). For us it is minor: the target forward has no torch fp32 GEMMs; only
+  the DSpark drafter's attention einsums (`dspark.py`) run in TF32, which can change drafts, never replies; the
+  prompt mHC kernel's TF32 dot is deliberate (as vLLM).
+- Decode round cost (bertholomus bd0024d, +18% single stream): drafter 5.1 -> 3.3 ms (vocabulary split per rank, one
+  argmax gather, cached Markov bias rows for the 256 most frequent tokens; ours recomputes
+  `markov_embed[prev] @ markov_head.T` each draft token); 6-row verify 39.5 -> 36.8 ms (ours 48.5); cross-node
+  gathers 2.9 -> 1.9 ms a round (rings and flags in cudaHostAlloc memory, one system fence a staging block).
+- Lazy Triton loads mid-serving (bertholomus#1: a 13-row prefill-tail specialization first loaded after 15.5 h failed
+  with CUDA 800 and took the lane down): warm every small prefill-tail row count.
+- Prompt chunks: `group_members` (`serial.py`) syncs the host three times a layer (bincount, `int(max)`, nonzero);
+  bertholomus v0.5 builds the expert work list on the device.
+- Long-context decode: exact pruned top-k, candidate-only reindex, tile skip (decode after a 128K prompt 89 -> 115-129).
 - Opt-in reasoning loop guard (bertholomus dfbe519, `TF_LOOP_GUARD`).
 - soumyarupsarkar's 8.6M resident KV tokens vs our 6.5M at 16 × 614K.
 - sfxnz's lane decoder (`--parallel 1..4`, top_k-off lanes drawn together) and their frozen-ruler benchmark gates.
