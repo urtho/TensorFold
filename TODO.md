@@ -255,15 +255,37 @@ structured 119.31 -> 124.85, c1 106.67 -> 109.60, hard 50.70 -> 53.01 tok/s.
       3 dry 1,024-token windows (< 2% new 8-grams) close the thinking; tests/test_loop_guard.py
 - [x] Kept-prompt trimming (`TF_DSV41_KEEP_SHRINK`, default on): prompts >= 128K also kept (exactly) at 3/4 and 7/8;
       room is made by dropping loose extents' longest states (`multi._trim`) before whole extents are evicted
-- [ ] Verify-window levers still open (bertholomus bd0024d): dead fp32 scratch discarded from L2, the mHC finish split
-      with its Sinkhorn on a side stream, wo_a's rotation folded into the attention merge, norm + rot_in fusion
-  - [ ] mHC: written behind switches, default off until the GPU A/B (tests/cuda/test_dsv41_hc.py, quick tier,
-        decode-bench / jaybench, then a BENCH.md row): `TF_DSV41_HC_SPLIT=1` (Sinkhorn | collapse in one launch),
-        `TF_DSV41_HC_SIDE=1` (partials + Sinkhorn on a side stream from `layers` only), `TF_DSV41_HC_SIDE_PART=0`
-        (only the Sinkhorn moves)
-      with its Sinkhorn on a side stream, wo_a's rotation folded into the attention merge, norm + rot_in fusion.
-      L2 discard implemented, default off (`TF_DSV41_L2_DISCARD=po,moe`, with `TF_DSV41_RES_FOLD`): first an ncu
-      dram__bytes_write check that GB10 honours discard.global.L2 at all (it drops prefetch.global.L2), then the A/B
+
+## Phase 9 — performance items and reasoning loops (2026-10-08, out/perf/)
+
+Designed by a 40-agent workflow (out/perf/design.json: 13 items, each with an exactness and a gain critic), built on
+perf/* branches by a second one, merged in perf/integrate -> dsv41-cuda. Same-session A/B (out/perf/ab2-*: bbc5ee8 /
+merged-off / on, alternating x2; the quick tier with every switch on gives bbc5ee8's fingerprints; reply shas equal).
+
+- [x] Round index memo (`TF_DSV41_IDX_BASE`) + mHC partials and Sinkhorn on a side stream (`TF_DSV41_HC_SIDE`), on by
+      default (c906e95): windows 1 / 2 / 4 / 6 rows 23.6-24.3 / 28.1 / 36.2 / 40.7 -> 23.15 / 27.3 / 35.0 / 39.9 ms;
+      jaybench code 83.8 -> 85.8, prose 46.0 -> 47.0, structured 121.1 -> 124.2, c1 105.8 -> 107.8
+- [x] Measured, left off: `TF_DSV41_HC_SPLIT` and `HC_SIDE_PART=0` (no gain), `TF_X3LD_ORDER=expert` (-0.1..-0.5 ms,
+      marginal), `TF_DSV41_L2_DISCARD=po` (0) / `po,moe` (R=1 +0.4, R=6 -0.9: mixed), `TF_DSV41_RES_FOLD` (0),
+      `TF_DSV41_MQA_FEW` 2 / 6 (worse than 1)
+- [ ] `TF_MULTI_COPY` (copy drafts in concurrent rounds): A/B on the edit / docs jaybench workloads and 16 clients
+- [ ] `TF_DSV41_SEND=one` (one exchange a message) and `TF_RDMA_TRACE`: measure on the served path
+- [ ] Draft policy: the calibrated verify costs over-price 5-6-row windows by 6-20% (server 43 / 49 ms vs decode-bench
+      38.0 / 40.7 and jaybench rounds 40.7 / 44.7): a realistic-depth cost curve (design.json "draft-policy")
+- [ ] Still open from the design: wo_a rotation folded into the attention merge, norm + rot_in fusion, dense-lane EXL3
+      decode, Triton PDL, RoCE two rails, the serving warm-up trim (27-54 s a start), first-start PP dip diagnosis
+- [x] Grammar-constrained streams draft (`TF_DSV41_DRAFT_GRAMMAR`, 6542b0d; on in the deployment): before, every
+      response_format / tool-grammar reply verified one row a round, its reasoning included (accepted=0/0). Served:
+      the same replies (12 verdicts' tokens and content equal; structured schemas PASS), ~55% of drafts kept, but at 6
+      concurrent the aggregate is bandwidth-bound: per-stream 14-19 tok/s either way (median 87 -> 96 s); the gain is
+      for 1-2 concurrent constrained requests
+- [x] Reasoning loops (algolabel "smart" prompts, out/debug/smart-reasoning; tools/dsv41_reasoning_probe.py): the
+      control prompt at temperature 0.1 looped to the 16K cap 4 / 4 (0.6: 1 / 4, 1.0 — the server default — 0 / 4;
+      finished replies need 5-9K reasoning tokens). Loop guard under a grammar (f343663) cut 3 / 4 at 4-5K with valid
+      JSON; numbers as one symbol (ec31852) also catches the 4th (a numbered 13-line cycle). Verdicts: no loops, but
+      4 / 12 deliberate past max_tokens 4000 (empty content) at 6 concurrent; TF_THINK_RESERVE (thinking closed with
+      room for the answer) turns those into answers
+
 
 ## Open (2026-10-05)
 
