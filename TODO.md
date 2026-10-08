@@ -274,6 +274,10 @@ merged-off / on, alternating x2; the quick tier with every switch on gives bbc5e
       38.0 / 40.7 and jaybench rounds 40.7 / 44.7): a realistic-depth cost curve (design.json "draft-policy")
 - [ ] Still open from the design: wo_a rotation folded into the attention merge, norm + rot_in fusion, dense-lane EXL3
       decode, Triton PDL, RoCE two rails, the serving warm-up trim (27-54 s a start), first-start PP dip diagnosis
+- [ ] Triton PDL (`TF_DSV41_PDL`, default off): rmsnorm, rope, rope_q / Fp4Rows.store, router logits, route, mHC
+      pre / post as programmatic dependent launches (peer bd0024d `_pdl()`). PTX at 0 equals a5dd0ca's; at 1 bit-equal
+      in captured graphs behind a racing producer (tests/cuda/test_dsv41_pdl.py, RTX 5070 sm_120). Local 40-layer
+      chain: R=1 -2.3%, R=6 0 (+-1%): small, since most predecessors (exl3, torch) never trigger early. GB10 A/B due
 - [x] Grammar-constrained streams draft (`TF_DSV41_DRAFT_GRAMMAR`, 6542b0d; on in the deployment): before, every
       response_format / tool-grammar reply verified one row a round, its reasoning included (accepted=0/0). Served:
       the same replies (12 verdicts' tokens and content equal; structured schemas PASS), ~55% of drafts kept, but at 6

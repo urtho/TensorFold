@@ -13,6 +13,9 @@ from typing import NamedTuple
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+
+from .kernels import pdl  # TF_DSV41_PDL (kernels.PDL): the decode pre / post as dependent launches
 
 NB = 16          # K blocks of the 24-mix projection (20,480 / 16 = 1,280 columns each)
 SUB = 128        # columns a partial step takes
@@ -23,7 +26,11 @@ PROMPT_ROWS = int(__import__("os").environ.get("TF_DSV41_DECODE_ROWS") or 32)
 
 
 @triton.jit
-def _pre_partial(X, FN, PART, WIDE: tl.constexpr, NBLK: tl.constexpr, SUBK: tl.constexpr, EVICT: tl.constexpr = ""):
+def _pre_partial(X, FN, PART, WIDE: tl.constexpr, NBLK: tl.constexpr, SUBK: tl.constexpr, EVICT: tl.constexpr = "",
+                 PDL: tl.constexpr = False):
+    if PDL:                                 # (the mix matrix streams with the rows in the K loop: after the wait)
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     b = tl.program_id(1)
     KB: tl.constexpr = WIDE // NBLK
@@ -66,7 +73,10 @@ def _pre_partial_rows(X, FN, PART, R, WIDE: tl.constexpr, NBLK: tl.constexpr, SU
 @triton.jit
 def _pre_finish(X, PART, BASE, SCALE, PRE_IN, NW, OUT, PRE, POST, COMB, eps_norm, hc_eps,
                 D: tl.constexpr, NBLK: tl.constexpr, ITERS: tl.constexpr, CH: tl.constexpr,
-                COLLAPSED: tl.constexpr = False):
+                COLLAPSED: tl.constexpr = False, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     m = tl.arange(0, 32)
     mix = tl.zeros((32,), dtype=tl.float32)
@@ -203,9 +213,12 @@ def _collapse_row(r, X, PRE_IN, NW, OUT, eps_norm, D: tl.constexpr, CH: tl.const
 
 @triton.jit
 def _pre_finish2(X, PART, BASE, SCALE, PRE_IN, NW, OUT, PRE, POST, COMB, eps_norm, hc_eps,
-                 D: tl.constexpr, NBLK: tl.constexpr, ITERS: tl.constexpr, CH: tl.constexpr):
+                 D: tl.constexpr, NBLK: tl.constexpr, ITERS: tl.constexpr, CH: tl.constexpr, PDL: tl.constexpr = False):
     """_pre_finish as two programs a row (grid (R, 2)): the Sinkhorn beside the collapse, not before it."""
 
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     if tl.program_id(1) == 0:
         _sinkhorn_row(r, PART, BASE, SCALE, PRE, POST, COMB, eps_norm, hc_eps, D, NBLK, ITERS)
@@ -215,20 +228,29 @@ def _pre_finish2(X, PART, BASE, SCALE, PRE_IN, NW, OUT, PRE, POST, COMB, eps_nor
 
 @triton.jit
 def _pre_sinkhorn(PART, BASE, SCALE, PRE, POST, COMB, eps_norm, hc_eps, D: tl.constexpr, NBLK: tl.constexpr,
-                  ITERS: tl.constexpr):
+                  ITERS: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     _sinkhorn_row(tl.program_id(0), PART, BASE, SCALE, PRE, POST, COMB, eps_norm, hc_eps, D, NBLK, ITERS)
 
 
 @triton.jit
-def _pre_collapse(X, PRE_IN, NW, OUT, eps_norm, D: tl.constexpr, CH: tl.constexpr):
+def _pre_collapse(X, PRE_IN, NW, OUT, eps_norm, D: tl.constexpr, CH: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     _collapse_row(tl.program_id(0), X, PRE_IN, NW, OUT, eps_norm, D, CH, False)
 
 
 @triton.jit
-def _post(B, X, POST, COMB, Y, parts, R, split, D: tl.constexpr, CH: tl.constexpr):
+def _post(B, X, POST, COMB, Y, parts, R, split, D: tl.constexpr, CH: tl.constexpr, PDL: tl.constexpr = False):
     """B holds ``parts`` rank partials (fp32 or bf16, rank order) or one bf16 branch (parts 0), in row blocks of
     ``split`` rows, each [parts, rows, D] (split R: one block)."""
 
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     c = tl.program_id(1)
     o = c * CH + tl.arange(0, CH)
@@ -376,24 +398,24 @@ def pre(X: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tens
     elif HC_SIDE and side is not None:      # partials (HC_SIDE_PART) + Sinkhorn on ``side``, the collapse here
         main = torch.cuda.current_stream()
         if not HC_SIDE_PART:
-            _pre_partial[(R, NB)](X, fn, buf.part, WIDE=S * D, NBLK=NB, SUBK=SUB, num_warps=4)
+            _pre_partial[(R, NB)](X, fn, buf.part, WIDE=S * D, NBLK=NB, SUBK=SUB, num_warps=4, **pdl())
         side.wait_stream(main)              # (X, the fresh outputs and the partials written)
         with torch.cuda.stream(side):
             if HC_SIDE_PART:                # (the mix matrix not kept in L2: l2pace stages weights there)
                 _pre_partial[(R, NB)](X, fn, buf.part, WIDE=S * D, NBLK=NB, SUBK=SUB, EVICT="evict_first",
-                                      num_warps=4)
+                                      num_warps=4, **pdl())
             _pre_sinkhorn[(R,)](buf.part, base, scale, pre_out, post, comb, eps, hc_eps, D=D, NBLK=NB, ITERS=iters,
-                                num_warps=8)
-        _pre_collapse[(R,)](X, pre_in.contiguous(), norm_w, x_in, eps, D=D, CH=CHUNK, num_warps=8)
+                                num_warps=8, **pdl())
+        _pre_collapse[(R,)](X, pre_in.contiguous(), norm_w, x_in, eps, D=D, CH=CHUNK, num_warps=8, **pdl())
         return post, comb, x_in, pre_out
     else:                                   # decode and verify windows: the row-invariant per-row sums
-        _pre_partial[(R, NB)](X, fn, buf.part, WIDE=S * D, NBLK=NB, SUBK=SUB, num_warps=4)
+        _pre_partial[(R, NB)](X, fn, buf.part, WIDE=S * D, NBLK=NB, SUBK=SUB, num_warps=4, **pdl())
         if HC_SPLIT:                        # the Sinkhorn beside the collapse
             _pre_finish2[(R, 2)](X, buf.part, base, scale, pre_in.contiguous(), norm_w, x_in, pre_out, post, comb,
-                                 eps, hc_eps, D=D, NBLK=NB, ITERS=iters, CH=CHUNK, num_warps=8)
+                                 eps, hc_eps, D=D, NBLK=NB, ITERS=iters, CH=CHUNK, num_warps=8, **pdl())
             return post, comb, x_in, pre_out
     _pre_finish[(R,)](X, buf.part, base, scale, pre_in.contiguous(), norm_w, x_in, pre_out, post, comb, eps, hc_eps,
-                      D=D, NBLK=NB, ITERS=iters, CH=CHUNK, num_warps=8)
+                      D=D, NBLK=NB, ITERS=iters, CH=CHUNK, num_warps=8, **pdl())
     return post, comb, x_in, pre_out
 
 
@@ -416,7 +438,7 @@ def post(b, X: torch.Tensor, post_w: torch.Tensor, comb: torch.Tensor) -> torch.
     else:
         b = b.contiguous()
         parts, split = (b.shape[0] if b.dim() == 3 else 0), R
-    _post[(R, D // CHUNK)](b, X, post_w, comb, Y, parts, R, split, D=D, CH=CHUNK, num_warps=4)
+    _post[(R, D // CHUNK)](b, X, post_w, comb, Y, parts, R, split, D=D, CH=CHUNK, num_warps=4, **pdl())
     return Y
 
 
@@ -452,6 +474,6 @@ def post_pre(b, X: torch.Tensor, post_w: torch.Tensor, comb: torch.Tensor, fn: t
     comb_out = torch.empty((R, 4, 4), dtype=torch.float32, device=dev)
     pre_out = torch.empty((R, 4), dtype=torch.float32, device=dev)
     _pre_finish[(R,)](x_in, buf.part, base, scale, pre_in, norm_w, x_in, pre_out, post, comb_out, eps, hc_eps,
-                      D=D, NBLK=nb, ITERS=iters, CH=CHUNK, COLLAPSED=True, num_warps=8)
+                      D=D, NBLK=nb, ITERS=iters, CH=CHUNK, COLLAPSED=True, num_warps=8, **pdl())
     return Y, (post, comb_out, x_in, pre_out)
 
