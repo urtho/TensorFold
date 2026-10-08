@@ -27,6 +27,11 @@ BS = 1024           # entries a block of the scan
 # the ids are packed first and -1 padded, every lane past them -inf, so the same choice. At 2K context 2048 of the
 # 16384 lanes (the 65536-key graphs keep the candidate path on at every context)
 CAND_BOUND = os.environ.get("TF_DSV41_CAND_BOUND", "0") == "1"
+# the radix select's digit width (TF_DSV41_TOPK_DIGITS: 8, the default, four passes; 11: 11 / 11 / 10 bits, one full
+# pass over the row fewer): the same k-th key, so the same entries
+TOPK_DIGITS = int(os.environ.get("TF_DSV41_TOPK_DIGITS") or 8)
+if TOPK_DIGITS not in (8, 11):
+    raise ValueError(f"TF_DSV41_TOPK_DIGITS={TOPK_DIGITS}: 8 or 11")
 
 
 @triton.jit
@@ -47,8 +52,51 @@ def _untie(s, i):
 
 
 @triton.jit
+def _hist_pass(row, FLAGS, r, f_stride, n, block, newest, prefix, MODE: tl.constexpr, BS: tl.constexpr,
+               NB: tl.constexpr, SH: tl.constexpr, PSH: tl.constexpr, FIRST: tl.constexpr):
+    """One digit pass: the histogram of (key >> SH) & (NB - 1) over the valid lanes whose key >> PSH is ``prefix``
+    (FIRST: every valid lane)."""
+
+    offs = tl.arange(0, BS)
+    hist = tl.zeros((NB,), dtype=tl.int32)
+    for b0 in range(0, n, BS):
+        i = b0 + offs
+        inb = i < n
+        s = tl.load(row + i, mask=inb, other=float("-inf"))
+        if MODE == 3:
+            b = tl.load(FLAGS + r * f_stride + i // block, mask=inb, other=-1)
+            v = _untie(s, b * block + i % block)
+        else:
+            v = _untie(s, i)
+        if MODE == 2:
+            v = tl.where(i == newest, float("inf"), v)
+        ok = inb & (v != float("-inf"))
+        if MODE == 1:
+            f = tl.load(FLAGS + r * f_stride + i // block, mask=inb, other=0)
+            ok = ok & (f != 0)
+        key = _key(v)
+        if not FIRST:
+            ok = ok & ((key >> PSH) == prefix)
+        dig = ((key >> SH) & (NB - 1)).to(tl.int32)
+        hist += tl.histogram(dig, NB, mask=ok)
+    return hist
+
+
+@triton.jit
+def _pick(hist, need, NB: tl.constexpr):
+    """The bin holding the need-th largest key and the count above it."""
+
+    bins = tl.arange(0, NB)
+    above = tl.cumsum(hist, 0, reverse=True)          # entries in this bin or higher
+    pick = tl.max(tl.where(above >= need, bins, -1))
+    pick = tl.maximum(pick, 0)
+    higher = tl.sum(tl.where(bins > pick, hist, 0))
+    return pick, higher
+
+
+@triton.jit
 def _topk(S, POS, FLAGS, OUT, FLAGS_OUT, s_stride, f_stride, o_stride, n_keys, ratio, k, block, nb_out,
-          MODE: tl.constexpr, BS: tl.constexpr, BOUND: tl.constexpr = False):
+          MODE: tl.constexpr, BS: tl.constexpr, BOUND: tl.constexpr = False, DIGITS: tl.constexpr = 8):
     """MODE 0: entries of S (row r, n_keys of them, visible below (pos + 1) // ratio). MODE 1: the same, kept only
     in blocks FLAGS marks. MODE 2: candidate blocks: S holds block maxima (n_keys blocks of ``block`` entries; the
     newest visible block is pinned), writes FLAGS_OUT [r, block] = 1 for the chosen ones (0 below ``nb_out``).
@@ -59,6 +107,7 @@ def _topk(S, POS, FLAGS, OUT, FLAGS_OUT, s_stride, f_stride, o_stride, n_keys, r
     r = tl.program_id(0)
     p = tl.load(POS + r)
     nvis = (p + 1) // ratio
+    newest = tl.maximum(nvis - 1, 0) // block               # (MODE 2's pinned block)
     if MODE == 3:
         n = n_keys
         if BOUND:                                   # the listed blocks' lanes: the ids >= 0, packed first
@@ -70,47 +119,39 @@ def _topk(S, POS, FLAGS, OUT, FLAGS_OUT, s_stride, f_stride, o_stride, n_keys, r
             n = tl.minimum(n_keys, listed * block)
     elif MODE == 2:
         n = tl.minimum(n_keys, (nvis + block - 1) // block)
-        newest = tl.maximum(nvis - 1, 0) // block
         n = tl.maximum(n, tl.minimum(newest + 1, n_keys))
     else:
         n = tl.minimum(n_keys, nvis)
     offs = tl.arange(0, BS)
-    bins = tl.arange(0, 256)
     row = S + r * s_stride
-    # the valid count, then four 8-bit digit passes (high to low) for the k-th largest key
-    prefix = tl.zeros((), dtype=tl.uint32)
+    # the valid count, then the digit passes (high to low) for the k-th largest key: four of 8 bits, or (DIGITS 11)
+    # 11 / 11 / 10 bits, one full pass fewer; the same k-th key either way
     need = k
-    total = tl.zeros((), dtype=tl.int32)
-    for d in tl.static_range(4):
-        hist = tl.zeros((256,), dtype=tl.int32)
-        for b0 in range(0, n, BS):
-            i = b0 + offs
-            inb = i < n
-            s = tl.load(row + i, mask=inb, other=float("-inf"))
-            if MODE == 3:
-                b = tl.load(FLAGS + r * f_stride + i // block, mask=inb, other=-1)
-                v = _untie(s, b * block + i % block)
-            else:
-                v = _untie(s, i)
-            if MODE == 2:
-                v = tl.where(i == newest, float("inf"), v)
-            ok = inb & (v != float("-inf"))
-            if MODE == 1:
-                f = tl.load(FLAGS + r * f_stride + i // block, mask=inb, other=0)
-                ok = ok & (f != 0)
-            key = _key(v)
-            if d > 0:
-                ok = ok & ((key >> (32 - 8 * d)) == prefix)
-            dig = ((key >> (24 - 8 * d)) & 255).to(tl.int32)
-            hist += tl.histogram(dig, 256, mask=ok)
-        if d == 0:
-            total = tl.sum(hist)
-        above = tl.cumsum(hist, 0, reverse=True)          # entries in this bin or higher
-        pick = tl.max(tl.where(above >= need, bins, -1))
-        pick = tl.maximum(pick, 0)
-        higher = tl.sum(tl.where(bins > pick, hist, 0))
+    if DIGITS == 11:
+        hist = _hist_pass(row, FLAGS, r, f_stride, n, block, newest, 0, MODE, BS, 2048, 21, 32, True)
+        total = tl.sum(hist)
+        pick, higher = _pick(hist, need, 2048)
         need = need - higher
-        prefix = (prefix << 8) | pick.to(tl.uint32)
+        prefix = pick.to(tl.uint32)
+        hist = _hist_pass(row, FLAGS, r, f_stride, n, block, newest, prefix, MODE, BS, 2048, 10, 21, False)
+        pick, higher = _pick(hist, need, 2048)
+        need = need - higher
+        prefix = (prefix << 11) | pick.to(tl.uint32)
+        hist = _hist_pass(row, FLAGS, r, f_stride, n, block, newest, prefix, MODE, BS, 1024, 0, 10, False)
+        pick, higher = _pick(hist, need, 1024)
+        need = need - higher
+        prefix = (prefix << 10) | pick.to(tl.uint32)
+    else:
+        prefix = tl.zeros((), dtype=tl.uint32)
+        total = tl.zeros((), dtype=tl.int32)
+        for d in tl.static_range(4):
+            hist = _hist_pass(row, FLAGS, r, f_stride, n, block, newest, prefix, MODE, BS, 256, 24 - 8 * d,
+                              32 - 8 * d, d == 0)
+            if d == 0:
+                total = tl.sum(hist)
+            pick, higher = _pick(hist, need, 256)
+            need = need - higher
+            prefix = (prefix << 8) | pick.to(tl.uint32)
     thresh = prefix
     take_all = total <= k                                # every valid entry, the rest -1
     # ordered compaction: keys above the k-th, then the first ``need`` equal to it, in index order
@@ -161,7 +202,8 @@ def top_entries(scores: torch.Tensor, pos: torch.Tensor, ratio: int, topk: int,
     out = torch.empty((R, topk), dtype=torch.int32, device=scores.device)
     f = flags if flags is not None else out
     _topk[(R,)](scores, pos, f, out, out, scores.stride(0), f.stride(0) if flags is not None else 0, out.stride(0),
-                S, ratio, topk, block, 0, MODE=1 if flags is not None else 0, BS=BS, num_warps=8)
+                S, ratio, topk, block, 0, MODE=1 if flags is not None else 0, BS=BS, DIGITS=TOPK_DIGITS,
+                num_warps=8)
     return out
 
 
@@ -175,7 +217,7 @@ def candidate_flags(scores: torch.Tensor, pos: torch.Tensor, ratio: int, block: 
     best = padded.view(R, nb, block).amax(-1)
     flags = torch.empty((R, nb), dtype=torch.uint8, device=scores.device)
     _topk[(R,)](best, pos, flags, flags, flags, best.stride(0), 0, 0, nb, ratio, keep, block, nb, MODE=2, BS=BS,
-                num_warps=8)
+                DIGITS=TOPK_DIGITS, num_warps=8)
     return flags
 
 
@@ -199,5 +241,5 @@ def top_entries_cand(scores: torch.Tensor, pos: torch.Tensor, ratio: int, topk: 
     R, C = scores.shape
     out = torch.empty((R, topk), dtype=torch.int32, device=scores.device)
     _topk[(R,)](scores, pos, ids, out, out, scores.stride(0), ids.stride(0), out.stride(0), C, ratio, topk, block, 0,
-                MODE=3, BS=BS, BOUND=CAND_BOUND, num_warps=8)
+                MODE=3, BS=BS, BOUND=CAND_BOUND, DIGITS=TOPK_DIGITS, num_warps=8)
     return out

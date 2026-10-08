@@ -12,6 +12,14 @@ from tensorfold.families.deepseek_v41.cuda import kernels as K  # noqa: E402
 from tensorfold.families.deepseek_v41.cuda import topk as TK  # noqa: E402
 
 
+@pytest.fixture(autouse=True, params=[8, 11], ids=["digits8", "digits11"])
+def digits(request, monkeypatch):
+    """Every test with the 8-bit and the 11 / 11 / 10-bit radix passes (TF_DSV41_TOPK_DIGITS)."""
+
+    monkeypatch.setattr(TK, "TOPK_DIGITS", request.param)
+    return request.param
+
+
 def rows(R, S, ratio, kind, seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
     pos = torch.randint(0, S * ratio, (R,), generator=g, device="cuda")
@@ -72,3 +80,29 @@ def test_candidates_and_masked_equal_reference(S, ratio):
     later = torch.where(scores == float("-inf"), scores, later)
     got = TK.top_entries(later, pos, ratio, 512, flags=flags, block=block)
     assert torch.equal(got, K.top_entries(K.mask_to_blocks(later, cand, block), 512))
+
+
+@pytest.mark.parametrize("S", [5000, 65537])
+def test_adversarial_rows_same_for_both_digit_widths(S):
+    """Rows built against the 11-bit digits: every score in one top-11-bit bin (1 + i 2^-23), many equal non-zero
+    scores straddling the k-th place, all zeros (untied), and rows with 0 / 1 visible entries."""
+
+    R, k = 6, 512
+    i = torch.arange(S, device="cuda", dtype=torch.float32)
+    s = torch.empty((R, S), device="cuda")
+    s[0] = 1.0 + i * 2.0 ** -23
+    s[1] = torch.where(i < 3 * k, 2.0, 1.0)
+    s[2] = 0.0
+    s[3] = torch.randn((S,), device="cuda")
+    s[4] = torch.randn((S,), device="cuda")
+    s[5] = (i % 7).float()
+    pos = torch.full((R,), S - 1, device="cuda")
+    pos[3], pos[4] = 0, 1
+    vis = torch.arange(S, device="cuda")[None, :] < (pos + 1)[:, None]
+    scores = torch.where(vis, s, torch.full_like(s, float("-inf")))
+    got = {}
+    for d in (8, 11):
+        TK.TOPK_DIGITS = d
+        got[d] = TK.top_entries(scores, pos, 1, k)
+    assert torch.equal(got[8], got[11])
+    assert torch.equal(got[11], ref_dense(scores, k))
