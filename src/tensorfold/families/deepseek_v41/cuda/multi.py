@@ -71,7 +71,8 @@ DRAFT_GRAMMAR = os.environ.get("TF_DSV41_DRAFT_GRAMMAR", "0") == "1"
 # several kept states an extent and ``_settle``. TF_DSV41_KEEP_SHRINK=0: off
 KEEP_SHRINK = os.environ.get("TF_DSV41_KEEP_SHRINK", "1") != "0"
 KEEP_SHRINK_MIN = int(os.environ.get("TF_DSV41_KEEP_SHRINK_MIN") or 131072)
-# copy (prompt-lookup) drafts in concurrent rounds (TF_MULTI_COPY=1; 0, the default: none, as before): a stream whose
+# copy (prompt-lookup) drafts in concurrent rounds (TF_MULTI_COPY, on by default since the 2026-10-08 A/B: jaybench edit
+# 107.5 -> 178.1, docs 94.9 -> 115.1, code unchanged, the same reply shas; 0: none, as before): a stream whose
 # context's last tokens occurred before verifies what followed them (``copy_drafts``) instead of DSpark's drafts, as the
 # serial path does. Rank 0 plans a copy round as (sid, k + COPY_FLAG); both ranks then compute the same proposal from
 # the stream's prompt and reply. A stream copies while the running mean (each copy round weighs half) of the share of its copy
@@ -79,7 +80,7 @@ KEEP_SHRINK_MIN = int(os.environ.get("TF_DSV41_KEEP_SHRINK_MIN") or 131072)
 # length is the cost curve's pick, as a draft count is. TF_COPY_DRAFTS=0: off everywhere; TF_COPY_MATCH, TF_COPY_MAX
 # (default 15 here) tune it. Copy-draft wiring after MiaAI-Lab's GLM recipe patches 0007 / 0032 (Apache-2.0); see
 # THIRD_PARTY_NOTICES.md
-MULTI_COPY = (os.environ.get("TF_MULTI_COPY") or "0") != "0"
+MULTI_COPY = (os.environ.get("TF_MULTI_COPY") or "1") != "0"
 MULTI_COPY_MIN = float(os.environ.get("TF_MULTI_COPY_MIN") or 0.3)
 COPY_FLAG = 1 << 16                        # a plan's copy round: drafts + this (drafts < ROWS <= 2048)
 COPY_BACKOFF = 64                          # most rounds a stream waits after copy rounds that missed
