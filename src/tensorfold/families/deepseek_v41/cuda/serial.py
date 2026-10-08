@@ -240,6 +240,13 @@ FAST_TOPK = os.environ.get("TF_DSV41_FAST_TOPK", "1") != "0"
 # BertholomusAI) and coolbho3k's DeepSeek-v4.1-Flash-2x-DGX-Spark (1d8ac64); written for this engine's FP4 keys and
 # radix select. TF_DSV41_CAND_ONLY=0: off
 CAND_ONLY = os.environ.get("TF_DSV41_CAND_ONLY", "1") != "0"
+# decode graphs: a round's index arithmetic once a graph piece, not in every layer (TF_DSV41_IDX_BASE=1): the rows'
+# ring base and slots and each kv source's entry base built where ``layers`` starts, on the main stream before any
+# Par fork, and each (index source, kv source) pair's top-k shifted to the rows' streams once (38 rebuilds -> 8). The
+# same integer ops on the same inputs, fewer times. Idea after bertholomus/TensorFold's memoised round glue (bd0024d
+# rounds.py ``_ix``, TF_DS_ROUND_GLUE; Apache License 2.0, Copyright 2026 BertholomusAI); written for this engine.
+# 0 (the default until the A/B): per layer
+IDX_BASE = os.environ.get("TF_DSV41_IDX_BASE", "0") == "1"
 
 
 def entry_bytes(dim: int = 512, kdim: int = 128, rope: int = 64, mode: str | None = None) -> tuple[int, int]:
@@ -538,6 +545,8 @@ class _Fixed:
 
 class SerialEngine:
     _deq_comp = None              # ((kv source, visible entries), bf16 decode) for the layers of one prompt chunk
+    _ebc = None                   # a decode graph piece's index tensors (IDX_BASE, ``_round_bases``), else None
+    _idxc = None                  # (index source, kv source) -> (top-k, shifted to the rows' streams) (IDX_BASE)
 
     def __init__(self, w: Weights, comm: Comm, engram_dir: str, tokenizer_json: str, *, cap: int = 4096,
                  device: str = "cuda", slots: int = 1, pool_tokens: int | None = None) -> None:
@@ -794,7 +803,45 @@ class SerialEngine:
     def _ebase(self, src: int) -> torch.Tensor:
         """Each decode row's stream's first entry of source ``src`` (in a graph: read from the base table)."""
 
+        if self._ebc is not None and ("e", src) in self._ebc:          # (IDX_BASE: built where the piece starts)
+            return self._ebc[("e", src)]
         return self.ebase[self._sid] // self.c.layer_ratios[src]
+
+    def _round_bases(self, pos: torch.Tensor, first: int, last: int) -> dict:
+        """IDX_BASE: the index tensors layers [first, last) of a decode graph share, built on the current (main)
+        stream before any Par fork (branches only read them): the rows' ring base ``wbase`` and slot ``wslot``, the
+        previous slot ``rprev`` when a ratio-2 compressor runs, and each kv source's entry base, int64 ``("e", s)``
+        (indexer, compressor) and int32 [R, 1] ``("ei", s)`` (attention), for the sources those layers read only.
+        The expressions the layers compute."""
+
+        c = self.c
+        lays = self.w.layers[first:last]
+        wbase = self._sid * DRING
+        b = {"main": torch.cuda.current_stream() if torch.cuda.is_available() else None,
+             "wbase": wbase, "wslot": wbase + pos % DRING}
+        if any(lw.attn.ratio == 2 and lw.attn.compressor is not None for lw in lays):
+            b["rprev"] = wbase + (pos - 1).clamp(min=0) % DRING
+        srcs = sorted({max(s for s in c.kv_source_layer_ids if s <= lw.index) for lw in lays if lw.attn.ratio > 0})
+        if srcs:
+            e0 = self.ebase[self._sid]
+            for s in srcs:
+                e = e0 // c.layer_ratios[s] if c.layer_ratios[s] != 1 else e0     # (// 1: the same int64 values)
+                b[("e", s)], b[("ei", s)] = e, e.int()[:, None]
+        return b
+
+    def _shifted(self, isrc: int, src: int) -> torch.Tensor:
+        """IDX_BASE: index source ``isrc``'s top-k as entries of each row's stream in kv source ``src``, once a
+        (isrc, src) pair a graph piece (the main stream, after its select; a new top-k replaces the entry)."""
+
+        idx = self.topk[isrc]
+        hit = self._idxc.get((isrc, src))
+        if hit is None or hit[0] is not idx:
+            main = self._ebc["main"]
+            assert main is None or torch.cuda.current_stream() == main, "the index memo grows on the main stream only"
+            ei = self._ebc.get(("ei", src))
+            hit = (idx, torch.where(idx >= 0, idx + (ei if ei is not None else self._ebase(src).int()[:, None]), idx))
+            self._idxc[(isrc, src)] = hit
+        return hit[1]
 
     def _comp_pools(self, E: dict) -> dict:
         """The compressed-entry pools of every source, largest first into the display carveout when it is on
@@ -1018,6 +1065,16 @@ class SerialEngine:
 
     def layers(self, carry: tuple, pos: torch.Tensor, rows: dict, first: int, last: int, static: bool,
                attn_last: bool = False) -> tuple:
+        # IDX_BASE: the piece's index tensors before any fork; dropped where it ends (no graph-pool tensor outlives it)
+        self._ebc = self._round_bases(pos, first, last) if static and IDX_BASE and first < last else None
+        self._idxc = {} if self._ebc is not None else None
+        try:
+            return self._layers(carry, pos, rows, first, last, static, attn_last)
+        finally:
+            self._ebc = self._idxc = None
+
+    def _layers(self, carry: tuple, pos: torch.Tensor, rows: dict, first: int, last: int, static: bool,
+                attn_last: bool) -> tuple:
         X, pre, f, post, comb = carry
         fuse = (X.shape[0] > PROMPT_ROWS or hcf.FUSE_DECODE) and FUSE_HC   # post and the next pre in one pass
         self._deq_comp = None
@@ -1476,10 +1533,13 @@ class SerialEngine:
             qr = K.rmsnorm(a.wq_a(x), a.q_norm, eps)
             return qr, K.rope(a.wq_b(qr).view(R, H, Dh), pos, cos, sin)          # bf16, this rank's heads
 
+        rb = self._ebc if static else None                              # (IDX_BASE: read-only in the branches)
+
         def kv_branch():
             kv = K.rmsnorm(a.wkv(x), a.kv_norm, eps)
             if static:                                                  # each row into its own stream's ring
-                self.big.swa[L].index_copy_(0, self._sid * DRING + pos % DRING, K.rope_q(kv, pos, cos, sin, SWA_Q))
+                slots = rb["wslot"] if rb is not None else self._sid * DRING + pos % DRING
+                self.big.swa[L].index_copy_(0, slots, K.rope_q(kv, pos, cos, sin, SWA_Q))
             else:
                 st.swa[L].index_copy_(0, pos % RING, K.rope_q(kv, pos, cos, sin, SWA_Q))
 
@@ -1499,17 +1559,24 @@ class SerialEngine:
         if a.ratio > 0:
             if a.indexer is not None:
                 self.topk[L] = self.select(layer, qr, x, pos, static)
+                if self._idxc:                                          # (IDX_BASE: shifts of the old top-k)
+                    for k in [k for k in self._idxc if k[0] == L]:
+                        del self._idxc[k]
             src = max(s for s in c.kv_source_layer_ids if s <= L)
             comp = st.comp[src]
-            idx = self.topk[max(s for s in c.index_source_layer_ids if s <= L)]
+            isrc = max(s for s in c.index_source_layer_ids if s <= L)
+            idx = self.topk[isrc]
             if static:                                                  # entries of the row's stream
                 comp = self.big.comp[src]
-                idx = torch.where(idx >= 0, idx + self._ebase(src).int()[:, None], idx)
+                if self._idxc is not None:                              # (IDX_BASE: once a pair a graph piece)
+                    idx = self._shifted(isrc, src)
+                else:
+                    idx = torch.where(idx >= 0, idx + self._ebase(src).int()[:, None], idx)
         if R <= PROMPT_ROWS and L in self._pf_woa and not L2_BULK:
             self._prefetch(self._pf_woa[L], programs=PF_PROGRAMS)  # wo_a streams in while the attention core runs
         if static:
             o = K.mqa(q, comp, idx, self.big.swa[L], pos, a.sink, W, self.attnbuf, Dh ** -0.5, cos, sin,
-                      sbase=self._sid * DRING, ring=DRING)
+                      sbase=rb["wbase"] if rb is not None else self._sid * DRING, ring=DRING)
         else:
             deq = None
             if comp is not None and R > K.FULL_ROWS and K.FULL_DEQ and isinstance(comp, K.Fp4Rows):
@@ -1607,17 +1674,23 @@ class SerialEngine:
         else:
             gate = cw.wgate(x, out_dtype=F32)
             raw = self.big.raw[L] if static else st.raw[L]
-            roff = self._sid * DRING if static else 0                   # the row's stream's ring
-            rs = DRING if static else RING
-            raw.index_copy_(0, roff + pos % rs, torch.cat([kv, gate], dim=1))
-            if static:                                                  # write the group only when pos closes it
+            rb = self._ebc if static else None                          # (IDX_BASE: wslot, rprev; ends == pos)
+            if rb is not None:
+                raw.index_copy_(0, rb["wslot"], torch.cat([kv, gate], dim=1))
                 ends = pos
+                pair = torch.stack([raw[rb["rprev"]], raw[rb["wslot"]]], dim=1)
             else:
-                closing = [int(p) for p in pos.tolist() if (p + 1) % 2 == 0]
-                if not closing:
-                    return
-                ends = torch.tensor(closing, device=self.dev)
-            pair = torch.stack([raw[roff + (ends - 1).clamp(min=0) % rs], raw[roff + ends % rs]], dim=1)
+                roff = self._sid * DRING if static else 0               # the row's stream's ring
+                rs = DRING if static else RING
+                raw.index_copy_(0, roff + pos % rs, torch.cat([kv, gate], dim=1))
+                if static:                                              # write the group only when pos closes it
+                    ends = pos
+                else:
+                    closing = [int(p) for p in pos.tolist() if (p + 1) % 2 == 0]
+                    if not closing:
+                        return
+                    ends = torch.tensor(closing, device=self.dev)
+                pair = torch.stack([raw[roff + (ends - 1).clamp(min=0) % rs], raw[roff + ends % rs]], dim=1)
             wts = torch.softmax(pair[..., c.head_dim:], dim=1)
             pooled = (wts * pair[..., :c.head_dim]).sum(1)
             latent = K.rmsnorm(pooled.to(BF) if COMP_BF16 else pooled, cw.norm, c.rms_norm_eps)

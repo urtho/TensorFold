@@ -63,6 +63,8 @@ services:
       TF_DSV41_MARKOV: ${TF_DSV41_MARKOV:-}
       TF_DSV41_GROUP_LIST: ${TF_DSV41_GROUP_LIST:-}
       TF_DSV41_WARM_SERVING: ${TF_DSV41_WARM_SERVING:-}
+      # A/B switches of exact paths (empty: off): a decode round's index arithmetic once a graph piece
+      TF_DSV41_IDX_BASE: ${TF_DSV41_IDX_BASE:-}
       TF_RDMA_HOST: ${TF_RDMA_HOST:-}
       TF_RDMA_MAX_KB: ${TF_RDMA_MAX_KB:-}
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True

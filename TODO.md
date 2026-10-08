@@ -324,9 +324,11 @@ structured 119.31 -> 124.85, c1 106.67 -> 109.60, hard 50.70 -> 53.01 tok/s.
       0-1% / ~11 W idle, outputs and latency unchanged
 - [x] Server MemAvailable after warm-up was 2.8-2.9 GiB: TF_DSV41_RESERVE_GIB 2.5 -> 3 (3.86 / 3.91 GiB; pool 6.52M -> 6.41M)
 - [ ] Old `tf-dev-old-*` containers on both nodes can go (keep the `tf-dev-snapshot:*` images: tf-dev runs on them)
-- [ ] Global top-k indices rebuilt every compressed layer in the multi-stream path (`serial.py` ~1389: idx + the
-      stream's entry base, ~3 small ops a layer): build once per (index source, kv source) or pass the base into
-      `K.mqa` as `sbase` (idea: vLLM #57659); ~50-100 us a step, outputs unchanged
+- [ ] Global top-k indices rebuilt every compressed layer in the multi-stream path (`serial.py` attention's static
+      branch: idx + the stream's entry base, 6 small ops a layer, ~0.4 ms a step): built once per (index source, kv
+      source) with the round's ring / entry bases once a graph piece behind `TF_DSV41_IDX_BASE=1` (default 0 until
+      the GPU A/B: quick-tier fingerprints, decode-bench R=1..6, jaybench sha). Passing the base into `K.mqa`
+      (idea: vLLM #57659) dropped: ~0.05 ms more for an ext bump
 - [ ] First-start PP8192 dip still seen with zero Triton compiles (1473-1523, then 1830-1856 a minute later): cause open
 - [ ] Server MemAvailable 2.7-2.9 GiB under load (3.8 idle) with RESERVE 3: decide whether the 3 GiB floor applies
       under load

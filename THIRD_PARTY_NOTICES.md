@@ -296,8 +296,9 @@ deepseek-v41-tp2:
 - Ideas, re-implemented here: kept prompts shrunk to 3/4 and 7/8 boundaries before being forgotten (v0.5, 508bfb3);
   candidate-only reindex scoring (v0.5; also coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark 1d8ac64); the prompt-chunk
   expert work list built on the device (v0.5, `work_list_kernel`); RoCE gather rings in cudaHostRegister'd memory with
-  one system fence a block and the own slice copied early (bd0024d). The counts without bincount's host read follow
-  jayleaton/deepseek-v41-tensorfold-spark PR #17 (Apache-2.0).
+  one system fence a block and the own slice copied early (bd0024d); a decode round's index arithmetic once a graph
+  piece (bd0024d rounds.py `_ix`, TF_DS_ROUND_GLUE; here `serial.py` `_round_bases`, `TF_DSV41_IDX_BASE`). The
+  counts without bincount's host read follow jayleaton/deepseek-v41-tensorfold-spark PR #17 (Apache-2.0).
 
 ## Ideas from AGPL-licensed recipes (no code included)
 
