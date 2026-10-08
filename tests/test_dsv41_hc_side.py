@@ -46,6 +46,7 @@ def engine(monkeypatch, log, side_on=True, n_layers=4, engram=(1,)):
         log.append("post")
         return X
 
+    monkeypatch.setattr(S, "IDX_BASE", False)                   # (the round bases need slot state this fake lacks)
     monkeypatch.setattr(S.hcf, "pre", pre)
     monkeypatch.setattr(S.hcf, "post", post)
     monkeypatch.setattr(S.torch.cuda, "current_stream", lambda: _Main(log))
