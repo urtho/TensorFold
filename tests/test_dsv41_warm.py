@@ -144,6 +144,7 @@ def test_warm_switches_stay_out_of_the_calibration_key(monkeypatch, tmp_path):
     m = MultiDecoder.__new__(MultiDecoder)
     m.e = SimpleNamespace(cap=65536, slots=4, drafter=None)
     m.drafts, m.rank = 5, 0
+    m.one_rows = m.one_depth = 0                                # (TF_DSV41_COSTS off)
     monkeypatch.setenv("TF_DSV41_WARM_SERVING", "")
     base = m._calib_path([65536])
     for v in ("trim", "full", "audit"):
