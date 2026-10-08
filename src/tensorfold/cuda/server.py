@@ -56,6 +56,9 @@ class PreparedRequest:
 
 # the loop guard's server default (``ThinkLoop``; a request's "loop_guard": true / false overrides it)
 LOOP_GUARD = os.environ.get("TF_LOOP_GUARD", "0") == "1"
+# ... with numbers as one symbol (a loop that numbers its lines repeats; measured 2026-10-08: it caught a 13-line cycle
+# "878. ...", "891. ..." that plain 8-grams called 48% new, and no healthy reasoning came under 38% new)
+LOOP_DIGITS = os.environ.get("TF_LOOP_GUARD_DIGITS", "1") != "0"
 # the answer's share of a thinking reply's max_tokens (TF_THINK_RESERVE, e.g. 0.15; 0: off): a request with no
 # thinking_budget of its own (and no server default) gets max_tokens - max(TF_THINK_RESERVE_MIN, that share) as one,
 # so a reasoning that would run to the cap is closed as a thinking budget closes it, with room left for the answer
@@ -635,7 +638,22 @@ class App:
         close = [*self.tok.encode("\n", add_special_tokens=False).ids, end]
         if prepared.grammar is None:
             close += self.tok.encode("\n\n", add_special_tokens=False).ids
-        return ThinkLoop(close, end)
+        return ThinkLoop(close, end, same=self._digit_tokens())
+
+    def _digit_tokens(self) -> frozenset:
+        """The tokenizer's all-digit tokens (a leading space or a trailing "." / ")" allowed), which the loop guard
+        counts as one symbol (TF_LOOP_GUARD_DIGITS=0: none); made once."""
+
+        if not LOOP_DIGITS:
+            return frozenset()
+        found = self.__dict__.get("_digits")
+        if found is None:
+            import re
+
+            vocab = getattr(self.tok, "get_vocab", dict)()
+            digit = re.compile(r"[\sĠ▁]*\d+[.)]?[\sĠ▁]*")
+            found = self.__dict__["_digits"] = frozenset(int(i) for t, i in vocab.items() if digit.fullmatch(t))
+        return found
 
     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:
         """The gate a required tool call needs, from this template's call markup and the rendered prompt."""

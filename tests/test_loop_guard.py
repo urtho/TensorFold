@@ -75,3 +75,17 @@ def test_generate_gated_goes_on_after_the_close():
     generate_gated(generate, [1, 2, 3], 10000, [ThinkLoop(CLOSE, END)], lambda new: out.extend(new) or False)
     assert out[:4 * 1024] == script[:4 * 1024] and out[4 * 1024:4 * 1024 + 3] == CLOSE and out[-3:] == [42, 43, 1]
     assert calls == [3, 3 + 4 * 1024 + 3]                   # the second run: the prompt, the reply and the close
+
+
+def test_numbered_loop_caught_with_digits_as_one_symbol():
+    """A cycle of lines with an increasing line number: new 8-grams every line plainly, a loop with numbers alike."""
+
+    digits = frozenset(range(5000, 6000))                    # this test's "number" tokens
+    lines = [[100 + 7 * j + i for i in range(6)] for j in range(13)]
+    reply = []
+    for k in range(1200):
+        reply += [5000 + k % 1000, *lines[k % 13]]
+    reply = reply[:8000]
+    assert feed(ThinkLoop(CLOSE, END), reply) == (None, None)
+    at, fix = feed(ThinkLoop(CLOSE, END, same=digits), reply)
+    assert fix == CLOSE and at <= 5 * 1024

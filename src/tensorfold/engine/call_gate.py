@@ -145,11 +145,13 @@ class ThinkLoop:
     Copyright 2026 BertholomusAI). The signal (the share of new 8-grams a window, a loop after 3 dry windows under
     2%) is Capicua25x's loop_detector.py (bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10 PR #9), after tonyd2wild's
     DSpark recipe PR #29. Novelty counts a window's 8-gram positions (repeats inside it count as new); the first
-    window is all new, so the earliest cut ends the fourth window."""
+    window is all new, so the earliest cut ends the fourth window. Tokens in ``same`` (the server passes its
+    all-digit tokens) count as one symbol: a loop that numbers its lines ("878. X? 879. Y? ...") repeats too."""
 
     def __init__(self, close: Sequence[int], think_end: int, width: int = 1024, n: int = 8, least: float = 0.02,
-                 windows: int = 3) -> None:
+                 windows: int = 3, same: frozenset = frozenset()) -> None:
         self.close, self.think_end = [int(t) for t in close], int(think_end)
+        self.same = same                         # tokens counted as one symbol in the n-grams (numbers)
         self.width, self.n, self.least, self.windows = int(width), int(n), float(least), int(windows)
         self.open = True
         self.seen: set = set()                   # every earlier window's n-grams
@@ -157,6 +159,9 @@ class ThinkLoop:
         self.win: list[int] = []                 # this window's tokens
         self.dry = 0                             # windows in a row with less than ``least`` new
         self.fired = False
+
+    def _key(self, t: int) -> int:
+        return -1 if t in self.same else t
 
     def _novelty(self, toks: Sequence[int]) -> float:
         seq = [*self.tail, *toks]
@@ -174,7 +179,7 @@ class ThinkLoop:
             if int(token) == self.think_end:
                 return None
             if i + 1 == need:
-                rest = [int(t) for t in tokens[:need]]
+                rest = [self._key(int(t)) for t in tokens[:need]]
                 if self.dry + 1 >= self.windows and self._novelty([*self.win, *rest]) < self.least:
                     return i + 1, list(self.close)
                 return None
@@ -186,7 +191,7 @@ class ThinkLoop:
         if int(token) == self.think_end:
             self.open = False
             return
-        self.win.append(int(token))
+        self.win.append(self._key(int(token)))
         if len(self.win) < self.width:
             return
         nov = self._novelty(self.win)
