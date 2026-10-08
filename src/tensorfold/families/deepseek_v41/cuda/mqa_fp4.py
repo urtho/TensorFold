@@ -54,5 +54,7 @@ def ext(lut: bool = False):
     from tensorfold.cuda.build import load
 
     flags = ["-O3", "-lineinfo"] + (["-DTF_MQA4_LUT"] if lut else [])
-    return load("tf_dsv41_mqa_fp4_lut_v7" if lut else "tf_dsv41_mqa_fp4_v7",
-                [str(Path(__file__).with_name("mqa_fp4.cu"))], arch_specific=True, extra_cuda_cflags=flags)
+    exl3 = Path(__file__).parents[3] / "cuda" / "exl3"                 # rot128.cuh
+    return load("tf_dsv41_mqa_fp4_lut_v8" if lut else "tf_dsv41_mqa_fp4_v8",
+                [str(Path(__file__).with_name("mqa_fp4.cu"))], arch_specific=True, extra_cuda_cflags=flags,
+                extra_include_paths=[str(exl3)])

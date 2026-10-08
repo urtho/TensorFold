@@ -17,6 +17,7 @@ import torch
 
 from tensorfold.cuda.capacity import gather_ints
 from tensorfold.cuda.exl3 import experts as ex3
+from tensorfold.cuda.exl3.linear import grouped_rotated, linear_rotated, rot_mode
 from tensorfold.cuda.sampling import sample_rows
 
 from .. import engram as E
@@ -165,6 +166,15 @@ SKIP_SHARED = os.environ.get("TF_SKIP_SHARED") == "1"
 # (down_combine's res: the same fp32 add as ``routed + shared``, one launch fewer on the main stream); the shared chain
 # starts first on a side stream and the combine waits for it. Default off until measured.
 RES_FOLD = os.environ.get("TF_DSV41_RES_FOLD") == "1"
+# decode / verify rows, EXL3 input rotations made by the kernel holding the values instead of a rot_in launch
+# (TF_DSV41_ROT_FUSE, a comma list; default none; "1" / "all": both): "attn": the attention merge (mqa_fp4.cu) also
+# writes wo_a's rotated rows, "wob": wo_a's epilogue (linear.cu) also writes wo_b's. The same fp16 bits as rot_in
+# (rot128.cuh: explicit operations in rot_in's contraction form, which exl3 linear.rot_mode() finds at start; no form
+# equal: off, said once). Default off until measured.
+ROT_FUSE = {t.strip() for t in os.environ.get("TF_DSV41_ROT_FUSE", "").split(",")} - {"", "0"}
+ROT_FUSE = {"attn", "wob"} if ROT_FUSE & {"1", "all"} else ROT_FUSE
+if ROT_FUSE - {"attn", "wob"}:
+    raise ValueError(f"TF_DSV41_ROT_FUSE: unknown {sorted(ROT_FUSE - {'attn', 'wob'})} (attn, wob, 1)")
 PF_PROGRAMS = int(os.environ.get("TF_PF_PROGRAMS") or 4)
 # decode / verify step as one graph: the graph waits on a pinned-memory flag for each table's rows (read by the host
 # meanwhile) instead of three graphs launched around the reads (each graph switch left the GPU idle ~0.7 ms)
@@ -553,6 +563,8 @@ class SerialEngine:
     _idxc = None                  # (index source, kv source) -> (top-k, shifted to the rows' streams) (IDX_BASE)
     _hc_stream = None             # hcf.HC_SIDE: the stream ``layers``' HC partials and Sinkhorn run on
     _hc_live = False              # an HC pre on it not joined yet
+    _rot_fuse = frozenset()       # ROT_FUSE's parts in use (empty: rot_in everywhere) and rot_in's form (rot_mode)
+    _rot_mode = 0
 
     def __init__(self, w: Weights, comm: Comm, engram_dir: str, tokenizer_json: str, *, cap: int = 4096,
                  device: str = "cuda", slots: int = 1, pool_tokens: int | None = None) -> None:
@@ -569,6 +581,18 @@ class SerialEngine:
         # every layer has the same shapes: one small scratch for decode / verify rows, one for prompt chunks whose
         # gate/up inputs and fp32 partials the prompt kernel no longer reads (rotated while staged, its own fp16 Z)
         small = ex3.Scratch(w.layers[0].moe.experts, PROMPT_ROWS, decode_slots(w.layers[0].moe, c.num_experts_per_tok))
+        if ROT_FUSE:
+            mode = rot_mode()
+            if mode is None:
+                print("[serial] TF_DSV41_ROT_FUSE off: no rot128 form equals this build's rot_in", flush=True)
+            else:
+                self._rot_fuse, self._rot_mode = frozenset(ROT_FUSE), mode
+                for lw in w.layers:
+                    g = lw.attn.wo_a_grouped
+                    if g is not None and (lw.attn.wo_b.k != g.groups * g.n or g.suh.numel() != g.groups * g.k):
+                        raise ValueError(f"layer {lw.index}: wo_b reads {lw.attn.wo_b.k} inputs, wo_a writes "
+                                         f"{g.groups * g.n}")
+                print(f"[serial] TF_DSV41_ROT_FUSE {','.join(sorted(ROT_FUSE))} (rot_in form {mode})", flush=True)
         self.scratch = [small] * len(w.layers)
         self.scratch_prompt = ex3.Scratch(w.layers[0].moe.experts, MAX_ROWS, c.num_experts_per_tok)
         if PROMPT_ZB is not None and PROMPT_ROTX:
@@ -1600,9 +1624,14 @@ class SerialEngine:
                     idx = torch.where(idx >= 0, idx + self._ebase(src).int()[:, None], idx)
         if R <= PROMPT_ROWS and L in self._pf_woa and not L2_BULK:
             self._prefetch(self._pf_woa[L], programs=PF_PROGRAMS)  # wo_a streams in while the attention core runs
+        fuse = self._rot_fuse if R <= PROMPT_ROWS and a.wo_a_grouped is not None else ()
+        xo = rot = None
+        if "attn" in fuse:                                              # wo_a's rotated rows from the merge
+            xo = torch.empty((R, H * Dh), dtype=torch.float16, device=x.device)
+            rot = (a.wo_a_grouped.suh, xo, self._rot_mode)
         if static:
             o = K.mqa(q, comp, idx, self.big.swa[L], pos, a.sink, W, self.attnbuf, Dh ** -0.5, cos, sin,
-                      sbase=rb["wbase"] if rb is not None else self._sid * DRING, ring=DRING)
+                      sbase=rb["wbase"] if rb is not None else self._sid * DRING, ring=DRING, rot=rot)
         else:
             deq = None
             if comp is not None and R > K.FULL_ROWS and K.FULL_DEQ and isinstance(comp, K.Fp4Rows):
@@ -1612,17 +1641,31 @@ class SerialEngine:
                     self._deq_comp = (key, K.deq_entries(comp, key[1]))
                 deq = self._deq_comp[1]
             o = K.mqa(q, comp, idx, st.swa[L], pos, a.sink, W, self.attnbuf, Dh ** -0.5, cos, sin,
-                      comp_bf16=deq)                                       # inverse-rotated
+                      comp_bf16=deq, rot=rot)                              # inverse-rotated
+        if rot is not None:
+            o, filled = o
+            xo = xo if filled else None                                 # (a Triton merge: rot_in as before)
         groups = len(a.wo_a)
         o = o.view(R, groups, (H // groups) * Dh)
+        xb = None
         if R <= PROMPT_ROWS and a.wo_a_grouped is not None:
             self._join()
-            z = a.wo_a_grouped(o.reshape(R, -1))                        # every group in one launch
+            if fuse:
+                wob = None
+                if "wob" in fuse:                                       # wo_b's rotated rows from wo_a's epilogue
+                    xb = torch.empty((R, a.wo_b.k), dtype=torch.float16, device=x.device)
+                    wob = (a.wo_b.suh, xb, self._rot_mode)
+                z = grouped_rotated(a.wo_a_grouped, xo, o.dtype, x=o.reshape(R, -1), rot_out=wob)
+            else:
+                z = a.wo_a_grouped(o.reshape(R, -1))                    # every group in one launch
         elif R <= PROMPT_ROWS:
             z = torch.cat(self.par(*[lambda g=g, wo=wo: wo(o[:, g].contiguous()) for g, wo in enumerate(a.wo_a)]), dim=1)
         else:
             z = torch.cat([wo(o[:, g]) for g, wo in enumerate(a.wo_a)], dim=1)
         pf = self._pf_moe.get(L) if R <= PROMPT_ROWS else None        # the MoE's router + shared expert, meanwhile
+        if xb is not None:                                              # (R <= PROMPT_ROWS: one block)
+            return self.comm.partials_rows(lambda r0, r1: linear_rotated(a.wo_b, xb[r0:r1], F32), R,
+                                           during=(lambda: self._prefetch(pf, site="moe")) if pf is not None else None)
         return self.comm.partials_rows(lambda r0, r1: a.wo_b(z[r0:r1], out_dtype=F32 if R <= PROMPT_ROWS else BF), R,
                                        during=(lambda: self._prefetch(pf, site="moe")) if pf is not None else None)
 

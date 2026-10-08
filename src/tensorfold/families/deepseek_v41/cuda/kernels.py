@@ -579,12 +579,15 @@ def deq_entries(comp, n_comp: int | None) -> torch.Tensor | None:
 def mqa(q: torch.Tensor, comp: torch.Tensor | None, idx: torch.Tensor | None, swa: torch.Tensor, pos: torch.Tensor,
         sink: torch.Tensor, window: int, buf: AttnBuffers, scale: float, cos: torch.Tensor | None = None,
         sin: torch.Tensor | None = None, sbase: torch.Tensor | None = None, ring: int | None = None,
-        n_comp: int | None = None, comp_bf16: torch.Tensor | None = None) -> torch.Tensor:
+        n_comp: int | None = None, comp_bf16: torch.Tensor | None = None,
+        rot: tuple[torch.Tensor, torch.Tensor, int] | None = None):
     """q [R, H, D] (RoPE'd) -> o [R, H, D] over the compressed entries ``idx`` [R, n] of ``comp`` and the window
     (``swa`` a ring of window rows addressed by position modulo its length): fp32, or with RoPE tables the
     inverse-rotated bf16 the output projection takes. ``n_comp`` (prompt chunks): every index is below it (the
     entries the chunk can see), so FP4 entries may be decoded once for all rows (FULL_DEQ); ``comp_bf16``: that
-    decode, made by the caller (deq_entries) and shared by the layers reading the same entries."""
+    decode, made by the caller (deq_entries) and shared by the layers reading the same entries. ``rot`` (suh, xo,
+    mode; TF_DSV41_ROT_FUSE): the CUDA merge also writes xo fp16 [R, H * D] = rot_in(o, suh) (the output projection's
+    input); then (o, whether xo was written: only the CUDA path with RoPE writes it) is returned."""
 
     R, H, D = q.shape
     assert H % HEAD_TILE == 0
@@ -609,11 +612,15 @@ def mqa(q: torch.Tensor, comp: torch.Tensor | None, idx: torch.Tensor | None, sw
         if ext is not None:
             per, nparts = mqa_fp4.parts(R, n_idx, window)
             assert R * nparts <= buf.po.numel() // (H * D)
-            ext.attend_rows(q.contiguous(), comp.q if q4 else None, comp.s if q4 else None,
-                            idx.int() if idx is not None else None, swa, pos.long(),
-                            sbase.long() if sbase is not None else None, sink.float(), cos, sin, out, buf.po, buf.pm,
-                            buf.pl, ring or swa.shape[0], mqa_fp4.GROUP, per, scale, int(mqa_fp4.DISCARD))
-            return out
+            args = (q.contiguous(), comp.q if q4 else None, comp.s if q4 else None,
+                    idx.int() if idx is not None else None, swa, pos.long(), sbase.long() if sbase is not None else None,
+                    sink.float(), cos, sin, out, buf.po, buf.pm, buf.pl, ring or swa.shape[0], mqa_fp4.GROUP, per,
+                    scale, int(mqa_fp4.DISCARD))
+            if rot is not None and rope:
+                ext.attend_rows_rot(*args, *rot)
+                return out, True
+            ext.attend_rows(*args)
+            return out if rot is None else (out, False)
     if rope and R > FULL_ROWS and q4 and idx is not None and comp_bf16 is None:
         comp_bf16 = deq_entries(comp, n_comp)
     if rope and R > FULL_ROWS and q4 and idx is not None and comp_bf16 is not None:
@@ -623,7 +630,7 @@ def mqa(q: torch.Tensor, comp: torch.Tensor | None, idx: torch.Tensor | None, sw
                                      idx_t.stride(0) if idx is not None else 0, cr, cs, H=H, D=D, W=window,
                                      RING=swa.shape[0], SCALE=scale, HT=FULL_HT, KT=FULL_KT, HALF=cos.shape[1],
                                      num_warps=FULL_WARPS, num_stages=FULL_STAGES, **fkw)
-        return out
+        return out if rot is None else (out, False)
     _mqa_chunks[(R, H // HEAD_TILE, nch)](q.contiguous(), cq, idx_t, swa, pos, buf.po, buf.pm, buf.pl, n_idx,
                                           idx_t.stride(0) if idx is not None else 0,
                                           sbase if sbase is not None else pos, cr, cs, H=H, D=D, W=window,
@@ -632,7 +639,7 @@ def mqa(q: torch.Tensor, comp: torch.Tensor | None, idx: torch.Tensor | None, sw
                                           **fkw)
     _mqa_merge[(R, H)](buf.po, buf.pm, buf.pl, sink, out, pos, cos if rope else sink, sin if rope else sink, H=H, D=D,
                        NCH=nch, HALF=cos.shape[1] if rope else 1, ROPE=rope, num_warps=4)
-    return out
+    return out if rot is None else (out, False)
 
 
 @triton.jit

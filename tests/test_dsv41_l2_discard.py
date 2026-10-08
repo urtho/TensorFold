@@ -62,7 +62,7 @@ def test_extension_names_bumped():
 
     assert 'name="tensorfold_exl3_experts_v2"' in (ROOT / "src/tensorfold/cuda/exl3/experts.py").read_text()
     src = (ROOT / "src/tensorfold/families/deepseek_v41/cuda/mqa_fp4.py").read_text()
-    assert '"tf_dsv41_mqa_fp4_lut_v7" if lut else "tf_dsv41_mqa_fp4_v7"' in src
+    assert '"tf_dsv41_mqa_fp4_lut_v8" if lut else "tf_dsv41_mqa_fp4_v8"' in src
 
 
 def test_merge_flat_barrier_before_discard():
