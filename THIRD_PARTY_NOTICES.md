@@ -206,8 +206,9 @@ Parts of the DeepSeek-V4.1 serving path are adapted from Jay Leaton's
   `src/tensorfold/families/deepseek_v41/cuda/x3ld.cu`, `x3ld.cpp` and `expert_loads.py`
   (`patches/0002-deepseek-v41-family.patch`), MIT License, Copyright (c) 2026 Jay Leaton. It applies the load path of
   his glm53-tensorfold-spark patch 0580 (16-byte, several-deep weight loads) to TensorFold's grouped EXL3 expert
-  kernel (`experts_grouped.cuh`). The kernel and bindings are moved here unchanged. `x3ld.py` drops the PDL launch and
-  probe options and renames the switch to `TF_EXPERT_LOADS`. The license is included in `LICENSES/JayLeaton-MIT.txt`;
+  kernel (`experts_grouped.cuh`). The kernel and bindings are moved here; changed since: an expert-major program order
+  (`TF_X3LD_ORDER`), deeper load rings and a 4..6 width instance, more probe instances. `x3ld.py` drops the PDL launch
+  and renames the switch to `TF_EXPERT_LOADS`. The license is included in `LICENSES/JayLeaton-MIT.txt`;
   each file keeps its SPDX line and states what was changed.
 - The prepared per-rank weight folders (`src/tensorfold/families/deepseek_v41/cuda/fastboot.py`, used by `make prepare`
   and `TF_DSV41_PREPARED` in `deploy/dsv41-tp2/`) adapt its DeepSeek-V4.1 family's `fastboot.py` (`patches/0002`): the
@@ -302,6 +303,9 @@ deepseek-v41-tp2:
   / HC_DEFER / HC_DOTS; here `hc.py` `_pre_finish2` / `_pre_sinkhorn` / `_pre_collapse`, the halves being
   `_pre_finish`'s own code). The counts without bincount's host read follow jayleaton/deepseek-v41-tensorfold-spark
   PR #17 (Apache-2.0).
+  one system fence a block and the own slice copied early (bd0024d); the routed experts' expert-major program order
+  with the dead expert slots last (`experts_grouped.cuh` `grouped_cp_kernel`; `TF_X3LD_ORDER=expert` in `x3ld.cu`). The counts without bincount's host read follow
+  jayleaton/deepseek-v41-tensorfold-spark PR #17 (Apache-2.0).
 
 ## Ideas from AGPL-licensed recipes (no code included)
 
