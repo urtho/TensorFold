@@ -249,8 +249,8 @@ CAND_ONLY = os.environ.get("TF_DSV41_CAND_ONLY", "1") != "0"
 # Par fork, and each (index source, kv source) pair's top-k shifted to the rows' streams once (38 rebuilds -> 8). The
 # same integer ops on the same inputs, fewer times. Idea after bertholomus/TensorFold's memoised round glue (bd0024d
 # rounds.py ``_ix``, TF_DS_ROUND_GLUE; Apache License 2.0, Copyright 2026 BertholomusAI); written for this engine.
-# 0 (the default until the A/B): per layer
-IDX_BASE = os.environ.get("TF_DSV41_IDX_BASE", "0") == "1"
+# On by default since the 2026-10-08 A/B (with HC_SIDE: windows 1-6 rows -0.8..-1.1 ms, same reply shas); 0: per layer
+IDX_BASE = os.environ.get("TF_DSV41_IDX_BASE", "1") != "0"
 
 
 def entry_bytes(dim: int = 512, kdim: int = 128, rope: int = 64, mode: str | None = None) -> tuple[int, int]:

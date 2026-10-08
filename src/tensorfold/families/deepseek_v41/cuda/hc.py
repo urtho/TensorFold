@@ -343,15 +343,16 @@ class HCBuffers:
         self.rows, self.dims = rows, dims
 
 
-# decode / verify rows (exact: the same kernels and bodies, only split or moved to a stream; default off until the
-# GPU A/B). TF_DSV41_HC_SPLIT=1: the finish as Sinkhorn | collapse programs side by side (one launch).
+# decode / verify rows (exact: the same kernels and bodies, only split or moved to a stream). HC_SIDE on by default
+# since the 2026-10-08 A/B (with IDX_BASE: windows -0.8..-1.1 ms; HC_SPLIT and SIDE_PART=0 gave nothing).
+# TF_DSV41_HC_SPLIT=1: the finish as Sinkhorn | collapse programs side by side (one launch).
 # TF_DSV41_HC_SIDE=1: with a ``side`` stream (serial.layers only, which joins it before the next post and where it
 # ends), the mix partials and the Sinkhorn run there and only the collapse on the caller's stream;
 # TF_DSV41_HC_SIDE_PART=0 keeps the partials on the caller's stream (only the Sinkhorn moves: no DRAM on the side).
 # Idea after bertholomus/TensorFold bd0024d (TF_DS_HC_SPLIT / HC_DEFER / HC_DOTS; Apache License 2.0, Copyright
 # 2026 BertholomusAI); the halves here are _pre_finish's own code
 HC_SPLIT = __import__("os").environ.get("TF_DSV41_HC_SPLIT", "0") == "1"
-HC_SIDE = __import__("os").environ.get("TF_DSV41_HC_SIDE", "0") == "1"
+HC_SIDE = __import__("os").environ.get("TF_DSV41_HC_SIDE", "1") != "0"
 HC_SIDE_PART = __import__("os").environ.get("TF_DSV41_HC_SIDE_PART", "1") != "0"
 
 
