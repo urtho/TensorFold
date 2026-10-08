@@ -4,7 +4,9 @@
 void exl3_rot_in_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&);
 void exl3_linear_cuda(const at::Tensor&, const at::Tensor&, int64_t, int64_t, const at::Tensor&,
                       const c10::optional<at::Tensor>&, at::Tensor&, const c10::optional<at::Tensor>&, at::Tensor&,
-                      int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, const c10::optional<at::Tensor>&, const c10::optional<at::Tensor>&);
+                      int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, const c10::optional<at::Tensor>&, const c10::optional<at::Tensor>&,
+                      const c10::optional<at::Tensor>&, const c10::optional<at::Tensor>&, int64_t);
+void exl3_rot_exact_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t);
 void exl3_unpack_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
@@ -36,10 +38,30 @@ void rot_in(const at::Tensor& x, const at::Tensor& suh, at::Tensor xh) {
     exl3_rot_in_cuda(x, suh, xh);
 }
 
+// rot_in with rot128.cuh's explicit operations, the first butterfly in form mode (0..8): what TF_DSV41_ROT_FUSE's
+// producers compute (linear.py rot_mode() picks the form equal to rot_in on this build)
+void rot_exact(const at::Tensor& x, const at::Tensor& suh, at::Tensor xh, int64_t mode) {
+    const auto t = x.scalar_type();
+    TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.stride(1) == 1 && (t == at::kHalf || t == at::kBFloat16 || t == at::kFloat),
+                "x: expected a 2-d fp16, bf16 or fp32 CUDA tensor with contiguous rows");
+    const int64_t align = 16 / x.element_size();
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && x.stride(0) % align == 0,
+                "x: rows must be 16-byte aligned");
+    check(suh, at::kHalf, "suh");
+    check(xh, at::kHalf, "xh");
+    TORCH_CHECK(x.size(1) % 128 == 0 && suh.numel() == x.size(1) && xh.sizes() == x.sizes(),
+                "x and xh must be [M, K], K a multiple of 128, suh [K]");
+    TORCH_CHECK(mode >= 0 && mode < 9, "mode: 0..8");
+    c10::cuda::CUDAGuard guard(x.device());
+    exl3_rot_exact_cuda(x, suh, xh, mode);
+}
+
 // y [M, N] = (xh @ W_q) @ H * svh + bias; Z [SK, M, N] fp32 when SK > 1; counters int32 [8 * N / 128], left zero.
-void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb, const at::Tensor& svh,
-            const c10::optional<at::Tensor>& bias, at::Tensor y, const c10::optional<at::Tensor>& Z,
-            at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK, int64_t KG, int64_t GN) {
+static void linear_any(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb,
+                       const at::Tensor& svh, const c10::optional<at::Tensor>& bias, at::Tensor y,
+                       const c10::optional<at::Tensor>& Z, at::Tensor counters, int64_t K2, int64_t cb, int64_t SK,
+                       int64_t WK, int64_t KG, int64_t GN, const c10::optional<at::Tensor>& xo,
+                       const c10::optional<at::Tensor>& suho, int64_t rmode) {
     check(xh, at::kHalf, "xh");
     check_io(y, "y");
     check(svh, at::kHalf, "svh");
@@ -61,9 +83,32 @@ void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t
         check(*Z, at::kFloat, "Z");
         TORCH_CHECK(Z->numel() >= SK * M * N, "Z too small");
     }
+    if (xo) {
+        check(*xo, at::kHalf, "xo");
+        check(*suho, at::kHalf, "suho");
+        TORCH_CHECK(xo->dim() == 2 && xo->size(0) == M && xo->size(1) == N && suho->numel() == N,
+                    "xo must be [M, N] and suho [N]");
+        TORCH_CHECK(rmode >= 0 && rmode < 9, "rmode: 0..8");
+    }
     c10::cuda::CUDAGuard guard(xh.device());
     exl3_linear_cuda(xh, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK, KG, GN, c10::nullopt,
-                     c10::nullopt);
+                     c10::nullopt, xo, suho, rmode);
+}
+
+void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb, const at::Tensor& svh,
+            const c10::optional<at::Tensor>& bias, at::Tensor y, const c10::optional<at::Tensor>& Z,
+            at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK, int64_t KG, int64_t GN) {
+    linear_any(xh, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK, KG, GN, c10::nullopt,
+               c10::nullopt, 0);
+}
+
+// linear() that also writes the next layer's input xo [M, N] fp16 = rot_in(y, suho), rot_exact's form rmode, as each
+// output row finishes (TF_DSV41_ROT_FUSE wob); y unchanged
+void linear_rot_out(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb,
+                    const at::Tensor& svh, const c10::optional<at::Tensor>& bias, at::Tensor y,
+                    const c10::optional<at::Tensor>& Z, at::Tensor counters, int64_t K2, int64_t cb, int64_t SK,
+                    int64_t WK, int64_t KG, int64_t GN, at::Tensor xo, at::Tensor suho, int64_t rmode) {
+    linear_any(xh, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK, KG, GN, xo, suho, rmode);
 }
 
 // linear() with the input rotation in the kernel: x [M, G*K] raw rows (fp16 / bf16 / fp32, row stride any), suh the
@@ -84,7 +129,8 @@ void linear_rot(const at::Tensor& x, const at::Tensor& suh, const at::Tensor& T,
     TORCH_CHECK(T.numel() == K * N * K2 / 64, "T must hold K * N * bits / 32 words");
     if (SK > 1) TORCH_CHECK(Z.has_value() && Z->numel() >= SK * M * N, "Z too small");
     c10::cuda::CUDAGuard guard(x.device());
-    exl3_linear_cuda(x, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK, KG, GN, x, suh);
+    exl3_linear_cuda(x, T, stride_k, stride_nb, svh, bias, y, Z, counters, K2, cb, SK, WK, KG, GN, x, suh,
+                     c10::nullopt, c10::nullopt, 0);
 }
 
 // W [K, N] fp16 = W_q, the trellis tiles decoded; tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb words.
@@ -99,6 +145,8 @@ void unpack(const at::Tensor& T, at::Tensor W, int64_t stride_k, int64_t stride_
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rot_in", &rot_in);
+    m.def("rot_exact", &rot_exact);
+    m.def("linear_rot_out", &linear_rot_out);
     m.def("linear", &linear);
     m.def("linear_rot", &linear_rot);
     m.def("unpack", &unpack);

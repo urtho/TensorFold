@@ -8,6 +8,7 @@
 #include <algorithm>
 
 #include "decode.cuh"
+#include "rot128.cuh"
 
 using namespace tf_exl3;
 
@@ -124,6 +125,30 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
     store4(xh, F16, (size_t)row * K + k, v);
 }
 
+// rot_in with rot128.cuh's explicit operations in form ``mode`` (linear.py rot_mode(): the form equal to rot_in here)
+__global__ void __launch_bounds__(128) rot_exact_kernel(const void* __restrict__ x, int x_dtype,
+                                                        const half* __restrict__ suh, half* __restrict__ xh, int K,
+                                                        long long x_stride, int mode) {
+    const int blk = blockIdx.x * 4 + (threadIdx.x >> 5), row = blockIdx.y, lane = threadIdx.x & 31;
+    if (blk * 128 >= K) return;                      // (whole warps)
+    const int k = blk * 128 + 4 * lane;
+    float v[4];
+    load4(x, x_dtype, (size_t)row * x_stride + k, v);
+    tf_rot::rot128_store(v, suh + k, xh + (size_t)row * K + k, lane, mode);
+}
+
+// The finished row's next-layer input (TF_DSV41_ROT_FUSE wob): y as stored in y_dtype, rotated by the next layer's
+// suh into its fp16 rows XO [M, N] (rot_in's bits: rot128.cuh)
+__device__ __forceinline__ void store_rot(const float (&y)[4], int y_dtype, const half* SUHO, half* XO, size_t at,
+                                          int col, int lane, int rmode) {
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        v[j] = y_dtype == BF16 ? __bfloat162float(__float2bfloat16_rn(y[j]))
+             : y_dtype == F16 ? __half2float(__float2half_rn(y[j])) : y[j];
+    tf_rot::rot128_store(v, SUHO + col, XO + at, lane, rmode);
+}
+
 // ROT: the input rotation (x * suh, H / sqrt(128) per 128 block, fp16; rot_in's arithmetic) done here for the block's
 // K range, into shared memory after red, instead of a separate rot_in launch writing xh
 template <int K2, int CB, int WK, bool ROT>
@@ -131,7 +156,8 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
     const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
     const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
     float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK, int XS, int GN,
-    const void* __restrict__ xr, int xr_dtype, long long xr_stride, const half* __restrict__ suh) {
+    const void* __restrict__ xr, int xr_dtype, long long xr_stride, const half* __restrict__ suh,
+    half* __restrict__ XO, const half* __restrict__ SUHO, int rmode) {
     constexpr int TW = tile_words<K2>();
     constexpr int LW = lane_words<K2>();
     extern __shared__ __align__(16) float red[];              // WK * RH * 128 floats (then ROT's rotated rows)
@@ -257,6 +283,9 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                     }
                     finish(v, lane, svh, bias, col0 + 4 * lane);
                     store4(y, y_dtype, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, v);
+                    if (XO != nullptr)                          // (a kernel argument; the warp's loop: whole warps)
+                        store_rot(v, y_dtype, SUHO, XO, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, col0 + 4 * lane,
+                                  lane, rmode);
                 }
             } else {
                 for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
@@ -288,6 +317,9 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                     float v[4] = {s.x, s.y, s.z, s.w};
                     finish(v, lane, svh, bias, col0 + 4 * lane);
                     store4(y, y_dtype, (size_t)(m0 + r) * N + col0 + 4 * lane, v);
+                    if (XO != nullptr)
+                        store_rot(v, y_dtype, SUHO, XO, (size_t)(m0 + r) * N + col0 + 4 * lane, col0 + 4 * lane, lane,
+                                  rmode);
                 }
                 if (threadIdx.x == 0) counters[pass * NB + nb] = 0;   // every program of the block has arrived
             }
@@ -331,11 +363,21 @@ void exl3_rot_in_cuda(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xh
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void exl3_rot_exact_cuda(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xh, int64_t mode) {
+    const int M = (int)x.size(0), K = (int)x.size(1);
+    dim3 grid((unsigned)((K / 128 + 3) / 4), (unsigned)M);
+    rot_exact_kernel<<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr(), dtype_of(x), reinterpret_cast<const half*>(suh.data_ptr()),
+        reinterpret_cast<half*>(xh.data_ptr()), K, (long long)x.stride(0), (int)mode);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb,
                       const at::Tensor& svh, const c10::optional<at::Tensor>& bias, at::Tensor& y,
                       const c10::optional<at::Tensor>& Z, at::Tensor& counters, int64_t K2, int64_t cb, int64_t SK,
                       int64_t WK, int64_t KG, int64_t GN, const c10::optional<at::Tensor>& xr,
-                      const c10::optional<at::Tensor>& suh) {
+                      const c10::optional<at::Tensor>& suh, const c10::optional<at::Tensor>& xo,
+                      const c10::optional<at::Tensor>& suho, int64_t rmode) {
     const int M = (int)xh.size(0), XS = (int)xh.size(1), N = (int)y.size(1);
     const int K = KG > 0 ? (int)KG : XS, G = GN > 0 ? (int)GN : N;
     TORCH_CHECK(WK == 2 || WK == 4 || WK == 8, "WK must be 2, 4 or 8");
@@ -360,7 +402,9 @@ void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_
             stride_k, stride_nb, reinterpret_cast<const half*>(svh.data_ptr()), bptr, y.data_ptr(), dtype_of(y),\
             zptr, counters.data_ptr<int>(), M, K, N, (int)SK, XS, G,                                            \
             rot ? xr->data_ptr() : nullptr, rot ? dtype_of(*xr) : 0, rot ? (long long)xr->stride(0) : 0LL,      \
-            rot ? reinterpret_cast<const half*>(suh->data_ptr()) : nullptr);                                                  \
+            rot ? reinterpret_cast<const half*>(suh->data_ptr()) : nullptr,                                     \
+            xo ? reinterpret_cast<half*>(xo->data_ptr()) : nullptr,                                             \
+            xo ? reinterpret_cast<const half*>(suho->data_ptr()) : nullptr, (int)rmode);                        \
         C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                         \
         return;                                                                                                 \
     }

@@ -272,7 +272,11 @@ merged-off / on, alternating x2; the quick tier with every switch on gives bbc5e
 - [ ] `TF_DSV41_SEND=one` (one exchange a message) and `TF_RDMA_TRACE`: measure on the served path
 - [ ] Draft policy: the calibrated verify costs over-price 5-6-row windows by 6-20% (server 43 / 49 ms vs decode-bench
       38.0 / 40.7 and jaybench rounds 40.7 / 44.7): a realistic-depth cost curve (design.json "draft-policy")
-- [ ] Still open from the design: wo_a rotation folded into the attention merge, norm + rot_in fusion, dense-lane EXL3
+- [ ] `TF_DSV41_ROT_FUSE` attn,wob (the merge writes wo_a's rotated rows, wo_a's epilogue wo_b's: 80 rot_in launches
+      a step fewer; rot128.cuh, exact by the rot_mode() check, form 0 on the local CUDA 13.1 sm_120 build): GB10 bitwise
+      tests (tests/cuda/test_dsv41_rot_fuse.py), suite fingerprints on/off, then the window A/B (>= 5 reps, R=1 / 6;
+      the design guesses 0.1-0.13 ms). The q-norm part (wq_b / ix.wq_b) only if this gains >= 0.1 ms
+- [ ] Still open from the design: norm + rot_in fusion, dense-lane EXL3
       decode, Triton PDL, RoCE two rails, the serving warm-up trim (27-54 s a start), first-start PP dip diagnosis
 - [x] Grammar-constrained streams draft (`TF_DSV41_DRAFT_GRAMMAR`, 6542b0d; on in the deployment): before, every
       response_format / tool-grammar reply verified one row a round, its reasoning included (accepted=0/0). Served:

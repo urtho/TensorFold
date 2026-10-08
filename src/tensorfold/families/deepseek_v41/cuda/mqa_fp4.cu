@@ -28,6 +28,8 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 
+#include "rot128.cuh"                 // (cuda/exl3: rot_in's bits, TF_DSV41_ROT_FUSE)
+
 #if !defined(TF_MQA4_LUT) && (__CUDACC_VER_MAJOR__ * 100 + __CUDACC_VER_MINOR__) >= 1302
 #define TF_MQA4_CVT 1
 #else
@@ -379,6 +381,9 @@ split_kernel(const __nv_bfloat16* __restrict__ Q, const uint8_t* __restrict__ CQ
 // Finish rows: per (row, head), the parts folded group by group (``ppg`` parts a group, in order: the group's
 // stages folded left to right; warp w takes groups w, w + 4, ..), then the groups folded onto the sink (a logit with
 // a zero value vector); divide, inverse RoPE of the last 2 * half dims (cos / sin given: bf16 out) or fp32 out.
+// XO (TF_DSV41_ROT_FUSE attn; bf16 out only): wo_a's input as rot_in would make it from OUT, fp16 [R, H * D] =
+// rot_in(OUT [R, H * D], SUHO [H * D]): warp w's 128 dims of a head are one rotation block, lane L its dims 4L..
+// (rot128.cuh, form rmode).
 // discard (TF_DSV41_L2_DISCARD=po): once the block has read them, the (row, head)'s partials leave L2 without their
 // write-back (this block is their only reader; the next split launch rewrites them; an empty part's PO, never
 // written, is dropped by the folds' select either way).
@@ -393,7 +398,8 @@ __device__ __forceinline__ void discard_po(const float* PO, int r, int h, int np
 __global__ void __launch_bounds__(128)
 merge_kernel(const float* __restrict__ PO, const float* __restrict__ PM, const float* __restrict__ PL,
              const float* __restrict__ SINK, const int64_t* __restrict__ POS, const float* __restrict__ COS,
-             const float* __restrict__ SIN, int half, void* __restrict__ OUT, int nparts, int ppg, int discard) {
+             const float* __restrict__ SIN, int half, void* __restrict__ OUT, int nparts, int ppg, int discard,
+             const __half* __restrict__ SUHO, __half* __restrict__ XO, int rmode) {  // (`half` is an argument)
     __shared__ __align__(16) float gv[MAXG][D];
     __shared__ float gml[MAXG][2];
     const int r = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -470,6 +476,8 @@ merge_kernel(const float* __restrict__ PO, const float* __restrict__ PM, const f
         __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(OUT) + ob;
         *reinterpret_cast<__nv_bfloat162*>(out) = __floats2bfloat162_rn(o[0], o[1]);
         *reinterpret_cast<__nv_bfloat162*>(out + 2) = __floats2bfloat162_rn(o[2], o[3]);
+        if (XO != nullptr)                              // (a kernel argument; all 128 threads: whole warps)
+            tf_rot::rot128_bf16_store(o, SUHO + h * D + d, XO + ob, threadIdx.x & 31, rmode);
     } else {
         *reinterpret_cast<float4*>(reinterpret_cast<float*>(OUT) + ob) = make_float4(o[0], o[1], o[2], o[3]);
     }
@@ -481,7 +489,8 @@ template <int MB>
 __global__ void __launch_bounds__(128)
 merge_flat(const float* __restrict__ PO, const float* __restrict__ PM, const float* __restrict__ PL,
              const float* __restrict__ SINK, const int64_t* __restrict__ POS, const float* __restrict__ COS,
-             const float* __restrict__ SIN, int half, void* __restrict__ OUT, int nparts, int ppg, int discard) {
+             const float* __restrict__ SIN, int half, void* __restrict__ OUT, int nparts, int ppg, int discard,
+             const __half* __restrict__ SUHO, __half* __restrict__ XO, int rmode) {  // (`half` is an argument)
     const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x * 4;
     float fm = SINK[h], fl = 1.f;
     float4 fo = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -547,6 +556,8 @@ merge_flat(const float* __restrict__ PO, const float* __restrict__ PM, const flo
         __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(OUT) + ob;
         *reinterpret_cast<__nv_bfloat162*>(out) = __floats2bfloat162_rn(o[0], o[1]);
         *reinterpret_cast<__nv_bfloat162*>(out + 2) = __floats2bfloat162_rn(o[2], o[3]);
+        if (XO != nullptr)                              // (a kernel argument; all 128 threads: whole warps)
+            tf_rot::rot128_bf16_store(o, SUHO + h * D + d, XO + ob, threadIdx.x & 31, rmode);
     } else {
         *reinterpret_cast<float4*>(reinterpret_cast<float*>(OUT) + ob) = make_float4(o[0], o[1], o[2], o[3]);
     }
@@ -571,11 +582,12 @@ int64_t stages_of(int64_t n_idx) { return (n_idx + tf_mqa4::ST - 1) / tf_mqa4::S
 // ring (a power of two); group: stages a group (the fixed reduction tree); per: stages a CTA, 1 or ``group`` (the
 // same result either way); discard: the merge drops the partials from L2 once read (po 128-byte aligned, else not).
 // Returns the parts written.
-int64_t attend_rows(torch::Tensor q, c10::optional<torch::Tensor> cq, c10::optional<torch::Tensor> cs,
-                    c10::optional<torch::Tensor> idx, torch::Tensor swa, torch::Tensor pos,
-                    c10::optional<torch::Tensor> sbase, torch::Tensor sink, c10::optional<torch::Tensor> cosp,
-                    c10::optional<torch::Tensor> sinp, torch::Tensor out, torch::Tensor po, torch::Tensor pm,
-                    torch::Tensor pl, int64_t ring, int64_t group, int64_t per, double scale, int64_t discard) {
+static int64_t attend_any(torch::Tensor q, c10::optional<torch::Tensor> cq, c10::optional<torch::Tensor> cs,
+                          c10::optional<torch::Tensor> idx, torch::Tensor swa, torch::Tensor pos,
+                          c10::optional<torch::Tensor> sbase, torch::Tensor sink, c10::optional<torch::Tensor> cosp,
+                          c10::optional<torch::Tensor> sinp, torch::Tensor out, torch::Tensor po, torch::Tensor pm,
+                          torch::Tensor pl, int64_t ring, int64_t group, int64_t per, double scale, int64_t discard,
+                          const half* suho, half* xo, int rmode) {
     using namespace tf_mqa4;
     TORCH_CHECK(group >= 1 && group <= MAXPPG && (per == 1 || per == group), "per: 1 or group (<= 8)");
     TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kBFloat16 && q.dim() == 3 && q.size(1) == H && q.size(2) == D &&
@@ -649,9 +661,39 @@ int64_t attend_rows(torch::Tensor q, c10::optional<torch::Tensor> cq, c10::optio
         po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(), sink.data_ptr<float>(),
         pos.data_ptr<int64_t>(), rope ? cosp->data_ptr<float>() : nullptr, rope ? sinp->data_ptr<float>() : nullptr,
         half, out.data_ptr(), nparts, (int)(group / per),
-        (int)(discard && reinterpret_cast<uintptr_t>(po.data_ptr()) % 128 == 0));   // (rows of 2 KiB: whole lines)
+        (int)(discard && reinterpret_cast<uintptr_t>(po.data_ptr()) % 128 == 0),    // (rows of 2 KiB: whole lines)
+        suho, xo, rmode);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return nparts;
+}
+
+int64_t attend_rows(torch::Tensor q, c10::optional<torch::Tensor> cq, c10::optional<torch::Tensor> cs,
+                    c10::optional<torch::Tensor> idx, torch::Tensor swa, torch::Tensor pos,
+                    c10::optional<torch::Tensor> sbase, torch::Tensor sink, c10::optional<torch::Tensor> cosp,
+                    c10::optional<torch::Tensor> sinp, torch::Tensor out, torch::Tensor po, torch::Tensor pm,
+                    torch::Tensor pl, int64_t ring, int64_t group, int64_t per, double scale, int64_t discard) {
+    return attend_any(q, cq, cs, idx, swa, pos, sbase, sink, cosp, sinp, out, po, pm, pl, ring, group, per, scale,
+                      discard, nullptr, nullptr, 0);
+}
+
+// attend_rows (with RoPE: bf16 out) that also writes wo_a's input xo fp16 [R, 32 * 512] = rot_in(out [R, 32 * 512],
+// suho [32 * 512]), rot128.cuh's form rmode (TF_DSV41_ROT_FUSE attn); out unchanged
+int64_t attend_rows_rot(torch::Tensor q, c10::optional<torch::Tensor> cq, c10::optional<torch::Tensor> cs,
+                        c10::optional<torch::Tensor> idx, torch::Tensor swa, torch::Tensor pos,
+                        c10::optional<torch::Tensor> sbase, torch::Tensor sink, torch::Tensor cosp,
+                        torch::Tensor sinp, torch::Tensor out, torch::Tensor po, torch::Tensor pm, torch::Tensor pl,
+                        int64_t ring, int64_t group, int64_t per, double scale, int64_t discard, torch::Tensor suho,
+                        torch::Tensor xo, int64_t rmode) {
+    using namespace tf_mqa4;
+    const int64_t R = q.size(0);
+    TORCH_CHECK(xo.is_cuda() && xo.scalar_type() == at::kHalf && xo.is_contiguous() && xo.numel() == R * H * D &&
+                reinterpret_cast<uintptr_t>(xo.data_ptr()) % 8 == 0, "xo: contiguous fp16 [R, 32 * 512]");
+    TORCH_CHECK(suho.is_cuda() && suho.scalar_type() == at::kHalf && suho.is_contiguous() && suho.numel() == H * D,
+                "suho: contiguous fp16 [32 * 512]");
+    TORCH_CHECK(rmode >= 0 && rmode < 9, "rmode: 0..8");
+    return attend_any(q, cq, cs, idx, swa, pos, sbase, sink, cosp, sinp, out, po, pm, pl, ring, group, per, scale,
+                      discard, reinterpret_cast<const half*>(suho.data_ptr()), reinterpret_cast<half*>(xo.data_ptr()),
+                      (int)rmode);
 }
 
 // the decode helpers over every byte: (bf16x2 of each nibble pair as int32 [256], bf16 bits of each e4m3 byte as
@@ -668,6 +710,7 @@ std::tuple<torch::Tensor, torch::Tensor, bool> decode_table(torch::Tensor like) 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("attend_rows", &attend_rows);
+    m.def("attend_rows_rot", &attend_rows_rot);
     m.def("stages", &stages_of);
     m.def("decode_table", &decode_table);
 }

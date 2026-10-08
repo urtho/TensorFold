@@ -18,7 +18,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_linear_v6", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
+    return load(name="tensorfold_exl3_linear_v7", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
                 verbose=False)
 
@@ -261,3 +261,82 @@ class GroupedLinear:
         ext.linear(xh, self.words, *self.strides, self.svh, None, out, z, self.counters, self.k2,
                    CODEBOOK_IDS[self.codebook], sk, wk, self.k, self.n)
         return out
+
+
+# -- TF_DSV41_ROT_FUSE: a layer's rotated input made by its producer (the attention merge, the previous layer's
+# epilogue) instead of rot_in; module functions, not methods (the prepared tree's code digest names the classes)
+@lru_cache(maxsize=1)
+def rot_mode() -> int | None:
+    """rot128.cuh's form (0..8) of rot_in's first butterfly as this build's nvcc contracted it: the producers write
+    rot_in's bits with it. Found on rows that tell the forms apart (bf16, fp16 and fp32 inputs of 2^-12 .. 2^12, suh of
+    every magnitude and sign-only); None: no form equals rot_in (the producers stay off)."""
+
+    ext = _ext()
+    g = torch.Generator(device="cuda").manual_seed(41)
+    m, k = 64, 4096
+    base = torch.randn((m, k), generator=g, device="cuda") * torch.exp2(
+        torch.randint(-12, 13, (m, k), generator=g, device="cuda").float())
+    suh = (torch.randn((k,), generator=g, device="cuda") *
+           torch.exp2(torch.randint(-6, 7, (k,), generator=g, device="cuda").float())).half()
+    suh[: k // 4] = torch.where(suh[: k // 4] < 0, -1.0, 1.0).half()
+    xs = [base.to(torch.bfloat16), base.clamp(-6e4, 6e4).half(), base]
+    refs = []
+    for x in xs:
+        ref = torch.empty((m, k), dtype=torch.float16, device="cuda")
+        ext.rot_in(x, suh, ref)
+        refs.append(ref.view(torch.int16))
+    for mode in range(9):
+        ok = True
+        for x, ref in zip(xs, refs):
+            got = torch.empty((m, k), dtype=torch.float16, device="cuda")
+            ext.rot_exact(x, suh, got, mode)
+            ok = ok and torch.equal(got.view(torch.int16), ref)
+        if ok:
+            return mode
+    return None
+
+
+def linear_rotated(layer: Exl3Linear, xh: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """``layer(x, out_dtype=...)`` from x's rotated rows xh fp16 [M, K] (rot_in(x, layer.suh)): the same linear
+    launch, so the same bits."""
+
+    m = xh.shape[0]
+    if xh.dim() != 2 or xh.shape[1] != layer.k or xh.dtype != torch.float16 or not 1 <= m <= 128:
+        raise ValueError(f"xh must be fp16 [1..128, {layer.k}], got {tuple(xh.shape)} {xh.dtype}")
+    xh = xh.contiguous()
+    out = torch.empty((m, layer.n), dtype=out_dtype, device=xh.device)
+    sk, wk = layer.split
+    z = torch.empty((sk * m * layer.n,), dtype=torch.float32, device=xh.device) if sk > 1 else None
+    _ext().linear(xh, layer.words, *layer.strides, layer.svh, layer.bias, out, z, layer.counters, layer.k2,
+                  CODEBOOK_IDS[layer.codebook], sk, wk, 0, 0)
+    return out
+
+
+def grouped_rotated(g: GroupedLinear, xh: torch.Tensor | None, out_dtype: torch.dtype, x: torch.Tensor | None = None,
+                    rot_out: tuple[torch.Tensor, torch.Tensor, int] | None = None) -> torch.Tensor:
+    """``g(x, out_dtype)`` from x's rotated rows xh fp16 [M, G*K] (None: rot_in of x here, as g does); ``rot_out``
+    (suh, xo, mode): the epilogue also writes xo fp16 [M, G*N] = rot_in(y, suh), the next layer's input, in
+    rot_mode()'s form. The same linear launch, so y has the same bits."""
+
+    if xh is None:
+        if x is None or x.dim() != 2 or x.shape[1] != g.groups * g.k or not 1 <= x.shape[0] <= 128:
+            raise ValueError(f"x must be [1..128, {g.groups * g.k}]")
+        x = x.contiguous()
+        xh = torch.empty((x.shape[0], g.groups * g.k), dtype=torch.float16, device=x.device)
+        _ext().rot_in(x, g.suh, xh)
+    m, N = xh.shape[0], g.groups * g.n
+    if xh.dim() != 2 or xh.shape[1] != g.groups * g.k or xh.dtype != torch.float16 or not 1 <= m <= 128:
+        raise ValueError(f"xh must be fp16 [1..128, {g.groups * g.k}], got {tuple(xh.shape)} {xh.dtype}")
+    xh = xh.contiguous()
+    out = torch.empty((m, N), dtype=out_dtype, device=xh.device)
+    sk, wk = g.split
+    z = torch.empty((sk * m * N,), dtype=torch.float32, device=xh.device) if sk > 1 else None
+    ext = _ext()
+    if rot_out is None:
+        ext.linear(xh, g.words, *g.strides, g.svh, None, out, z, g.counters, g.k2, CODEBOOK_IDS[g.codebook], sk, wk,
+                   g.k, g.n)
+    else:
+        suh, xo, mode = rot_out
+        ext.linear_rot_out(xh, g.words, *g.strides, g.svh, None, out, z, g.counters, g.k2, CODEBOOK_IDS[g.codebook],
+                           sk, wk, g.k, g.n, xo, suh, mode)
+    return out

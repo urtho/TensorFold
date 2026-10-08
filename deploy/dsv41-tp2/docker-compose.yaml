@@ -80,6 +80,9 @@ services:
       # L2 without its write-back), TF_DSV41_RES_FOLD=1 (routed + shared added in the routed combine)
       TF_DSV41_L2_DISCARD: ${TF_DSV41_L2_DISCARD:-}
       TF_DSV41_RES_FOLD: ${TF_DSV41_RES_FOLD:-}
+      # (exact, empty: off) wo_a's / wo_b's rotated input rows written by the attention merge / wo_a's epilogue
+      # instead of rot_in launches: attn,wob | 1
+      TF_DSV41_ROT_FUSE: ${TF_DSV41_ROT_FUSE:-}
       TF_RDMA_HOST: ${TF_RDMA_HOST:-}
       TF_RDMA_MAX_KB: ${TF_RDMA_MAX_KB:-}
       # routed experts' load path (the same Z): "nt,pd" or "nt,pd/nt,pd" (gate/up, down; empty: 4,2, e.g. 4,4/4,3)
