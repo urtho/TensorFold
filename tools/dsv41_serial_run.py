@@ -1102,7 +1102,7 @@ def mode_jaybench(eng, nccl, args, env) -> SU.Result:
             dec.follow()
             return SU.Result("jaybench", "INFO", None, "rank 1 followed")
         if args.rank == 0:
-            print(f"[jaybench] verify ms by rows 1..4: {[round(c, 2) for c in dec.costs[:4]]}, a draft "
+            print(f"[jaybench] verify ms by rows 1..8: {[round(c, 2) for c in dec.costs[:8]]}, a draft "
                   f"{dec.draft_ms:.2f} ms; policy {'carried across requests' if args.jb_carry else 'reset a request'}"
                   f" (prior {dec.prior0[0]:g})", flush=True)
             for line in dec.cost_report()[1:]:

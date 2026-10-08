@@ -59,11 +59,23 @@ DRAFT_PRIOR = float(os.environ.get("TF_DSV41_DRAFT_PRIOR") or 0.8)
 # 2026-10-06, single requests (tools/dsv41_serial_run.py --jaybench): prior 0.6 without it (the old start) code 78.0,
 # prose 40.4, structured 109.1, c1 98.7 tok/s; 0.8 + 0.02: 77.3-79.8 / 42.3 / 114.0 / 99.5, hard 38.9 -> 47.4
 DRAFT_RELAX = float(os.environ.get("TF_DSV41_DRAFT_RELAX") or 0.02)
+# a round that kept all its k drafts also moves the estimates of the positions it did not draft (k ..) toward the k-th's
+# (TF_DSV41_DRAFT_BORROW=1; 0, the default: they stay where they are): otherwise a stream that starts at k drafts never
+# learns position k+1's rate and stays at k (2026-10-09: some processes ran jaybench structured at 4 drafts a round
+# with 99% kept, 112 tok/s, others at 5, 124; prior 0.8 prices 4 and 5 drafts within 1%). Draft counts only
+DRAFT_BORROW = os.environ.get("TF_DSV41_DRAFT_BORROW", "0") == "1"
 # streams under a grammar (response_format, tool grammars) draft like the rest (TF_DSV41_DRAFT_GRAMMAR=1): each verify
 # row is masked by the grammar's state after the row's path (``Constraint.window``: through </think>, a draft the
 # grammar rejects ends the path), so the kept tokens are the serial reply's. 0 (the default until the A/B): such
 # streams verify one row a round, their reasoning included
 DRAFT_GRAMMAR = os.environ.get("TF_DSV41_DRAFT_GRAMMAR", "0") == "1"
+# a measured verify curve that replaces the calibrated one for every round (TF_DSV41_COST_CURVE="ms1,ms2,..": ms of
+# 1, 2, .. rows; rows past the list add the calibrated curve's increments; empty, the default: the calibration's).
+# An experiment knob: draft counts only, never tokens (rank 0 plans, agree() sends its k)
+# replays a calibration timing takes the best of (TF_DSV41_CALIB_REPS, default 4): at 4, the 5-6-row costs vary by
+# process enough to flip one stream's draft count (jaybench structured 112 / 124 tok/s with the same tokens)
+CALIB_REPS = max(1, int(os.environ.get("TF_DSV41_CALIB_REPS") or "4"))
+COST_CURVE = [float(v) for v in (os.environ.get("TF_DSV41_COST_CURVE") or "").split(",") if v.strip()]
 # a prompt of KEEP_SHRINK_MIN tokens or more is also kept at 3/4 and 7/8 of its length (exact states), and room is made
 # by dropping loose extents' longest kept states before whole extents are evicted (``_trim``): a long document's
 # prefix stays resumable when the pool needs its tail. Policy after bertholomus/TensorFold v0.5 (508bfb3, kept prompts
@@ -366,7 +378,7 @@ class MultiDecoder:
                 g["pos"].copy_(torch.arange(R) + 200)
                 g["sid"].copy_(torch.arange(R) % e.slots)
                 best = float("inf")
-                for _ in range(4):
+                for _ in range(CALIB_REPS):
                     torch.cuda.synchronize()
                     t = time.perf_counter()
                     e._replay_free(g)
@@ -548,6 +560,9 @@ class MultiDecoder:
         width, self.costs = next(((w, c) for w, c in self.curves if need <= w), self.curves[-1])
         if self.one is not None and len(live) == 1 and width == self.one[0]:
             self.costs = self.one[1]                                # TF_DSV41_COSTS=depth: one stream's own curve
+        if COST_CURVE:
+            n = min(len(COST_CURVE), len(self.costs))
+            self.costs = [*COST_CURVE[:n], *(COST_CURVE[n - 1] + c - self.costs[n - 1] for c in self.costs[n:])]
         rows, drafting = len(live), 0
         tokens = float(len(live))
         rate = tokens / (self.costs[rows - 1] + self.overhead)
@@ -622,6 +637,9 @@ class MultiDecoder:
             hit = 1.0 if j < m else 0.0
             s.acc[j] = (1 - a) * s.acc[j] + a * hit
             self.prior[j] = (1 - a / 4) * self.prior[j] + a / 4 * hit
+        if DRAFT_BORROW and 0 < k == m:
+            for j in range(k, len(s.acc)):
+                s.acc[j] += a * (s.acc[k - 1] - s.acc[j])
 
     def _learn_copy(self, s: Stream, k: int, m: int) -> None:
         """A copy round kept m of its k drafts: the running share; below MULTI_COPY_MIN, wait 2, 4 .. 64 rounds (a
