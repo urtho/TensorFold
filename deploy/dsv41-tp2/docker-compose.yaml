@@ -104,6 +104,7 @@ services:
       TF_EXPERT_LOADS_CFG: ${TF_EXPERT_LOADS_CFG:-}
       TF_X3LD_ORDER: ${TF_X3LD_ORDER:-}
       TF_EXPERT_GROUP: ${TF_EXPERT_GROUP:-}           # par: decode grouping writes members one thread a pick
+      TF_X3LD_PDL: ${TF_X3LD_PDL:-}                   # 1: the expert load kernels as programmatic dependent launches
       # copy drafts in concurrent rounds (empty / 0: off, 1: on; exact) and the kept share under which a stream backs
       # off (0.3); neither enters the calibration cache's key
       TF_MULTI_COPY: ${TF_MULTI_COPY:-}

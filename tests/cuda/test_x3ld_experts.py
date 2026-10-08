@@ -257,3 +257,42 @@ def test_l2_discard_row_gate_on_one_scratch(monkeypatch):
         outs[on] = [ex3.routed(x, p, w, ex, s, None, R).clone() for R, x, p, w in calls]
     for a, b in zip(outs[False], outs[True]):
         assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("R", [1, 6, 16])
+def test_pdl_launch_equals_plain_in_a_graph(R, monkeypatch):
+    """TF_X3LD_PDL=1: routed() with both x3ld launches programmatic gives the plain launches' bits, eager and from a
+    CUDA graph replayed 20 times over changing inputs (rot_in / gateup_epilogue may still run at the prologue)."""
+
+    E, slots, D, I = 24, 7, 5120, 1152
+    ex = layer(E, D, I, [8] * E, D + I)
+    g = torch.Generator(device="cuda").manual_seed(13 + R)
+    xs = [torch.randn((R, D), generator=g, device="cuda").to(torch.bfloat16) for _ in range(20)]
+    picks = [_picks(R, E, slots, g, E - 1) for _ in range(20)]
+    wts = [torch.rand((R, slots), generator=g, device="cuda") for _ in range(20)]
+    outs = {}
+    for pdl in (False, True):
+        monkeypatch.setitem(x3ld.CFG, "pdl", pdl)
+        s = ex3.Scratch(ex, 16, slots)
+        eager = [ex3.routed(x, p, w, ex, s, None, R).clone() for x, p, w in zip(xs, picks, wts)]
+        xb, pb, wb = xs[0].clone(), picks[0].clone(), wts[0].clone()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            ex3.routed(xb, pb, wb, ex, s, None, R)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = ex3.routed(xb, pb, wb, ex, s, None, R)
+        replayed = []
+        for x, p, w in zip(xs, picks, wts):
+            xb.copy_(x)
+            pb.copy_(p)
+            wb.copy_(w)
+            graph.replay()
+            replayed.append(out.clone())
+        outs[pdl] = (eager, replayed)
+    for a, b in zip(outs[False][0] + outs[False][1], outs[True][0] + outs[True][1]):
+        assert torch.equal(a, b), R
+    for a, b in zip(outs[True][0], outs[True][1]):
+        assert torch.equal(a, b), R

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jay Leaton. The DeepSeek-V4.1-Flash family of TensorFold (Apache-2.0): see THIRD_PARTY_NOTICES.md.
 # Modified for TensorFold dsv41-cuda: from patches/0002 src/tensorfold/families/deepseek_v41/cuda/expert_loads.py of
-# deepseek-v41-tensorfold-spark, without the PDL launch; TF_EXPERT_LOADS; TF_X3LD_ORDER (the expert-major order of
+# deepseek-v41-tensorfold-spark, its PDL launch behind TF_X3LD_PDL; TF_EXPERT_LOADS; TF_X3LD_ORDER (the expert-major order of
 # bertholomus/TensorFold deepseek-v41-tp2 grouped_cp_kernel, Apache-2.0, Copyright 2026 BertholomusAI), deeper rings.
 """The routed experts' load path (``x3ld.cu``): upstream's grouped EXL3 expert kernel with 16-byte, several-deep
 weight loads, the same Z (each output element's warp K range, mma chain and warp sum order are upstream's; only when
@@ -17,6 +17,10 @@ the bytes arrive changes).
 ``TF_X3LD_ORDER``            grid (default: blockIdx as is, distinct experts fastest) | expert (expert-major: one
                              expert's programs adjacent, the dead slots past ucount the grid's tail). The same Z.
 ``TF_X3LD_PROBE``            3: the load path alone, no decode and no mma -- timing only, WRONG results (default 0).
+``TF_X3LD_PDL``              1: launched as programmatic dependent launches (default 0: plain launches). The prologue
+                             (trellis words, the grouping's ucount / uids / members, a launch further back) runs while
+                             the kernel before (rot_in, gateup_epilogue) finishes; X and Z only after griddepcontrol.wait
+                             (``x3ld.cu``'s invariant). The same Z.
 """
 
 from __future__ import annotations
@@ -53,7 +57,7 @@ def _parse() -> dict:
     if probe and not {gu, dn} <= set(PROBE_CFGS):
         raise ValueError(f"TF_X3LD_PROBE=3 is built for {PROBE_CFGS}")
     return {"on": os.environ.get("TF_EXPERT_LOADS", "1") != "0", "gu": gu, "dn": dn, "order": ORDERS[order],
-            "probe": probe}
+            "probe": probe, "pdl": os.environ.get("TF_X3LD_PDL", "") == "1"}
 
 
 CFG = _parse()
@@ -98,5 +102,5 @@ def grouped(x0, x1, tp0, tp1, k2_0, k2_1, ids, count, members, z, mats: int, K: 
     if rng is None or cb != 2 or not fits(K, N, sk, warps, cfg):
         return False
     _ext().grouped(x0, x1, tp0, tp1, k2_0, k2_1, ids, count, members, z, mats, K, N, P, sk, slots, cb, cfg[0],
-                   cfg[1], probe, rng[0], rng[1], False, order)
+                   cfg[1], probe, rng[0], rng[1], bool(CFG.get("pdl")), order)
     return True
