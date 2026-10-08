@@ -60,7 +60,7 @@ def test_defaults_off(monkeypatch, reload):
 def test_extension_names_bumped():
     """experts.cu / experts.cpp and mqa_fp4.cu changed signatures: a stale build under the old name must not load."""
 
-    assert 'name="tensorfold_exl3_experts_v2"' in (ROOT / "src/tensorfold/cuda/exl3/experts.py").read_text()
+    assert 'name="tensorfold_exl3_experts_v3"' in (ROOT / "src/tensorfold/cuda/exl3/experts.py").read_text()
     src = (ROOT / "src/tensorfold/families/deepseek_v41/cuda/mqa_fp4.py").read_text()
     assert '"tf_dsv41_mqa_fp4_lut_v8" if lut else "tf_dsv41_mqa_fp4_v8"' in src
 

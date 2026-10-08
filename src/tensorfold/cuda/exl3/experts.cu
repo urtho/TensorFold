@@ -16,11 +16,16 @@ constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
 constexpr int GROUP_THREADS = 1024;
 constexpr int GROUP_PER_THREAD = 4;
 
-__global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restrict__ pick, int* __restrict__ uids,
+// PAR (TF_EXPERT_GROUP=par): the members are written one thread a pick, at its rank among the earlier picks of its
+// expert (the serial fill's j), after each expert's place is in shared memory; the same uids, count and members
+// (bertholomus/TensorFold experts.cu's one-thread-a-pick placement, Apache-2.0; the idea, no code copied).
+template <bool PAR>
+__global__ void __launch_bounds__(GROUP_THREADS) group_kernel_t(const int* __restrict__ pick, int* __restrict__ uids,
                                                               int* __restrict__ ucount, int* __restrict__ members,
                                                               int R, int slots, int E, int maxm) {
     extern __shared__ int sh_pick[];
     __shared__ int warp_tot[GROUP_THREADS / 32];
+    __shared__ int sh_place[PAR ? GROUP_THREADS * GROUP_PER_THREAD : 1];
     const int n = R * slots;
     for (int i = threadIdx.x; i < n; i += GROUP_THREADS) sh_pick[i] = pick[i];
     __syncthreads();
@@ -58,6 +63,26 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
     }
     __syncthreads();
     int place = warp_tot[warp] + inc - used;
+    if (PAR) {
+#pragma unroll
+        for (int q = 0; q < GROUP_PER_THREAD; ++q) {
+            if (cnt[q] == 0) continue;
+            const int e = threadIdx.x * GROUP_PER_THREAD + q;
+            uids[place] = e;
+            sh_place[e] = place;
+            for (int j = min(cnt[q], maxm); j < maxm; ++j) members[place * maxm + j] = -1;
+            ++place;
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < n; i += GROUP_THREADS) {
+            const int e = sh_pick[i];
+            if (e < 0 || e >= E) continue;
+            int j = 0;
+            for (int k = 0; k < i; ++k) j += sh_pick[k] == e;
+            if (j < maxm) members[sh_place[e] * maxm + j] = (i / slots) * 32 + (i % slots);
+        }
+        return;
+    }
 #pragma unroll
     for (int q = 0; q < GROUP_PER_THREAD; ++q) {
         if (cnt[q] == 0) continue;
@@ -325,11 +350,12 @@ void exl3x_dequant_cuda(const at::Tensor& T, at::Tensor& out, int64_t K, int64_t
 }
 
 void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucount, at::Tensor& members, int64_t R,
-                      int64_t slots, int64_t E) {
+                      int64_t slots, int64_t E, int64_t par) {
+    auto group_kernel = par ? group_kernel_t<true> : group_kernel_t<false>;
     TORCH_CHECK(E <= GROUP_THREADS * GROUP_PER_THREAD, "too many experts for the grouping kernel");
     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
     const size_t smem = (size_t)R * slots * sizeof(int);
-    constexpr size_t static_smem = GROUP_THREADS / 32 * sizeof(int);
+    const size_t static_smem = (GROUP_THREADS / 32 + (par ? GROUP_THREADS * GROUP_PER_THREAD : 1)) * sizeof(int);
     if (smem + static_smem > 48 * 1024) {
         cudaFuncAttributes attributes;
         C10_CUDA_CHECK(cudaFuncGetAttributes(&attributes, group_kernel));

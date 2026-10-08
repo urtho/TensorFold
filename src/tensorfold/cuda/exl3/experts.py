@@ -33,6 +33,11 @@ DISCARD = bool(_L2 & {"moe", "all"})
 # ... only in calls of at least this many rows (TF_DSV41_L2_DISCARD_ROWS; 0, the default: every call, as before): the
 # 2026-10-08 A/B measured moe discard at R=1 +0.4 ms, R=6 -0.9 ms. Only a cache hint: no value changes
 DISCARD_ROWS = int(os.environ.get("TF_DSV41_L2_DISCARD_ROWS") or 0)
+# the grouping kernel's member lists one thread a pick (TF_EXPERT_GROUP=par; empty, the default: a serial fill an
+# expert), in decode-sized calls (rows x slots <= GROUP_PAR_PICKS: each pick counts its earlier picks); the same uids,
+# count and members
+GROUP_PAR = os.environ.get("TF_EXPERT_GROUP", "") == "par"
+GROUP_PAR_PICKS = 16 * 7
 SKIP_SHARED = os.environ.get("TF_SKIP_SHARED") == "1"
 
 
@@ -42,7 +47,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v2", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v3", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -210,7 +215,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
     if group:
-        ext.group(pick, ids, s.count, members, R, slots, E)
+        ext.group(pick, ids, s.count, members, R, slots, E, int(GROUP_PAR and R * slots <= GROUP_PAR_PICKS))
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
     nt, w, sk, pf = s.cfg_gu
     if not x3ld.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D,
