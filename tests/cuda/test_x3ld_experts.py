@@ -236,3 +236,24 @@ def test_res_fold_equals_add(on, monkeypatch):
             res = shared * 1.0
         got = ex3.routed(x, pick, wts, ex, s, None, R, res=res, before_combine=lambda: main.wait_stream(side))
         assert torch.equal(got, want), R
+
+
+def test_l2_discard_row_gate_on_one_scratch(monkeypatch):
+    """TF_DSV41_L2_DISCARD_ROWS: one Scratch, calls alternating R in (1, 6, 2, 4) with the moe discard on for R >= 4
+    only, give the bits of discard off throughout."""
+
+    E, slots, D, I = 24, 7, 5120, 1152
+    ex = layer(E, D, I, [8] * E, D + I)
+    g = torch.Generator(device="cuda").manual_seed(11)
+    calls = []
+    for R in (1, 6, 2, 4) * 6:
+        calls.append((R, torch.randn((R, D), generator=g, device="cuda").to(torch.bfloat16),
+                      _picks(R, E, slots, g, E - 1), torch.rand((R, slots), generator=g, device="cuda")))
+    outs = {}
+    for on, rows in ((False, 0), (True, 4)):
+        monkeypatch.setattr(ex3, "DISCARD", on)
+        monkeypatch.setattr(ex3, "DISCARD_ROWS", rows)
+        s = ex3.Scratch(ex, 16, slots)
+        outs[on] = [ex3.routed(x, p, w, ex, s, None, R).clone() for R, x, p, w in calls]
+    for a, b in zip(outs[False], outs[True]):
+        assert torch.equal(a, b)

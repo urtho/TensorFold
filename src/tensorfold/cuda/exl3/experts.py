@@ -30,6 +30,9 @@ _L2 = {t.strip() for t in os.environ.get("TF_DSV41_L2_DISCARD", "").split(",")} 
 if _L2 - {"po", "moe", "all", "lin"}:                         # (the same check as deepseek_v41/cuda/mqa_fp4.py)
     raise ValueError(f"TF_DSV41_L2_DISCARD: unknown {sorted(_L2 - {'po', 'moe', 'all', 'lin'})}")
 DISCARD = bool(_L2 & {"moe", "all"})
+# ... only in calls of at least this many rows (TF_DSV41_L2_DISCARD_ROWS; 0, the default: every call, as before): the
+# 2026-10-08 A/B measured moe discard at R=1 +0.4 ms, R=6 -0.9 ms. Only a cache hint: no value changes
+DISCARD_ROWS = int(os.environ.get("TF_DSV41_L2_DISCARD_ROWS") or 0)
 SKIP_SHARED = os.environ.get("TF_SKIP_SHARED") == "1"
 
 
@@ -214,7 +217,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
                         I, P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1]):     # (TF_EXPERT_LOADS: the same Z)
         ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
                     P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1])
-    disc = int(DISCARD and wts is not None)
+    disc = int(DISCARD and wts is not None and R >= DISCARD_ROWS)
     zlive = s.cfg_d[2] * P * D                         # the down Z: rewritten next, so not dropped
     ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode,
                         s.xg, s.xu, zlive, disc)
