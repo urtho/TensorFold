@@ -161,6 +161,10 @@ if L2_JOIN not in ("use", "end"):
     raise ValueError(f"TF_L2_JOIN={L2_JOIN}: use or end")
 PF_WOA = os.environ.get("TF_PF_WOA") == "1"            # (experiment) wo_a weights into L2 during the attention core   # measured: no gain at one row (and idle gaps before the gather)
 SKIP_SHARED = os.environ.get("TF_SKIP_SHARED") == "1"
+# decode / verify rows, shared expert beside the routed ones: the routed combine adds the shared expert's output
+# (down_combine's res: the same fp32 add as ``routed + shared``, one launch fewer on the main stream); the shared chain
+# starts first on a side stream and the combine waits for it. Default off until measured.
+RES_FOLD = os.environ.get("TF_DSV41_RES_FOLD") == "1"
 PF_PROGRAMS = int(os.environ.get("TF_PF_PROGRAMS") or 4)
 # decode / verify step as one graph: the graph waits on a pinned-memory flag for each table's rows (read by the host
 # meanwhile) instead of three graphs launched around the reads (each graph switch left the GPU idle ~0.7 ms)
@@ -1694,10 +1698,22 @@ class SerialEngine:
         if R <= PROMPT_ROWS:                                        # the whole shared expert beside the routed ones
             if SKIP_SHARED:
                 return self.comm.partials(routed_rows())
-            routed, shared = self.par(routed_rows, lambda: m.shared[2](shared_act(), out_dtype=F32))
+            if RES_FOLD:                                            # Par's order, joined only before the combine
+                main = torch.cuda.current_stream()
+                side = self.par.streams[0] if PAR_DECODE else None
+                if side is not None:
+                    side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    shared = m.shared[2](shared_act(), out_dtype=F32)
+                pick, w = route()
+                summed = ex3.routed(x.contiguous(), pick, w, m.experts, scratch, None, R, limit=limit, res=shared,
+                                    before_combine=(lambda: main.wait_stream(side)) if side is not None else None)
+            else:
+                routed, shared = self.par(routed_rows, lambda: m.shared[2](shared_act(), out_dtype=F32))
+                summed = routed + shared
             main_layer = layer.index < len(self.scratch) and scratch is self.scratch[layer.index]   # (not drafter)
             pf = self._pf_attn.get(layer.index) if main_layer else None
-            return self.comm.partials(routed + shared,
+            return self.comm.partials(summed,
                                       during=(lambda: self._prefetch(pf, site="attn")) if pf is not None else None)
         pick, w = route()
         routed = routed_prompt(x.contiguous(), pick, w, m.experts, scratch, R, limit)

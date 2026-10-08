@@ -379,11 +379,21 @@ split_kernel(const __nv_bfloat16* __restrict__ Q, const uint8_t* __restrict__ CQ
 // Finish rows: per (row, head), the parts folded group by group (``ppg`` parts a group, in order: the group's
 // stages folded left to right; warp w takes groups w, w + 4, ..), then the groups folded onto the sink (a logit with
 // a zero value vector); divide, inverse RoPE of the last 2 * half dims (cos / sin given: bf16 out) or fp32 out.
+// discard (TF_DSV41_L2_DISCARD=po): once the block has read them, the (row, head)'s partials leave L2 without their
+// write-back (this block is their only reader; the next split launch rewrites them; an empty part's PO, never
+// written, is dropped by the folds' select either way).
 constexpr int MAXG = 8, MAXPPG = 8;
+
+__device__ __forceinline__ void discard_po(const float* PO, int r, int h, int nparts) {
+    for (int i = threadIdx.x; i < nparts * (D / 32); i += blockDim.x)     // 16 lines of 128 bytes a part
+        asm volatile("discard.global.L2 [%0], 128;" ::"l"(PO + (((int64_t)r * nparts + i / (D / 32)) * H + h) * D +
+                                                            (i % (D / 32)) * 32) : "memory");
+}
+
 __global__ void __launch_bounds__(128)
 merge_kernel(const float* __restrict__ PO, const float* __restrict__ PM, const float* __restrict__ PL,
              const float* __restrict__ SINK, const int64_t* __restrict__ POS, const float* __restrict__ COS,
-             const float* __restrict__ SIN, int half, void* __restrict__ OUT, int nparts, int ppg) {
+             const float* __restrict__ SIN, int half, void* __restrict__ OUT, int nparts, int ppg, int discard) {
     __shared__ __align__(16) float gv[MAXG][D];
     __shared__ float gml[MAXG][2];
     const int r = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -430,6 +440,7 @@ merge_kernel(const float* __restrict__ PO, const float* __restrict__ PM, const f
         }
     }
     __syncthreads();
+    if (discard) discard_po(PO, r, h, nparts);          // (after the barrier: every warp's PO loads are folded)
     const int d = tid * 4;
     float fm = SINK[h], fl = 1.f;
     float4 fo = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -470,7 +481,7 @@ template <int MB>
 __global__ void __launch_bounds__(128)
 merge_flat(const float* __restrict__ PO, const float* __restrict__ PM, const float* __restrict__ PL,
              const float* __restrict__ SINK, const int64_t* __restrict__ POS, const float* __restrict__ COS,
-             const float* __restrict__ SIN, int half, void* __restrict__ OUT, int nparts, int ppg) {
+             const float* __restrict__ SIN, int half, void* __restrict__ OUT, int nparts, int ppg, int discard) {
     const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x * 4;
     float fm = SINK[h], fl = 1.f;
     float4 fo = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -515,6 +526,10 @@ merge_flat(const float* __restrict__ PO, const float* __restrict__ PM, const flo
             }
         }
     }
+    if (discard) {                                        // (a kernel argument: uniform)
+        __syncthreads();                                  // a thread loads its own dims, the lines span 8 threads
+        discard_po(PO, r, h, nparts);
+    }
     float o[4] = {__fdiv_rn(fo.x, fl), __fdiv_rn(fo.y, fl), __fdiv_rn(fo.z, fl), __fdiv_rn(fo.w, fl)};
     const int64_t ob = ((int64_t)r * H + h) * D + d;
     if (COS != nullptr) {
@@ -554,12 +569,13 @@ int64_t stages_of(int64_t n_idx) { return (n_idx + tf_mqa4::ST - 1) / tf_mqa4::S
 // pos int64 [R]; sbase int64 [R] (the row's ring's first row) or None (0); sink fp32 [32]; cos / sin fp32 [positions,
 // half] (inverse RoPE, bf16 out) or None (fp32 out); out [R, 32, 512]; po / pm / pl partial scratch; ring: rows a
 // ring (a power of two); group: stages a group (the fixed reduction tree); per: stages a CTA, 1 or ``group`` (the
-// same result either way). Returns the parts written.
+// same result either way); discard: the merge drops the partials from L2 once read (po 128-byte aligned, else not).
+// Returns the parts written.
 int64_t attend_rows(torch::Tensor q, c10::optional<torch::Tensor> cq, c10::optional<torch::Tensor> cs,
                     c10::optional<torch::Tensor> idx, torch::Tensor swa, torch::Tensor pos,
                     c10::optional<torch::Tensor> sbase, torch::Tensor sink, c10::optional<torch::Tensor> cosp,
                     c10::optional<torch::Tensor> sinp, torch::Tensor out, torch::Tensor po, torch::Tensor pm,
-                    torch::Tensor pl, int64_t ring, int64_t group, int64_t per, double scale) {
+                    torch::Tensor pl, int64_t ring, int64_t group, int64_t per, double scale, int64_t discard) {
     using namespace tf_mqa4;
     TORCH_CHECK(group >= 1 && group <= MAXPPG && (per == 1 || per == group), "per: 1 or group (<= 8)");
     TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kBFloat16 && q.dim() == 3 && q.size(1) == H && q.size(2) == D &&
@@ -632,7 +648,8 @@ int64_t attend_rows(torch::Tensor q, c10::optional<torch::Tensor> cq, c10::optio
     merge<<<dim3((unsigned)R, H), 128, 0, st>>>(
         po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(), sink.data_ptr<float>(),
         pos.data_ptr<int64_t>(), rope ? cosp->data_ptr<float>() : nullptr, rope ? sinp->data_ptr<float>() : nullptr,
-        half, out.data_ptr(), nparts, (int)(group / per));
+        half, out.data_ptr(), nparts, (int)(group / per),
+        (int)(discard && reinterpret_cast<uintptr_t>(po.data_ptr()) % 128 == 0));   // (rows of 2 KiB: whole lines)
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return nparts;
 }

@@ -232,3 +232,38 @@ def test_build_has_no_spills():
     assert len(found) == 3
     for usage in found:
         assert "STACK:0 " in usage and "LOCAL:0 " in usage, usage
+
+
+@pytest.mark.parametrize("R", [1, 2, 6])
+@pytest.mark.parametrize("n_idx", [0, 64, 512])
+def test_l2_discard_is_bit_identical(cuda_mqa, monkeypatch, R, n_idx):
+    """TF_DSV41_L2_DISCARD=po: the merge (R=1: merge_kernel, a part a stage; R>1: merge_flat) drops the partials from
+    L2 once read; the outputs equal the switch off bit for bit, call after call on one buffer, with empty parts, in a
+    graph replay, and on a misaligned partial buffer (no discard there)."""
+
+    rows = _cache(7) if n_idx else None
+    q, idx, swa, pos, sink, kw = _case(R, 50 + R + n_idx, streams=2, comp=n_idx > 0, n_idx=max(n_idx, 1))
+    if n_idx:
+        idx[:, n_idx // 2:] = -1                       # whole stages empty (their partials never written)
+        idx[0, :] = -1
+    cos, sin = _tables()
+    outs = {}
+    for on in (False, True):
+        monkeypatch.setattr(mqa_fp4, "DISCARD", on)
+        buf = K.AttnBuffers(32, H, D, 512 + W)
+        seq = [K.mqa(q, rows, idx, swa, pos, sink, W, buf, D ** -0.5, cos, sin, **kw).clone() for _ in range(5)]
+        seq += [K.mqa(q, rows, idx, swa, pos, sink, W, buf, D ** -0.5, **kw).clone()]          # fp32 out
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = K.mqa(q, rows, idx, swa, pos, sink, W, buf, D ** -0.5, cos, sin, **kw)
+        for _ in range(3):
+            graph.replay()
+            seq.append(out.clone())
+        buf.po = buf.po[1:]                                # 4 bytes off a line: the merge must not discard
+        seq.append(K.mqa(q, rows, idx, swa, pos, sink, W, buf, D ** -0.5, cos, sin, **kw).clone())
+        outs[on] = seq
+    for a, b in zip(outs[False], outs[True]):
+        assert torch.equal(a, b)
+    for a in outs[False][1:5]:
+        assert torch.equal(a, outs[False][0])

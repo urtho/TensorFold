@@ -612,7 +612,7 @@ def mqa(q: torch.Tensor, comp: torch.Tensor | None, idx: torch.Tensor | None, sw
             ext.attend_rows(q.contiguous(), comp.q if q4 else None, comp.s if q4 else None,
                             idx.int() if idx is not None else None, swa, pos.long(),
                             sbase.long() if sbase is not None else None, sink.float(), cos, sin, out, buf.po, buf.pm,
-                            buf.pl, ring or swa.shape[0], mqa_fp4.GROUP, per, scale)
+                            buf.pl, ring or swa.shape[0], mqa_fp4.GROUP, per, scale, int(mqa_fp4.DISCARD))
             return out
     if rope and R > FULL_ROWS and q4 and idx is not None and comp_bf16 is None:
         comp_bf16 = deq_entries(comp, n_comp)

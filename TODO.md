@@ -254,7 +254,9 @@ structured 119.31 -> 124.85, c1 106.67 -> 109.60, hard 50.70 -> 53.01 tok/s.
 - [x] Kept-prompt trimming (`TF_DSV41_KEEP_SHRINK`, default on): prompts >= 128K also kept (exactly) at 3/4 and 7/8;
       room is made by dropping loose extents' longest states (`multi._trim`) before whole extents are evicted
 - [ ] Verify-window levers still open (bertholomus bd0024d): dead fp32 scratch discarded from L2, the mHC finish split
-      with its Sinkhorn on a side stream, wo_a's rotation folded into the attention merge, norm + rot_in fusion
+      with its Sinkhorn on a side stream, wo_a's rotation folded into the attention merge, norm + rot_in fusion.
+      L2 discard implemented, default off (`TF_DSV41_L2_DISCARD=po,moe`, with `TF_DSV41_RES_FOLD`): first an ncu
+      dram__bytes_write check that GB10 honours discard.global.L2 at all (it drops prefetch.global.L2), then the A/B
 
 ## Open (2026-10-05)
 
