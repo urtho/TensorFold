@@ -297,8 +297,11 @@ deepseek-v41-tp2:
   candidate-only reindex scoring (v0.5; also coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark 1d8ac64); the prompt-chunk
   expert work list built on the device (v0.5, `work_list_kernel`); RoCE gather rings in cudaHostRegister'd memory with
   one system fence a block and the own slice copied early (bd0024d); a decode round's index arithmetic once a graph
-  piece (bd0024d rounds.py `_ix`, TF_DS_ROUND_GLUE; here `serial.py` `_round_bases`, `TF_DSV41_IDX_BASE`). The
-  counts without bincount's host read follow jayleaton/deepseek-v41-tensorfold-spark PR #17 (Apache-2.0).
+  piece (bd0024d rounds.py `_ix`, TF_DS_ROUND_GLUE; here `serial.py` `_round_bases`, `TF_DSV41_IDX_BASE`); the
+  mHC finish split into Sinkhorn | collapse and the partial mixes + Sinkhorn on a side stream (bd0024d TF_DS_HC_SPLIT
+  / HC_DEFER / HC_DOTS; here `hc.py` `_pre_finish2` / `_pre_sinkhorn` / `_pre_collapse`, the halves being
+  `_pre_finish`'s own code). The counts without bincount's host read follow jayleaton/deepseek-v41-tensorfold-spark
+  PR #17 (Apache-2.0).
 
 ## Ideas from AGPL-licensed recipes (no code included)
 

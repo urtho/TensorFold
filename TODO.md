@@ -255,6 +255,10 @@ structured 119.31 -> 124.85, c1 106.67 -> 109.60, hard 50.70 -> 53.01 tok/s.
       room is made by dropping loose extents' longest states (`multi._trim`) before whole extents are evicted
 - [ ] Verify-window levers still open (bertholomus bd0024d): dead fp32 scratch discarded from L2, the mHC finish split
       with its Sinkhorn on a side stream, wo_a's rotation folded into the attention merge, norm + rot_in fusion
+  - [ ] mHC: written behind switches, default off until the GPU A/B (tests/cuda/test_dsv41_hc.py, quick tier,
+        decode-bench / jaybench, then a BENCH.md row): `TF_DSV41_HC_SPLIT=1` (Sinkhorn | collapse in one launch),
+        `TF_DSV41_HC_SIDE=1` (partials + Sinkhorn on a side stream from `layers` only), `TF_DSV41_HC_SIDE_PART=0`
+        (only the Sinkhorn moves)
 
 ## Open (2026-10-05)
 

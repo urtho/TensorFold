@@ -23,7 +23,7 @@ PROMPT_ROWS = int(__import__("os").environ.get("TF_DSV41_DECODE_ROWS") or 32)
 
 
 @triton.jit
-def _pre_partial(X, FN, PART, WIDE: tl.constexpr, NBLK: tl.constexpr, SUBK: tl.constexpr):
+def _pre_partial(X, FN, PART, WIDE: tl.constexpr, NBLK: tl.constexpr, SUBK: tl.constexpr, EVICT: tl.constexpr = ""):
     r = tl.program_id(0)
     b = tl.program_id(1)
     KB: tl.constexpr = WIDE // NBLK
@@ -34,7 +34,7 @@ def _pre_partial(X, FN, PART, WIDE: tl.constexpr, NBLK: tl.constexpr, SUBK: tl.c
     for t in range(KB // SUBK):
         base = b * KB + t * SUBK
         x = tl.load(X + r * WIDE + base + k).to(tl.float32)
-        w = tl.load(FN + m[:, None] * WIDE + base + k[None, :], mask=m[:, None] < 24, other=0.0)
+        w = tl.load(FN + m[:, None] * WIDE + base + k[None, :], mask=m[:, None] < 24, other=0.0, eviction_policy=EVICT)
         acc += tl.sum(w * x[None, :], axis=1)
         ss += x * x
     tl.store(PART + (r * NBLK + b) * 32 + m, acc, mask=m < 24)
@@ -128,6 +128,100 @@ def _pre_finish(X, PART, BASE, SCALE, PRE_IN, NW, OUT, PRE, POST, COMB, eps_norm
             v = (p0 * x0 + p1 * x1 + p2 * x2 + p3 * x3).to(tl.bfloat16).to(tl.float32)
         w = tl.load(NW + o).to(tl.float32)
         tl.store(OUT + r * D + o, (v * rinv * w).to(tl.bfloat16))
+
+
+# TF_DSV41_HC_SPLIT / HC_SIDE: _pre_finish's two independent halves, verbatim, as their own programs. The Sinkhorn
+# (post, comb, pre: read a sublayer later) and the collapse (x_in: read next; X, PRE_IN, NW only)
+@triton.jit
+def _sinkhorn_row(r, PART, BASE, SCALE, PRE, POST, COMB, eps_norm, hc_eps, D: tl.constexpr, NBLK: tl.constexpr,
+                  ITERS: tl.constexpr):
+    m = tl.arange(0, 32)
+    mix = tl.zeros((32,), dtype=tl.float32)
+    ss = 0.0
+    for b in range(NBLK):
+        mix += tl.load(PART + (r * NBLK + b) * 32 + m)
+        ss += tl.load(PART + (r * NBLK + b) * 32 + 24)
+    mix = mix * (1.0 / tl.sqrt(ss / (4 * D) + eps_norm))
+    s_pre = tl.load(SCALE + 0)
+    s_post = tl.load(SCALE + 1)
+    s_comb = tl.load(SCALE + 2)
+    base = tl.load(BASE + m, mask=m < 24, other=0.0)
+    sv = tl.arange(0, 4)
+    pre_logit = tl.sum(tl.where(m[None, :] == sv[:, None], (mix * s_pre + base)[None, :], 0.0), axis=1)
+    post_logit = tl.sum(tl.where(m[None, :] == (sv[:, None] + 4), (mix * s_post + base)[None, :], 0.0), axis=1)
+    pre = 1.0 / (1.0 + tl.exp(-pre_logit)) + hc_eps
+    post = 2.0 / (1.0 + tl.exp(-post_logit))
+    ii = tl.arange(0, 4)[:, None]
+    jj = tl.arange(0, 4)[None, :]
+    flat = 8 + ii * 4 + jj
+    cl = tl.sum(tl.where(m[None, None, :] == flat[:, :, None], (mix * s_comb + base)[None, None, :], 0.0), axis=2)
+    ce = tl.exp(cl - tl.max(cl, axis=1)[:, None])
+    comb = ce / tl.sum(ce, axis=1)[:, None] + hc_eps
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
+    for _ in range(ITERS - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + hc_eps)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
+    tl.store(PRE + r * 4 + sv, pre)
+    tl.store(POST + r * 4 + sv, post)
+    tl.store(COMB + r * 16 + ii * 4 + jj, comb)
+
+
+@triton.jit
+def _collapse_row(r, X, PRE_IN, NW, OUT, eps_norm, D: tl.constexpr, CH: tl.constexpr, COLLAPSED: tl.constexpr):
+    # collapse with the carried-in pre-mix, round to bf16, RMSNorm with the sublayer's weight
+    p0 = tl.load(PRE_IN + r * 4 + 0)
+    p1 = tl.load(PRE_IN + r * 4 + 1)
+    p2 = tl.load(PRE_IN + r * 4 + 2)
+    p3 = tl.load(PRE_IN + r * 4 + 3)
+    d = tl.arange(0, CH)
+    sq = 0.0
+    for c in range(D // CH):
+        o = c * CH + d
+        if COLLAPSED:
+            v = tl.load(X + r * D + o).to(tl.float32)
+        else:
+            x0 = tl.load(X + r * (4 * D) + o).to(tl.float32)
+            x1 = tl.load(X + r * (4 * D) + D + o).to(tl.float32)
+            x2 = tl.load(X + r * (4 * D) + 2 * D + o).to(tl.float32)
+            x3 = tl.load(X + r * (4 * D) + 3 * D + o).to(tl.float32)
+            v = (p0 * x0 + p1 * x1 + p2 * x2 + p3 * x3).to(tl.bfloat16).to(tl.float32)
+        sq += tl.sum(v * v, axis=0)
+    rinv = 1.0 / tl.sqrt(sq / D + eps_norm)
+    for c in range(D // CH):
+        o = c * CH + d
+        if COLLAPSED:
+            v = tl.load(X + r * D + o).to(tl.float32)
+        else:
+            x0 = tl.load(X + r * (4 * D) + o).to(tl.float32)
+            x1 = tl.load(X + r * (4 * D) + D + o).to(tl.float32)
+            x2 = tl.load(X + r * (4 * D) + 2 * D + o).to(tl.float32)
+            x3 = tl.load(X + r * (4 * D) + 3 * D + o).to(tl.float32)
+            v = (p0 * x0 + p1 * x1 + p2 * x2 + p3 * x3).to(tl.bfloat16).to(tl.float32)
+        w = tl.load(NW + o).to(tl.float32)
+        tl.store(OUT + r * D + o, (v * rinv * w).to(tl.bfloat16))
+
+
+@triton.jit
+def _pre_finish2(X, PART, BASE, SCALE, PRE_IN, NW, OUT, PRE, POST, COMB, eps_norm, hc_eps,
+                 D: tl.constexpr, NBLK: tl.constexpr, ITERS: tl.constexpr, CH: tl.constexpr):
+    """_pre_finish as two programs a row (grid (R, 2)): the Sinkhorn beside the collapse, not before it."""
+
+    r = tl.program_id(0)
+    if tl.program_id(1) == 0:
+        _sinkhorn_row(r, PART, BASE, SCALE, PRE, POST, COMB, eps_norm, hc_eps, D, NBLK, ITERS)
+    else:
+        _collapse_row(r, X, PRE_IN, NW, OUT, eps_norm, D, CH, False)
+
+
+@triton.jit
+def _pre_sinkhorn(PART, BASE, SCALE, PRE, POST, COMB, eps_norm, hc_eps, D: tl.constexpr, NBLK: tl.constexpr,
+                  ITERS: tl.constexpr):
+    _sinkhorn_row(tl.program_id(0), PART, BASE, SCALE, PRE, POST, COMB, eps_norm, hc_eps, D, NBLK, ITERS)
+
+
+@triton.jit
+def _pre_collapse(X, PRE_IN, NW, OUT, eps_norm, D: tl.constexpr, CH: tl.constexpr):
+    _collapse_row(tl.program_id(0), X, PRE_IN, NW, OUT, eps_norm, D, CH, False)
 
 
 @triton.jit
@@ -249,10 +343,24 @@ class HCBuffers:
         self.rows, self.dims = rows, dims
 
 
+# decode / verify rows (exact: the same kernels and bodies, only split or moved to a stream; default off until the
+# GPU A/B). TF_DSV41_HC_SPLIT=1: the finish as Sinkhorn | collapse programs side by side (one launch).
+# TF_DSV41_HC_SIDE=1: with a ``side`` stream (serial.layers only, which joins it before the next post and where it
+# ends), the mix partials and the Sinkhorn run there and only the collapse on the caller's stream;
+# TF_DSV41_HC_SIDE_PART=0 keeps the partials on the caller's stream (only the Sinkhorn moves: no DRAM on the side).
+# Idea after bertholomus/TensorFold bd0024d (TF_DS_HC_SPLIT / HC_DEFER / HC_DOTS; Apache License 2.0, Copyright
+# 2026 BertholomusAI); the halves here are _pre_finish's own code
+HC_SPLIT = __import__("os").environ.get("TF_DSV41_HC_SPLIT", "0") == "1"
+HC_SIDE = __import__("os").environ.get("TF_DSV41_HC_SIDE", "0") == "1"
+HC_SIDE_PART = __import__("os").environ.get("TF_DSV41_HC_SIDE_PART", "1") != "0"
+
+
 def pre(X: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, pre_in: torch.Tensor,
         norm_w: torch.Tensor, buf: HCBuffers, eps: float, hc_eps: float, iters: int,
-        out: torch.Tensor | None = None):
-    """X bf16 [R, 4, D] -> (post fp32 [R,4], comb fp32 [R,4,4], x_in bf16 [R,D], pre fp32 [R,4])."""
+        out: torch.Tensor | None = None, side: torch.cuda.Stream | None = None):
+    """X bf16 [R, 4, D] -> (post fp32 [R,4], comb fp32 [R,4,4], x_in bf16 [R,D], pre fp32 [R,4]). ``side``
+    (HC_SIDE, decode rows): post, comb and pre are written on that stream, the caller joins it before reading them
+    (and before the next pre: ``buf``); x_in on the current stream."""
 
     R, S, D = X.shape
     assert S == 4 and D % CHUNK == 0 and (S * D) % (NB * SUB) == 0 and X.is_contiguous()
@@ -264,8 +372,25 @@ def pre(X: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tens
     if R > PROMPT_ROWS:                     # prompt chunks: rows share the mix matrix loads (TF32 dot, like vLLM)
         _pre_partial_rows[(triton.cdiv(R, 16), NB)](X, fn, buf.part, R, WIDE=S * D, NBLK=NB, SUBK=64, BR=16,
                                                    num_warps=4)
+    elif HC_SIDE and side is not None:      # partials (HC_SIDE_PART) + Sinkhorn on ``side``, the collapse here
+        main = torch.cuda.current_stream()
+        if not HC_SIDE_PART:
+            _pre_partial[(R, NB)](X, fn, buf.part, WIDE=S * D, NBLK=NB, SUBK=SUB, num_warps=4)
+        side.wait_stream(main)              # (X, the fresh outputs and the partials written)
+        with torch.cuda.stream(side):
+            if HC_SIDE_PART:                # (the mix matrix not kept in L2: l2pace stages weights there)
+                _pre_partial[(R, NB)](X, fn, buf.part, WIDE=S * D, NBLK=NB, SUBK=SUB, EVICT="evict_first",
+                                      num_warps=4)
+            _pre_sinkhorn[(R,)](buf.part, base, scale, pre_out, post, comb, eps, hc_eps, D=D, NBLK=NB, ITERS=iters,
+                                num_warps=8)
+        _pre_collapse[(R,)](X, pre_in.contiguous(), norm_w, x_in, eps, D=D, CH=CHUNK, num_warps=8)
+        return post, comb, x_in, pre_out
     else:                                   # decode and verify windows: the row-invariant per-row sums
         _pre_partial[(R, NB)](X, fn, buf.part, WIDE=S * D, NBLK=NB, SUBK=SUB, num_warps=4)
+        if HC_SPLIT:                        # the Sinkhorn beside the collapse
+            _pre_finish2[(R, 2)](X, buf.part, base, scale, pre_in.contiguous(), norm_w, x_in, pre_out, post, comb,
+                                 eps, hc_eps, D=D, NBLK=NB, ITERS=iters, CH=CHUNK, num_warps=8)
+            return post, comb, x_in, pre_out
     _pre_finish[(R,)](X, buf.part, base, scale, pre_in.contiguous(), norm_w, x_in, pre_out, post, comb, eps, hc_eps,
                       D=D, NBLK=NB, ITERS=iters, CH=CHUNK, num_warps=8)
     return post, comb, x_in, pre_out

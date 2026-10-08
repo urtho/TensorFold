@@ -547,6 +547,8 @@ class SerialEngine:
     _deq_comp = None              # ((kv source, visible entries), bf16 decode) for the layers of one prompt chunk
     _ebc = None                   # a decode graph piece's index tensors (IDX_BASE, ``_round_bases``), else None
     _idxc = None                  # (index source, kv source) -> (top-k, shifted to the rows' streams) (IDX_BASE)
+    _hc_stream = None             # hcf.HC_SIDE: the stream ``layers``' HC partials and Sinkhorn run on
+    _hc_live = False              # an HC pre on it not joined yet
 
     def __init__(self, w: Weights, comm: Comm, engram_dir: str, tokenizer_json: str, *, cap: int = 4096,
                  device: str = "cuda", slots: int = 1, pool_tokens: int | None = None) -> None:
@@ -569,6 +571,7 @@ class SerialEngine:
             sp.xg = sp.xu = sp.z = sp.y = torch.empty((0,), dtype=torch.float16, device=self.dev)
             torch.cuda.empty_cache()
         self.hcbuf = hcf.HCBuffers(MAX_ROWS, c.hidden_size, device=self.dev)
+        self._hc_stream = torch.cuda.Stream() if hcf.HC_SIDE else None
         self.par = Par()
         self._pf_stream, self._pf_moe, self._pf_attn, self._pf_woa = None, {}, {}, {}
         table = K.bulk_table if L2_BULK else K.prefetch_table
@@ -1080,6 +1083,8 @@ class SerialEngine:
         self._deq_comp = None
         for layer in self.w.layers[first:last]:
             fused = fuse and f is not None and layer.engram is None
+            if f is not None:
+                self._hc_join()                                         # (post, comb, pre: HC_SIDE)
             if fused:
                 X, (post, comb, x, pre_a) = self.post_hc(f, X, post, comb, layer.hc_attn, pre)
             elif f is not None:
@@ -1089,23 +1094,25 @@ class SerialEngine:
             if not fused:
                 if layer.engram is not None:
                     X = self.engram(layer, X, rows[layer.index])
-                post, comb, x, pre_a = self.hc(layer.hc_attn, X, pre)
+                post, comb, x, pre_a = self.hc(layer.hc_attn, X, pre, side=True)
             a = self.attention(layer, x, pos, static)
             if self.debug is not None:
                 self.debug.append({"layer": layer.index, "attn_in": x.clone(),
                                    "attn_out": a.clone() if torch.is_tensor(a) else None})
             if attn_last and layer.index == last - 1:   # (its caches written: nothing reads the rest)
                 break
+            self._hc_join()
             if fuse:
                 X, (post, comb, x, pre) = self.post_hc(a, X, post, comb, layer.hc_ffn, pre_a)
             else:
                 X = hcf.post(a, X, post, comb)
-                post, comb, x, pre = self.hc(layer.hc_ffn, X, pre_a)
+                post, comb, x, pre = self.hc(layer.hc_ffn, X, pre_a, side=True)
             f = self.moe(layer, x, x.shape[0])
             if self.debug is not None:
                 self.debug.append({"layer": layer.index, "moe_in": x.clone(), "X": X.clone(),
                                    "f": f.clone() if torch.is_tensor(f) else None})
         self._join(final=True)                                          # (a graph ends with every stream joined)
+        self._hc_join()                                                 # (and nothing it wrote leaves unjoined)
         self._deq_comp = None                                          # (its scratch back to the allocator)
         return X, pre, f, post, comb
 
@@ -1515,10 +1522,24 @@ class SerialEngine:
         return hcf.post_pre(b, X, post, comb, w.fn, w.base, w.scale, pre_in, w.norm, self.hcbuf, c.rms_norm_eps,
                             c.hc_eps, c.hc_sinkhorn_iters)
 
-    def hc(self, w: HCW, X: torch.Tensor, pre_in: torch.Tensor):
+    def hc(self, w: HCW, X: torch.Tensor, pre_in: torch.Tensor, side: bool = False):
+        """``side`` (``layers`` only, which joins before every reader; hcf.HC_SIDE, decode rows): post, comb and pre
+        written on the HC stream. Other callers (the drafter, benches) stay on the current stream."""
+
         c = self.c
-        return hcf.pre(X, w.fn, w.base, w.scale, pre_in, w.norm, self.hcbuf, c.rms_norm_eps, c.hc_eps,
-                       c.hc_sinkhorn_iters)
+        st = self._hc_stream if side and X.shape[0] <= PROMPT_ROWS else None
+        out = hcf.pre(X, w.fn, w.base, w.scale, pre_in, w.norm, self.hcbuf, c.rms_norm_eps, c.hc_eps,
+                      c.hc_sinkhorn_iters, side=st)
+        self._hc_live = self._hc_live or st is not None
+        return out
+
+    def _hc_join(self) -> None:
+        """The HC stream back into the current one (HC_SIDE): before post / comb / pre are read, and where ``layers``
+        ends."""
+
+        if self._hc_live:
+            torch.cuda.current_stream().wait_stream(self._hc_stream)
+            self._hc_live = False
 
     def attention(self, layer: LayerW, x: torch.Tensor, pos: torch.Tensor, static: bool) -> torch.Tensor:
         self._join()
