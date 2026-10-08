@@ -16,6 +16,13 @@ from pathlib import Path
 
 GROUP = int(os.environ.get("TF_DSV41_MQA_GROUP") or 5)      # stages a group: the tree (fixed for the process)
 FEW = int(os.environ.get("TF_DSV41_MQA_FEW") or 1)          # rows a call up to which every stage gets its own CTA
+# TF_DSV41_L2_DISCARD (a comma list; default none): "po": the merge drops the partials from L2 once read (dead: the next
+# split launch rewrites them), so they are never written back to DRAM; "moe": the routed experts' scratch
+# (cuda/exl3/experts.py); "all". No value changes (peer bertholomus bd0024d's TF_EXL3_L2_DISCARD).
+L2_DISCARD = {t.strip() for t in os.environ.get("TF_DSV41_L2_DISCARD", "").split(",")} - {""}
+if L2_DISCARD - {"po", "moe", "all", "lin"}:                  # ("lin": the peer's token, a no-op here)
+    raise ValueError(f"TF_DSV41_L2_DISCARD: unknown {sorted(L2_DISCARD - {'po', 'moe', 'all', 'lin'})}")
+DISCARD = bool(L2_DISCARD & {"po", "all"})
 
 
 def stages(n_idx: int, window: int = 128) -> int:
@@ -47,5 +54,5 @@ def ext(lut: bool = False):
     from tensorfold.cuda.build import load
 
     flags = ["-O3", "-lineinfo"] + (["-DTF_MQA4_LUT"] if lut else [])
-    return load("tf_dsv41_mqa_fp4_lut_v6" if lut else "tf_dsv41_mqa_fp4_v6",
+    return load("tf_dsv41_mqa_fp4_lut_v7" if lut else "tf_dsv41_mqa_fp4_v7",
                 [str(Path(__file__).with_name("mqa_fp4.cu"))], arch_specific=True, extra_cuda_cflags=flags)

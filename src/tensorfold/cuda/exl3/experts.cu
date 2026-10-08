@@ -112,11 +112,23 @@ __global__ void rot_in_kernel(const TIN* __restrict__ x, int x_stride, const int
 
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 
+// TF_DSV41_L2_DISCARD=moe: drop a dead 128-byte scratch line from L2 without its write-back (the line's value becomes
+// indeterminate; the host passes only 128-byte aligned buffers, and every line here is a whole piece of one row).
+// Dead: read for the last time by this program, rewritten only by a later launch before anything reads it again. The
+// down x3ld rewrites s.z (PDL launch) only after its pdl_wait (x3ld.cu: no Z or X access may move above it), so the
+// gate/up epilogue's discards complete first; rot_in and gateup_epilogue (xg / xu / xd writers) are plain launches.
+__device__ __forceinline__ void l2_discard(const void* p) {
+    asm volatile("discard.global.L2 [%0], 128;" ::"l"(p) : "memory");
+}
+
 // Program (member row, 128-block of the width): splits summed in order, rotated, * svh, SwiGLU (0: GLM's bf16 roundings, 1: fp32), then Xd = fp16((act * suh_d) @ H).
+// discard: drop the row's Z lines at or past float zlive (below it the down x3ld writes its Z next, over lines still
+// in L2) and its xg / xu rows (K wide; read only by the gate/up launch, complete).
 __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                        const half* __restrict__ svh_g, const half* __restrict__ svh_u,
                                        const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N, int SK,
-                                       int E, float limit, int act_mode) {
+                                       int E, float limit, int act_mode, const half* __restrict__ xg,
+                                       const half* __restrict__ xu, int K, int64_t zlive, int discard) {
     const int p = blockIdx.x, blk = blockIdx.y;
     const int e = pick[p];
     if (e < 0 || e >= E) return;
@@ -132,6 +144,16 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
         }
         gv[j] = sg;
         uv[j] = su;
+    }
+    if (discard) {
+        __syncwarp();                                // every lane's Z reads are in gv / uv
+        for (int i = lane; i < 8 * SK; i += 32) {    // (matrix * SK + split, 32-float line of the block)
+            const size_t off = ((size_t)(i >> 2) * P + p) * N + blk * 128 + (i & 3) * 32;
+            if (off >= (size_t)zlive) l2_discard(Z + off);
+        }
+        const int lines = K / 64;                    // a row of xg / xu: the row's blocks take its lines in turn
+        for (int l = blk * 32 + lane; l < 2 * lines; l += gridDim.y * 32)
+            l2_discard((l < lines ? xg : xu) + (size_t)p * K + (l % lines) * 64);
     }
     fwht128(gv, lane);
     fwht128(uv, lane);
@@ -191,10 +213,14 @@ __global__ void combine_kernel(const float* __restrict__ y, const float* __restr
 }
 
 // down_epilogue_kernel then combine_kernel in one launch, the same arithmetic in the same order (the same bits).
+// res (TF_DSV41_RES_FOLD; else null): out = acc + res, the caller's ``routed + shared`` (the same fp32 add). store_y 0:
+// no y rows (the wts path reads y only for slots that are not a routed expert, which are never written here).
+// discard: drop the row's down Z lines and its xd row (I wide; read only by the down launch, complete).
 __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                     const half* __restrict__ svh_d, float* __restrict__ y,
                                     const float* __restrict__ wts, float* __restrict__ out, int P, int D, int SK,
-                                    int E, int slots) {
+                                    int E, int slots, const float* __restrict__ res, int store_y,
+                                    const half* __restrict__ xd, int I, int discard) {
     __shared__ float4 part[32][32];                 // [slot][lane]: the slot's 4 outputs of the lane
     const int r = blockIdx.x, blk = blockIdx.y;
     const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -210,11 +236,17 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
             for (int q = 0; q < SK; ++q) s += Z[((size_t)q * P + p) * D + n + j];
             v[j] = s;
         }
+        if (discard) {                               // (k is the warp: uniform in it)
+            __syncwarp();                            // every lane's Z reads are in v
+            for (int i = lane; i < 4 * SK; i += 32)
+                l2_discard(Z + ((size_t)(i >> 2) * P + p) * D + blk * 128 + (i & 3) * 32);
+            if (lane == 0 && blk < I / 64) l2_discard(xd + (size_t)p * I + blk * 64);
+        }
         fwht128(v, lane);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
-            y[(size_t)p * D + n + j] = o[j];
+            if (store_y) y[(size_t)p * D + n + j] = o[j];
         }
     } else {
 #pragma unroll
@@ -232,8 +264,13 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
         acc[2] = fmaf(w, u.z, acc[2]);
         acc[3] = fmaf(w, u.w, acc[3]);
     }
+    if (res != nullptr) {
 #pragma unroll
-    for (int j = 0; j < 4; ++j) out[(size_t)r * D + n + j] = acc[j];
+        for (int j = 0; j < 4; ++j) out[(size_t)r * D + n + j] = __fadd_rn(acc[j], res[(size_t)r * D + n + j]);
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) out[(size_t)r * D + n + j] = acc[j];
+    }
 }
 
 }  // namespace
@@ -332,12 +369,14 @@ void exl3x_rot_in_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& 
 void exl3x_gateup_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_g,
                                 const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor& xd, int64_t rows,
                                 int64_t P, int64_t N, int64_t SK, int64_t slots, int64_t E, double limit,
-                                int64_t act_mode) {
+                                int64_t act_mode, const void* xg, const void* xu, int64_t K, int64_t zlive,
+                                int64_t discard) {
     dim3 grid((unsigned)(rows * slots), (unsigned)(N / 128));
     gateup_epilogue_kernel<<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
         Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_g.data_ptr()),
         reinterpret_cast<const half*>(svh_u.data_ptr()), reinterpret_cast<const half*>(suh_d.data_ptr()),
-        reinterpret_cast<half*>(xd.data_ptr()), (int)P, (int)N, (int)SK, (int)E, (float)limit, (int)act_mode);
+        reinterpret_cast<half*>(xd.data_ptr()), (int)P, (int)N, (int)SK, (int)E, (float)limit, (int)act_mode,
+        reinterpret_cast<const half*>(xg), reinterpret_cast<const half*>(xu), (int)K, zlive, (int)discard);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -360,12 +399,13 @@ void exl3x_combine_cuda(const at::Tensor& y, const at::Tensor& wts, at::Tensor& 
 
 void exl3x_down_combine_cuda(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, at::Tensor& y,
                              const at::Tensor& wts, at::Tensor& out, int64_t rows, int64_t P, int64_t D, int64_t SK,
-                             int64_t slots, int64_t E) {
+                             int64_t slots, int64_t E, const float* res, int64_t store_y, const void* xd, int64_t I,
+                             int64_t discard) {
     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
     dim3 grid((unsigned)rows, (unsigned)(D / 128));
     down_combine_kernel<<<grid, (unsigned)(32 * slots), 0, at::cuda::getCurrentCUDAStream()>>>(
         Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_d.data_ptr()),
         y.data_ptr<float>(), wts.data_ptr<float>(), out.data_ptr<float>(), (int)P, (int)D, (int)SK, (int)E,
-        (int)slots);
+        (int)slots, res, (int)store_y, reinterpret_cast<const half*>(xd), (int)I, (int)discard);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

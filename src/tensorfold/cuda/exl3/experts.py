@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -21,6 +22,16 @@ K2_SUPPORTED = tuple(range(2, 17))
 GLM_GATEUP = (8, 4, 4, 1)
 GLM_DOWN = (8, 4, 1, 1)
 
+# TF_DSV41_L2_DISCARD with "moe" (or "all"; a comma list, default none): routed() with wts drops its dead scratch from L2
+# without the write-back: gate/up Z past the down Z, xg / xu (gateup_epilogue), the down Z and xd (down_combine), and
+# stores no y. No value changes. y stays stored under TF_SKIP_SHARED=1 (timing: its skipped slots read y rows).
+# Exact only while no weighted pick is >= E (down_combine reads y rows for those): route() never makes one.
+_L2 = {t.strip() for t in os.environ.get("TF_DSV41_L2_DISCARD", "").split(",")} - {""}
+if _L2 - {"po", "moe", "all", "lin"}:                         # (the same check as deepseek_v41/cuda/mqa_fp4.py)
+    raise ValueError(f"TF_DSV41_L2_DISCARD: unknown {sorted(_L2 - {'po', 'moe', 'all', 'lin'})}")
+DISCARD = bool(_L2 & {"moe", "all"})
+SKIP_SHARED = os.environ.get("TF_SKIP_SHARED") == "1"
+
 
 @lru_cache(maxsize=1)
 def _ext():
@@ -28,7 +39,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v1", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v2", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -183,8 +194,10 @@ class Scratch:
 
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
-           group: bool = True) -> torch.Tensor:
-    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync."""
+           group: bool = True, res: torch.Tensor | None = None, before_combine=None) -> torch.Tensor:
+    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
+    With wts, ``res`` (fp32 [R, D]) is added to ``out`` in the combine (bit for bit ``out + res``), and
+    ``before_combine()`` runs just before that launch (e.g. a wait on the stream making ``res``)."""
 
     ext = _ext()
     D, I, E = ex.dims, ex.width, ex.count
@@ -201,19 +214,27 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
                         I, P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1]):     # (TF_EXPERT_LOADS: the same Z)
         ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
                     P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1])
-    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode)
+    disc = int(DISCARD and wts is not None)
+    zlive = s.cfg_d[2] * P * D                         # the down Z: rewritten next, so not dropped
+    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode,
+                        s.xg, s.xu, zlive, disc)
     nt, w, sk, pf = s.cfg_d
     if not x3ld.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
                         I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1]):
         ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
                     D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1])
     if wts is None:
+        if res is not None:
+            raise ValueError("res needs wts")
         ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
         return s.y[:P]
     if out is None:
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
+    if before_combine is not None:
+        before_combine()
     # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two)
-    ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E)
+    ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E, res,
+                     int(not (disc and not SKIP_SHARED)), s.xd, disc)
     return out
 
 

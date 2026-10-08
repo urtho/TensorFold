@@ -261,6 +261,9 @@ structured 119.31 -> 124.85, c1 106.67 -> 109.60, hard 50.70 -> 53.01 tok/s.
         decode-bench / jaybench, then a BENCH.md row): `TF_DSV41_HC_SPLIT=1` (Sinkhorn | collapse in one launch),
         `TF_DSV41_HC_SIDE=1` (partials + Sinkhorn on a side stream from `layers` only), `TF_DSV41_HC_SIDE_PART=0`
         (only the Sinkhorn moves)
+      with its Sinkhorn on a side stream, wo_a's rotation folded into the attention merge, norm + rot_in fusion.
+      L2 discard implemented, default off (`TF_DSV41_L2_DISCARD=po,moe`, with `TF_DSV41_RES_FOLD`): first an ncu
+      dram__bytes_write check that GB10 honours discard.global.L2 at all (it drops prefetch.global.L2), then the A/B
 
 ## Open (2026-10-05)
 

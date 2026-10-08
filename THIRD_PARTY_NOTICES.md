@@ -305,6 +305,8 @@ deepseek-v41-tp2:
   PR #17 (Apache-2.0).
   one system fence a block and the own slice copied early (bd0024d); the routed experts' expert-major program order
   with the dead expert slots last (`experts_grouped.cuh` `grouped_cp_kernel`; `TF_X3LD_ORDER=expert` in `x3ld.cu`). The counts without bincount's host read follow
+  one system fence a block and the own slice copied early (bd0024d); dead decode scratch (split partials, expert Z)
+  dropped from L2 with discard.global.L2 once read (its TF_EXL3_L2_DISCARD, bd0024d; here TF_DSV41_L2_DISCARD). The counts without bincount's host read follow
   jayleaton/deepseek-v41-tensorfold-spark PR #17 (Apache-2.0).
 
 ## Ideas from AGPL-licensed recipes (no code included)
