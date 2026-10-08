@@ -110,6 +110,7 @@ services:
       TF_ROUTER_BE: ${TF_ROUTER_BE:-}                 # 16: the router matmul with twice the programs (same bits)
       TF_DSV41_TOPK_DIGITS: ${TF_DSV41_TOPK_DIGITS:-} # 11: the decode top-k in 3 radix passes instead of 4 (same entries)
       TF_DSV41_IDX_FORK: ${TF_DSV41_IDX_FORK:-}       # 1: the indexer's q and weights beside the attention branches
+      TF_DSV41_PREFILL_PROF: ${TF_DSV41_PREFILL_PROF:-} # 1: each prefill call logs its Engram read waits
       # copy drafts in concurrent rounds (empty / 0: off, 1: on; exact) and the kept share under which a stream backs
       # off (0.3); neither enters the calibration cache's key
       TF_MULTI_COPY: ${TF_MULTI_COPY:-}

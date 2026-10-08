@@ -234,6 +234,8 @@ PROMPT_ROWS = int(os.environ.get("TF_DSV41_DECODE_ROWS") or 32)
 # decode / verify rows: the indexer's q (after q's, on its branch) and head weights (a fourth branch) made beside the
 # window KV and the compressor instead of after the join (TF_DSV41_IDX_FORK=1; default 0). The same kernels and inputs
 IDX_FORK = os.environ.get("TF_DSV41_IDX_FORK", "0") == "1"
+# each prefill call's wait on its Engram row reads, first chunk and the rest (TF_DSV41_PREFILL_PROF=1; a diagnostic)
+PREFILL_PROF = os.environ.get("TF_DSV41_PREFILL_PROF", "0") == "1"
 # decode graphs are captured at these key widths (tokens) besides the full limit; a step replays the narrowest that
 # covers its rows' positions, so indexer scores, block choice and top-k run over [R, width // ratio] instead of the
 # limit's (the same entries are chosen: past a row's position every score is -inf). Each width's 32 graphs cost
@@ -1976,13 +1978,20 @@ class SerialEngine:
         ends = starts[1:] + [base + len(prompt)]
         ahead = self.prefetch(ids, starts[0], ends[0] - starts[0], 0)
         logits = None
+        waits = []
         for i, p0 in enumerate(starts):
             R = ends[i] - p0
+            t0 = time.perf_counter() if PREFILL_PROF else 0.0
             raw = ahead.result()
+            if PREFILL_PROF:
+                waits.append(1e3 * (time.perf_counter() - t0))
             if i + 1 < len(starts):
                 ahead = self.prefetch(ids, starts[i + 1], ends[i + 1] - starts[i + 1], (i + 1) % 2)
             encode = BOUNDED_TAIL and final is not None and ends[i] <= final - self.tail_min and R > PROMPT_ROWS
             logits = self.forward(ids[p0:p0 + R], last_only=True, raw=raw, prompt=True, encode=encode)
+        if PREFILL_PROF and self.comm.rank == 0:
+            print(f"[prefill] {len(prompt)} tokens from {base}, {len(starts)} chunk(s): Engram read wait first "
+                  f"{waits[0]:.0f} ms, later {sum(waits[1:]):.0f} ms", flush=True)
         return logits
 
     @torch.no_grad()
