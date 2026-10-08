@@ -271,7 +271,9 @@ recipe, Apache License 2.0, Copyright 2026 MiaAI-Lab. Its NOTICE line is in our 
 - `src/tensorfold/cuda/copy_drafts.py` (copy / prompt-lookup drafts) and its use in
   `families/deepseek_v41/cuda/engine.py` adapt its `glm5_next/cuda/copy_drafts.py` and decode wiring (patches
   `0007-glm-copy-drafts` and `0032-glm-code-copy-drafts`). TensorFold made it model-agnostic, on by default under
-  `TF_COPY_*`, windowed and truncatable.
+  `TF_COPY_*`, windowed and truncatable. The copy rounds of concurrent decoding in
+  `families/deepseek_v41/cuda/multi.py` (`TF_MULTI_COPY`) use the same module and follow that wiring; the plan
+  encoding, both ranks recomputing the proposal, the kept-share back-off and the cost-curve length are TensorFold's.
 - Design only, no code copied: the indexer reads only each row's visible keys (`_index_scores` in
   `families/deepseek_v41/cuda/kernels.py`, and `cuda/topk.py`), after its visible-pools bound (patch
   `0043-glm-visible-pools`, whose idea its credits trace to TensorFold PR #140 by mikolaj92). The CUDA `/tokenize`
@@ -279,7 +281,7 @@ recipe, Apache License 2.0, Copyright 2026 MiaAI-Lab. Its NOTICE line is in our 
 - The RoCE all-gather credit (its patch 0006, after b12x) is under "RoCE all-gather" above.
 
 Each adapted file states what was changed. `tests/test_dsv41_pool.py`, `tests/test_dsv41_kept.py` and
-`tests/test_copy_drafts.py` are written for TensorFold.
+`tests/test_copy_drafts.py` and `tests/test_dsv41_multi_copy.py` are written for TensorFold.
 
 ## DeepSeek-V4.1-Flash TP2 fork (BertholomusAI)
 

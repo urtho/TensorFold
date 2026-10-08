@@ -65,6 +65,10 @@ services:
       TF_DSV41_WARM_SERVING: ${TF_DSV41_WARM_SERVING:-}
       TF_RDMA_HOST: ${TF_RDMA_HOST:-}
       TF_RDMA_MAX_KB: ${TF_RDMA_MAX_KB:-}
+      # copy drafts in concurrent rounds (empty / 0: off, 1: on; exact) and the kept share under which a stream backs
+      # off (0.3); neither enters the calibration cache's key
+      TF_MULTI_COPY: ${TF_MULTI_COPY:-}
+      TF_MULTI_COPY_MIN: ${TF_MULTI_COPY_MIN:-}
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       TF_DSV41_PREPARED: /prepared                       # read the prepared folder when current (fastboot)
       # the NVMe tier of kept prompts: off unless set (/kvdisk); budget (128 GiB), smallest state written (2048

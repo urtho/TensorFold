@@ -116,11 +116,14 @@ def build_parser() -> argparse.ArgumentParser:
                     "first sublayer where a row's values depend on its chunk (and, with --graph, a <=32-row tail)")
     ap.add_argument("--jaybench", default="", help="comma list of code, prose, structured (jayleaton's m2bench "
                     "prompts: greedy, thinking off, --jb-tokens), c1 (bench_decode's C1 prompt: T 0.2, top-k 20, top-p "
-                    "0.95, --jb-c1-tokens), hard: each a single request through MultiDecoder as the server runs it, "
-                    "first-to-last-token tok/s, rounds, rows, drafts (needs --dspark; TF_ROUND_PROF=1: the round split)")
+                    "0.95, --jb-c1-tokens), hard, edit, docs (a 60-line Python file renamed / given docstrings: greedy, "
+                    "--jb-edit-tokens; copy drafts, TF_MULTI_COPY=1): each a single request through MultiDecoder as the "
+                    "server runs it, first-to-last-token tok/s, rounds, rows, drafts (needs --dspark; TF_ROUND_PROF=1: "
+                    "the round split)")
     ap.add_argument("--jb-reps", type=int, default=3, help="--jaybench: timed requests a workload (the median reported)")
     ap.add_argument("--jb-tokens", type=int, default=384, help="--jaybench: tokens a code / prose / structured reply")
     ap.add_argument("--jb-c1-tokens", type=int, default=2048, help="--jaybench: tokens a c1 / hard reply")
+    ap.add_argument("--jb-edit-tokens", type=int, default=1024, help="--jaybench: tokens an edit / docs reply")
     ap.add_argument("--jb-carry", action="store_true", help="--jaybench: keep the draft policy's running acceptance "
                     "estimate across requests (TF_DSV41_DRAFT_RESET=0 as a server runs it: warm-ups and earlier "
                     "workloads steer later ones) instead of resetting it before each request")
@@ -927,6 +930,79 @@ JAYBENCH = {
              "you are cut off.", (0.2, 20, 0.95)),
 }
 
+# edit-style requests (copy drafts: the reply quotes the prompt), after BENCH.md's 2026-10-02 rename / docstring cases;
+# the file is written for TensorFold
+EDIT_FILE = """import heapq
+import time
+from dataclasses import dataclass, field
+
+
+@dataclass(order=True)
+class Job:
+    due: float
+    name: str = field(compare=False)
+    every: float = field(default=0.0, compare=False)
+    runs: int = field(default=0, compare=False)
+
+
+class JobQueue:
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.heap: list[Job] = []
+        self.names: set[str] = set()
+
+    def add(self, name, delay, every=0.0):
+        if name in self.names:
+            raise ValueError(f"job {name} is queued already")
+        self.names.add(name)
+        heapq.heappush(self.heap, Job(self.clock() + delay, name, every))
+
+    def cancel(self, name):
+        if name not in self.names:
+            return False
+        self.names.discard(name)
+        self.heap = [j for j in self.heap if j.name != name]
+        heapq.heapify(self.heap)
+        return True
+
+    def due(self):
+        now = self.clock()
+        out = []
+        while self.heap and self.heap[0].due <= now:
+            job = heapq.heappop(self.heap)
+            job.runs += 1
+            out.append(job.name)
+            if job.every > 0:
+                job.due = now + job.every
+                heapq.heappush(self.heap, job)
+            else:
+                self.names.discard(job.name)
+        return out
+
+    def next_in(self):
+        if not self.heap:
+            return None
+        return max(0.0, self.heap[0].due - self.clock())
+
+    def __len__(self):
+        return len(self.heap)
+
+
+def run_forever(queue, handle, idle=0.5):
+    while True:
+        for name in queue.due():
+            handle(name)
+        wait = queue.next_in()
+        time.sleep(idle if wait is None else min(wait, idle))
+"""
+JAYBENCH["edit"] = ("Rename the class `JobQueue` to `Scheduler` everywhere in this file (its uses too) and change "
+                    "nothing else. Reply with the whole file only, in one code block.\n\n```python\n" + EDIT_FILE
+                    + "```", None)
+JAYBENCH["docs"] = ("Add a one-line docstring to every class, method and function in this file and change nothing "
+                    "else. Reply with the whole file only, in one code block.\n\n```python\n" + EDIT_FILE + "```",
+                    None)
+JB_EDIT = ("edit", "docs")
+
 
 def mode_jaybench(eng, nccl, args, env) -> SU.Result:
     """Single requests through ``MultiDecoder`` (the server's decoder at --parallel > 1): admit, rounds until done,
@@ -975,9 +1051,11 @@ def mode_jaybench(eng, nccl, args, env) -> SU.Result:
     with torch.no_grad():
         if not getattr(eng.drafter, "multi_graphs", None):           # the server's batched drafting pass (1 stream too)
             eng.drafter.capture_multi(max(1, min(args.slots, MU.ROWS // args.dspark)))
-        dec = MU.MultiDecoder(eng, share, rank=args.rank, drafts=args.dspark)
+        dec = MU.MultiDecoder(eng, share, rank=args.rank, drafts=args.dspark, gather=gather)
         dec.model_dir = args.model
         dec.calibrate(gather)
+        if args.rank == 0 and dec.copy is not None:
+            print(f"[jaybench] copy drafts in concurrent rounds: up to {dec.copy.most}", flush=True)
         if args.jb_carry:
             dec.reset_prior = False
         if args.rank == 1:
@@ -993,7 +1071,7 @@ def mode_jaybench(eng, nccl, args, env) -> SU.Result:
             prompt = tok.encode(tmpl.render([{"role": "user", "content": text}], tools=None, enable_thinking=False),
                                 add_special_tokens=False).ids
             sampling = Sampling(seed_for(prompt), samp[0], samp[1], samp[2], 0.0) if samp else None
-            count = args.jb_c1_tokens if samp else args.jb_tokens
+            count = args.jb_c1_tokens if samp else args.jb_edit_tokens if name in JB_EDIT else args.jb_tokens
             times = []
             s = Stream(list(prompt), count, sampling, draft=draft, stop_eos=True,
                        emit=lambda new: times.append(time.perf_counter()) and None)
@@ -1010,6 +1088,8 @@ def mode_jaybench(eng, nccl, args, env) -> SU.Result:
                  "tok_s": (n - 1) / (times[-1] - times[0]) if n > 1 and times[-1] > times[0] else 0.0,
                  "tpr": n / max(s.rounds, 1), "rows": (s.rounds + s.drafted) / max(s.rounds, 1),
                  "sha": hashlib.sha256(",".join(map(str, s.out)).encode()).hexdigest()[:12]}
+            if hasattr(s, "copy_rounds"):                               # copy drafts on (TF_MULTI_COPY)
+                r.update({"copy_rounds": s.copy_rounds, "copy_accepted": s.copy_accepted})
             if dec.rsplit is not None:
                 rounds = [x for x in dec.rsplit.take() if x.get("fill", 0.0) < 1.0]    # (not the prefill's round)
                 r["split"] = MU.RoundSplit.summary(rounds)
@@ -1034,6 +1114,7 @@ def mode_jaybench(eng, nccl, args, env) -> SU.Result:
             line = (f"[jaybench] {name}: {med:.2f} tok/s (reps {reps}), "
                     f"{r['tokens']} tokens, rounds {rounds}, {r['tpr']:.3f} tokens a round, {r['rows']:.2f} rows "
                     f"verified a round, drafts {r['drafted']} proposed / {r['accepted']} accepted, sha {shas}"
+                    + (f", copy rounds {r['copy_rounds']} kept {r['copy_accepted']}" if "copy_rounds" in r else "")
                     + (f", drafted == serial {m['drafted_eq_serial']}" if args.jb_serial else ""))
             print(line, flush=True)
             lines.append(f"{name} {med:.2f}")
@@ -1236,18 +1317,24 @@ def main() -> None:
                 ref.append(nxt)
             if args.decoder_test == 2:
                 eng.pool = PrefixPool(4 << 30)
-            dec = MultiDecoder(eng, share, rank=args.rank, drafts=3)
+            dec = MultiDecoder(eng, share, rank=args.rank, drafts=3, gather=gather)
             dec.calibrate(gather)
-            if args.rank == 0:
-                s = Stream(list(doc), 24, None, draft=True, stop_eos=False)
-                dec.admit(s)
-                while not s.done:
-                    dec.round()
-                dec.finish([s])
-                share([])
-                print(f"decoder-test: equal {s.out == ref}\n  ref {ref[:16]}\n  dec {s.out[:16]}", flush=True)
-            else:
-                dec.follow()
+            # TF_MULTI_COPY=1: also the copy-off arm first (the repeated document's reply copies; both == greedy)
+            arms = [None, dec.copy] if dec.copy is not None else [None]
+            for arm in arms:
+                dec.copy = arm
+                if args.rank == 0:
+                    s = Stream(list(doc), 24, None, draft=True, stop_eos=False)
+                    dec.admit(s)
+                    while not s.done:
+                        dec.round()
+                    dec.finish([s])
+                    share([])
+                    copies = f", copy rounds {s.copy_rounds} kept {s.copy_accepted}" if arm is not None else ""
+                    print(f"decoder-test{' (copy drafts)' if arm is not None else ''}: equal {s.out == ref}{copies}"
+                          f"\n  ref {ref[:16]}\n  dec {s.out[:16]}", flush=True)
+                else:
+                    dec.follow()
         nccl.barrier()
         return
     if args.profile_prefill:

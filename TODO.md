@@ -289,7 +289,8 @@ structured 119.31 -> 124.85, c1 106.67 -> 109.60, hard 50.70 -> 53.01 tok/s.
 - [x] Dev runs: expandable segments on by default in `dsv41_run2.sh` (4c9b2a3; quick tier fingerprints unchanged)
 - [ ] Draft PR #342: description predates FP4, the CUDA kernels, the dev loop and the doorbell
 - [ ] Serial decode >= 40 tok/s (now ~37.8; see Phase 3)
-- [ ] Copy drafts in concurrent rounds
+- [ ] Copy drafts in concurrent rounds: written behind `TF_MULTI_COPY` (off; CPU tests in
+      tests/test_dsv41_multi_copy.py); GPU A/B pending (--decoder-test, --jaybench edit,docs,... 0 vs 1)
 - [ ] RoCE two rails
 - [x] Triton kernels: `TRITON_CACHE_DIR` / `CUDA_CACHE_PATH` in the cache volume, shared by prebuild and every
       container (efb3911): boot 87 -> 44 s, none compiled on the first start after `make image`; a changed kernel

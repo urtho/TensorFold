@@ -42,3 +42,41 @@ def test_settings_from_env():
     assert s.match == 8 and s.most == 5
     with pytest.raises(ValueError):
         CopySettings.from_env(5, env={"TF_COPY_DRAFTS": "1", "TF_COPY_MATCH": "1"})
+
+
+def test_shorter_proposal_is_exactly_that_long():
+    """propose(k) after propose(cap) gave at least k tokens returns exactly k (a concurrent round sizes a copy with
+    the one and verifies the other); fuzzed over small alphabets, where matches are many."""
+
+    import random
+
+    rng = random.Random(0)
+    for _ in range(2000):
+        s = CopySettings(match=rng.randrange(2, 5), most=rng.randrange(1, 16))
+        c = CopyDrafts([rng.randrange(3) for _ in range(rng.randrange(1, 80))], s)
+        cap = rng.randrange(1, 20)
+        first = c.propose(cap)
+        for k in range(1, len(first) + 1):
+            assert len(c.propose(k)) == k
+
+
+def test_window_tail_index_proposes_the_same(monkeypatch):
+    """An index of the prompt's last WINDOW tokens and the reply proposes what the whole context's index does (the
+    search reads only the last WINDOW tokens)."""
+
+    import random
+
+    import tensorfold.cuda.copy_drafts as CD
+
+    monkeypatch.setattr(CD, "WINDOW", 64)
+    rng = random.Random(1)
+    for _ in range(300):
+        prompt = [rng.randrange(4) for _ in range(rng.randrange(1, 200))]
+        whole = CopyDrafts(prompt, S)
+        tail = CopyDrafts(prompt[-64:], S)
+        for _ in range(rng.randrange(1, 30)):
+            new = [rng.randrange(4) for _ in range(rng.randrange(1, 4))]
+            whole.extend(new)
+            tail.extend(new)
+            for k in (1, 2, 4):
+                assert whole.propose(k) == tail.propose(k)
