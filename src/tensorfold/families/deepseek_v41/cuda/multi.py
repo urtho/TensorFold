@@ -87,6 +87,49 @@ COPY_BACKOFF = 64                          # most rounds a stream waits after co
 M_DSPARK, M_COPY = 1, 2                    # a stream's drafts this round (not the admission modes FRESH / TAKEOVER / COPY)
 
 
+def costs_depth(value: str | None) -> int:
+    """TF_DSV41_COSTS: empty / calib (the default, as before): every round is priced by the startup curve of random
+    rows over the slots at position 200, which over-prices one stream's 5-6 row windows (2026-10-08, 2K: 24 29 34 38
+    43 49 ms against decode-bench's 23.6 28.0 32.1 35.8 38.0 40.7); depth (or depth:N): calibration also times one
+    stream's 1 .. drafts + 1 rows of natural consecutive tokens after a natural 2048 (N) token prompt, through
+    ``step_multi`` as a round verifies them, and one-stream rounds are priced by that curve. Returns N (0: off).
+    Draft counts only: never a token."""
+
+    v = (value or "").strip().lower()
+    if v in ("", "calib", "0"):
+        return 0
+    if v == "depth":
+        return 2048
+    if v.startswith("depth:") and v[6:].isdigit() and int(v[6:]) > 0:
+        return int(v[6:])
+    raise ValueError(f"TF_DSV41_COSTS={value!r}: calib, depth or depth:N")
+
+
+COSTS_DEPTH = costs_depth(os.environ.get("TF_DSV41_COSTS"))
+
+
+def natural_ids(tokenizer_json, n: int) -> list[int]:
+    """``n`` natural tokens (code and English: this package's own source, tokenized), repeated if short; without a
+    tokenizer, the Markov table's tokens in frequency order (frequent, but not a text)."""
+
+    from pathlib import Path
+
+    ids: list[int] = []
+    if tokenizer_json is not None and Path(tokenizer_json).is_file():
+        from tokenizers import Tokenizer
+
+        tok = Tokenizer.from_file(str(tokenizer_json))
+        for p in sorted(Path(__file__).parent.glob("*.py")):
+            ids += tok.encode(p.read_text(), add_special_tokens=False).ids
+            if len(ids) >= n:
+                break
+    if not ids:
+        from .markov_tokens import TOKENS
+
+        ids = list(TOKENS)
+    return (ids * (1 + n // len(ids)))[:n]
+
+
 def copy_settings() -> CopySettings | None:
     """TF_MULTI_COPY's settings (both ranks must agree on them), or None: off."""
 
@@ -267,6 +310,10 @@ class MultiDecoder:
         self.broken: Exception | None = None
         self.model_dir = None                      # rank 1 compiles a request's grammar from it
         self.costs: list[float] | None = None      # verify ms by rows (calibrate)
+        # TF_DSV41_COSTS=depth: (key width, ms by rows 1..ROWS) of one stream at depth (None: off), the timed rows,
+        # the depth (rank 0's: both ranks time the same rows)
+        self.one: tuple[int, list[float]] | None = None
+        self.one_rows = self.one_depth = 0
         self.draft_ms = 0.0
         self.draft_curve: list[float] = []
         self.overhead = 2.0                        # a round's host ms besides the forward and drafts
@@ -295,12 +342,15 @@ class MultiDecoder:
         e = self.e
         rng = random.Random(0)
         widths = [*e.widths, e.cap]                          # a cost curve for each key width the graphs have
+        self._one_layout(gather)
         path = self._calib_path(widths)
         cached = None
         if path is not None:
             try:
                 cached = [int(v) for v in json.loads(path.read_text())]
             except (OSError, ValueError):
+                cached = None
+            if cached is not None and len(cached) != ROWS * len(widths) + self._draft_passes() + self.one_rows:
                 cached = None
         if all(f[0] for f in gather([int(cached is not None)])):
             self._curves(gather(cached), widths)             # both ranks timed this image and setting before
@@ -338,7 +388,8 @@ class MultiDecoder:
                         e.drafter.propose(items[0][1], 300)
                     best = min(best, time.perf_counter() - t)
                 drafts.append(1e3 * best)
-        raw = [int(1e3 * v) for v in ms + drafts]
+        one = self._time_one(widths) if self.one_rows else []   # (before the resets below: it fills slot 0)
+        raw = [int(1e3 * v) for v in ms + drafts + one]
         if path is not None:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,6 +404,77 @@ class MultiDecoder:
             e.reset()
         e.select_slot(0)
 
+    def _draft_passes(self) -> int:
+        """How many drafting-pass timings calibration takes (1 .. the batched graph sizes; none without drafts)."""
+
+        return max(getattr(self.e.drafter, "multi_graphs", None) or {}, default=1) if self.drafts else 0
+
+    def _one_layout(self, gather) -> None:
+        """TF_DSV41_COSTS=depth: rank 0's depth on both ranks (each timed row is a collective and the timings are
+        gathered: both must time the same rows), clamped to slot 0's extent; the rows to time (a stream's most: drafts
+        + 1; copy windows beyond them are extrapolated from the random-row curve)."""
+
+        both = gather([COSTS_DEPTH])
+        depth = both[0][0]
+        if any(row[0] != depth for row in both) and self.rank == 0:
+            print(f"[tensorfold] TF_DSV41_COSTS differs between the ranks (depth {[row[0] for row in both]}): rank "
+                  f"0's {depth} on both", flush=True)
+        e = self.e
+        rows = min(ROWS, self.drafts + 1) if self.drafts else 0
+        depth = min(depth, min(e.limit, e.extents[0][1]) - ROWS - 1) if depth and rows else 0
+        self.one_depth, self.one_rows = (depth, rows) if depth > 0 else (0, 0)
+
+    def _time_one(self, widths: list[int]) -> list[float]:
+        """ms of one stream verifying 1 .. one_rows rows of natural consecutive tokens after a natural one_depth-token
+        prompt in slot 0: ``step_multi`` as a round calls it (Engram hashes and reads included), median of 5 after a
+        warm-up; the rows are dropped after each. The caller resets every slot after."""
+
+        import statistics
+
+        e, depth = self.e, self.one_depth
+        ids = natural_ids(getattr(e, "tokenizer_json", None), depth + self.one_rows)
+        e.select_slot(0)
+        e.reset()
+        e.prefill(ids[:depth], final=depth)
+        saved = getattr(e, "_mprof", None), getattr(e, "_rsplit", None)
+        e._mprof = e._rsplit = None                          # (not a round: kept out of the profiles)
+        out: list[float] = []
+        try:
+            for R in range(1, self.one_rows + 1):
+                if R not in e.graphs:
+                    out.append(out[-1] if out else 30.0)
+                    continue
+                rows = [(0, t) for t in ids[depth:depth + R]]
+                times = []
+                for _ in range(6):
+                    torch.cuda.synchronize()
+                    t = time.perf_counter()
+                    e.step_multi(rows)
+                    times.append(time.perf_counter() - t)
+                    del e.views[0].ids[depth:]
+                out.append(1e3 * statistics.median(times[1:]))
+        finally:
+            e._mprof, e._rsplit = saved
+        if depth > 4096:                                     # a long prompt's transient buffers back to the system
+            torch.cuda.empty_cache()
+        return out
+
+    def cost_report(self) -> list[str]:
+        """The startup lines of the policy's curves: the random rows' (the widest key width), and with
+        TF_DSV41_COSTS=depth one stream's beside the random rows' at its key width."""
+
+        def ms(c):
+            return " ".join(f"{v:.1f}" for v in c)
+
+        curve = " ".join(f"{v:.0f}" for v in self.costs)
+        out = [f"verify ms by rows 1..{len(self.costs)}: {curve}; a draft {self.draft_ms:.1f} ms"]
+        if self.one is not None:
+            w, one = self.one
+            k = self.one_rows
+            out.append(f"one-stream rounds (TF_DSV41_COSTS=depth:{self.one_depth}, key width {w}) priced by rows "
+                       f"1..{k}: {ms(one[:k])} ms (random rows: {ms(dict(self.curves)[w][:k])})")
+        return out
+
     def _calib_path(self, widths: list[int]):
         """Where this rank keeps its timings for this image and setting (TF_REVISION, set in the deploy image: the
         source snapshot's hash), or None (outside an image: always measure). The curves only steer draft counts,
@@ -365,11 +487,15 @@ class MultiDecoder:
         if rev in ("", "unknown") or os.environ.get("TF_DSV41_CALIB", "cached") != "cached":
             return None
         e = self.e
-        # (not the copy-draft switches: both arms of an A/B read one curve)
+        # (not the copy-draft switches: both arms of an A/B read one curve; TF_DSV41_COSTS: by the depth both ranks
+        # took, so the calib arm keeps its key and the depth arm, a curve longer by one stream's, has its own)
         knobs = sorted((k, v) for k, v in os.environ.items() if k.startswith("TF_") and k not in
-                       ("TF_API_KEY", "TF_PORT", "TF_RANK", "TF_DSV41_LAUNCH_T0", "TF_MULTI_COPY", "TF_MULTI_COPY_MIN"))
+                       ("TF_API_KEY", "TF_PORT", "TF_RANK", "TF_DSV41_LAUNCH_T0", "TF_MULTI_COPY", "TF_MULTI_COPY_MIN",
+                        "TF_DSV41_COSTS"))
         key = [rev, torch.cuda.get_device_name(), torch.__version__, e.cap, e.slots, ROWS, widths, self.drafts,
                sorted(getattr(e.drafter, "multi_graphs", None) or {}), knobs]
+        if self.one_rows:
+            key.append(["one-v1", self.one_depth, self.one_rows])
         h = hashlib.sha256(json.dumps(key, default=str).encode()).hexdigest()[:16]
         d = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "tensorfold" / "dsv41-calib"
         return d / f"r{self.rank}-{h}.json"
@@ -379,8 +505,17 @@ class MultiDecoder:
         n = ROWS * len(widths)
         self.curves = [(w, worst[i * ROWS:(i + 1) * ROWS]) for i, w in enumerate(widths)]
         self.costs = self.curves[-1][1]
-        self.draft_curve = worst[n:]
+        nd = self._draft_passes()
+        self.draft_curve = worst[n:n + nd]
         self.draft_ms = self.draft_curve[0] if self.draft_curve else 0.0
+        self.one = None
+        if self.one_rows:
+            one = worst[n + nd:n + nd + self.one_rows]
+            # the key width its rows replayed at; rows past the timed ones: its last plus the random curve's steps
+            w = next((w for w in widths if self.one_depth + self.one_rows <= w), widths[-1])
+            base = dict(self.curves)[w]
+            k = len(one)
+            self.one = (w, one + [one[-1] + base[r] - base[k - 1] for r in range(k, ROWS)])
 
     def _expected(self, acc: list[float], k: int) -> float:
         total, run = 1.0, 1.0
@@ -407,7 +542,9 @@ class MultiDecoder:
             return ks
         mode: list[int | None] = [None] * len(live)
         need = max(len(self.e.views[s.slot].ids) for s in live) + ROWS   # the round's graph width (at most)
-        self.costs = next((c for w, c in self.curves if need <= w), self.curves[-1][1])
+        width, self.costs = next(((w, c) for w, c in self.curves if need <= w), self.curves[-1])
+        if self.one is not None and len(live) == 1 and width == self.one[0]:
+            self.costs = self.one[1]                                # TF_DSV41_COSTS=depth: one stream's own curve
         rows, drafting = len(live), 0
         tokens = float(len(live))
         rate = tokens / (self.costs[rows - 1] + self.overhead)

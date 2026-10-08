@@ -1105,6 +1105,8 @@ def mode_jaybench(eng, nccl, args, env) -> SU.Result:
             print(f"[jaybench] verify ms by rows 1..4: {[round(c, 2) for c in dec.costs[:4]]}, a draft "
                   f"{dec.draft_ms:.2f} ms; policy {'carried across requests' if args.jb_carry else 'reset a request'}"
                   f" (prior {dec.prior0[0]:g})", flush=True)
+            for line in dec.cost_report()[1:]:
+                print(f"[jaybench] {line}", flush=True)
 
         def one(name: str, draft: bool = True) -> dict:
             text, samp = JAYBENCH[name]

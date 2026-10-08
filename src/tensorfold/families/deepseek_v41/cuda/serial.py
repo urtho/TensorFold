@@ -564,6 +564,7 @@ class SerialEngine:
         self.freqs = {r: inv_freq(c, r, self.dev) for r in set(c.layer_ratios)}
         self.layout = E.Layout.from_config(c)
         self.tmap = cached_token_map(tokenizer_json, c.engram_compressed_vocab_size)
+        self.tokenizer_json = tokenizer_json            # (multi.natural_ids: TF_DSV41_COSTS=depth's timing text)
         self.tables = E.Tables(engram_dir, c.engram_layer_ids)
         # every layer has the same shapes: one small scratch for decode / verify rows, one for prompt chunks whose
         # gate/up inputs and fp32 partials the prompt kernel no longer reads (rotated while staged, its own fp16 Z)

@@ -408,9 +408,8 @@ class Dsv41Engine:
             self._mark("calibration")
             self._memlog("after calibration")
             if rank == 0:
-                curve = " ".join(f"{v:.0f}" for v in self.multi.costs)
-                print(f"[tensorfold] verify ms by rows 1..{len(self.multi.costs)}: {curve}; a draft "
-                      f"{self.multi.draft_ms:.1f} ms", flush=True)
+                for line in self.multi.cost_report():
+                    print(f"[tensorfold] {line}", flush=True)
                 if self.multi.copy is not None:
                     print(f"[tensorfold] copy drafts in concurrent rounds: up to {self.multi.copy.most} (match "
                           f"{self.multi.copy.match} tokens)", flush=True)
