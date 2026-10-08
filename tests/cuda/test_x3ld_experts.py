@@ -78,7 +78,7 @@ def picks(R, E, slots, g):
 def z_of(ex, R, x0, x1, pick, mats, cfg, order, probe=0):
     s = ex3.Scratch(ex, R, DSV41_SLOTS)
     ids, members = s.window(R)
-    ex3._ext().group(pick, ids, s.count, members, R, DSV41_SLOTS, ex.count)
+    ex3._ext().group(pick, ids, s.count, members, R, DSV41_SLOTS, ex.count, 0)
     z = torch.full_like(s.z, SENTINEL)
     P = R * DSV41_SLOTS
     if mats == 2:

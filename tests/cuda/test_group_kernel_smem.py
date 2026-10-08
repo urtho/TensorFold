@@ -22,7 +22,7 @@ def test_group_succeeds_cold_at_prefill_scale(rows):
     ucount = torch.zeros((1,), dtype=torch.int32, device="cuda")
     members = torch.full((maxu * rows,), -1, dtype=torch.int32, device="cuda").view(maxu, rows)
 
-    ext.group(pick, uids, ucount, members, rows, SLOTS, EXPERTS)
+    ext.group(pick, uids, ucount, members, rows, SLOTS, EXPERTS, 0)
     torch.cuda.synchronize()
     distinct = ucount[0].item()
     assert 0 < distinct <= min(rows * SLOTS, EXPERTS)
@@ -44,7 +44,7 @@ def test_group_output_is_consistent_across_call_order():
         ids = torch.zeros((maxu,), dtype=torch.int32, device="cuda")
         count = torch.zeros((1,), dtype=torch.int32, device="cuda")
         members = torch.full((maxu * R,), -1, dtype=torch.int32, device="cuda").view(maxu, R)
-        ext.group(pick, ids, count, members, R, slots, E)
+        ext.group(pick, ids, count, members, R, slots, E, 0)
         torch.cuda.synchronize()
         results.append((count[0].item(), members.clone()))
     assert results[0][0] == results[1][0] and torch.equal(results[0][1], results[1][1])
@@ -73,7 +73,7 @@ def _launch(rows, slots=SLOTS, device="cuda"):
     ids = torch.zeros(n, dtype=torch.int32, device=device)
     count = torch.zeros(1, dtype=torch.int32, device=device)
     members = torch.full((n, rows), -1, dtype=torch.int32, device=device)
-    experts._ext().group(pick, ids, count, members, rows, slots, EXPERTS)
+    experts._ext().group(pick, ids, count, members, rows, slots, EXPERTS, 0)
     torch.cuda.synchronize(device)
     _assert_members(pick, ids, count, members, EXPERTS)
 
