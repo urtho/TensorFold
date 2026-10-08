@@ -76,6 +76,8 @@ class OneExchange:
         if ev is not None:
             ev.record()
         self.comm.all_gather(self.send, self.recv)
+        if not n and self.stream is not None:            # the end message (shutdown, _warm) blocks as the default's
+            self.torch.cuda.current_stream().synchronize()   # .tolist() did: rank 1 has joined before rank 0 goes on
         if short:
             return view[1:1 + n].tolist()
         torch = self.torch                               # (the default's second exchange, synced as it is)

@@ -46,6 +46,18 @@ def test_words_arrive_behind_a_busy_gpu():
     assert k == len(comm.seen)
 
 
+def test_end_message_blocks():
+    """The empty message (shutdown, the end of _warm) returns only once its gather ran, as the default's did."""
+    one = OneExchange(Loopback(), 0)
+    torch.cuda._sleep(20_000_000)
+    assert one.share([]) == []
+    assert torch.cuda.current_stream().query()
+    torch.cuda._sleep(20_000_000)
+    assert one.share([5]) == [5]                     # a non-empty one still returns behind the busy GPU
+    assert not torch.cuda.current_stream().query()
+    torch.cuda.synchronize()
+
+
 def test_refused_off_the_default_stream():
     one = OneExchange(Loopback(), 0)
     side = torch.cuda.Stream()
