@@ -51,6 +51,8 @@ services:
       TF_HEALTH: ${TF_HEALTH:-}
       TF_STALL_S: ${TF_STALL_S:-0}
       TF_DSV41_TOOL_GRAMMAR: ${TF_DSV41_TOOL_GRAMMAR:-off}
+      # A/B of an exact path: streams under a grammar (response_format, tool grammars) draft (empty: off, 1: on)
+      TF_DSV41_DRAFT_GRAMMAR: ${TF_DSV41_DRAFT_GRAMMAR:-}
       # loop guard: a thinking reply whose last 3 windows of 1,024 tokens each held < 2% new 8-grams has its
       # thinking closed (1: the server default; a request's "loop_guard" overrides it)
       TF_LOOP_GUARD: ${TF_LOOP_GUARD:-0}

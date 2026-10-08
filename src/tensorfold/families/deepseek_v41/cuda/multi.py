@@ -59,6 +59,11 @@ DRAFT_PRIOR = float(os.environ.get("TF_DSV41_DRAFT_PRIOR") or 0.8)
 # 2026-10-06, single requests (tools/dsv41_serial_run.py --jaybench): prior 0.6 without it (the old start) code 78.0,
 # prose 40.4, structured 109.1, c1 98.7 tok/s; 0.8 + 0.02: 77.3-79.8 / 42.3 / 114.0 / 99.5, hard 38.9 -> 47.4
 DRAFT_RELAX = float(os.environ.get("TF_DSV41_DRAFT_RELAX") or 0.02)
+# streams under a grammar (response_format, tool grammars) draft like the rest (TF_DSV41_DRAFT_GRAMMAR=1): each verify
+# row is masked by the grammar's state after the row's path (``Constraint.window``: through </think>, a draft the
+# grammar rejects ends the path), so the kept tokens are the serial reply's. 0 (the default until the A/B): such
+# streams verify one row a round, their reasoning included
+DRAFT_GRAMMAR = os.environ.get("TF_DSV41_DRAFT_GRAMMAR", "0") == "1"
 # a prompt of KEEP_SHRINK_MIN tokens or more is also kept at 3/4 and 7/8 of its length (exact states), and room is made
 # by dropping loose extents' longest kept states before whole extents are evicted (``_trim``): a long document's
 # prefix stays resumable when the pool needs its tail. Policy after bertholomus/TensorFold v0.5 (508bfb3, kept prompts
@@ -393,7 +398,7 @@ class MultiDecoder:
         caps, rooms = [], []
         for s in live:
             room = min(self.e.limit, self.e.extents[s.slot][1]) - len(self.e.views[s.slot].ids) - 1
-            ok = s.draft and s.constraint is None and self.drafts
+            ok = s.draft and (s.constraint is None or DRAFT_GRAMMAR) and self.drafts
             caps.append(max(0, min(self.drafts, room, s.count - len(s.out) - 1)) if ok else 0)
             rooms.append(room)
         props = self._proposals(live, rooms) if self.copy is not None and self.costs is not None else None
@@ -1108,8 +1113,8 @@ class MultiDecoder:
 
     # -- rounds ---------------------------------------------------------------------------------------------------
     def _plan(self, live: list[Stream]) -> list[tuple[int, int]]:
-        """(sid, drafts) a stream: drafts while the round's rows fit (none for a grammar's stream yet); a copy round's
-        drafts + COPY_FLAG."""
+        """(sid, drafts) a stream: drafts while the round's rows fit (a grammar's stream: only with DRAFT_GRAMMAR); a
+        copy round's drafts + COPY_FLAG."""
 
         return [(s.sid, k) for s, k in zip(live, self._allocate(live))]
 
@@ -1247,8 +1252,9 @@ class MultiDecoder:
                 s = self.streams[sid]
                 if s.sampling is not None and s.sampling.temperature > 0 or s.constraint is not None:
                     block = logits[r0:r0 + nrows].float()
-                    if s.constraint is not None:
-                        block = s.constraint.mask(block.clone(), s.constraint.window([rows[r0][1]], [-1]))
+                    if s.constraint is not None:            # each verify row masked by the grammar after its path
+                        chain = [t for _, t in rows[r0:r0 + nrows]]
+                        block = s.constraint.mask(block.clone(), s.constraint.window(chain, [-1, *range(nrows - 1)]))
                     target = sample_rows(block, [p0 + 1 + j for j in range(nrows)], s.sampling)
                 else:
                     target = greedy[r0:r0 + nrows]
