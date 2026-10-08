@@ -231,6 +231,9 @@ _ZB = None
 PROMPT_CFG = [1, 1]          # prompt expert kernel config for gate/up and down (experts_prompt.cu)
 # decode/verify rows at most (row-invariant kernels; a round of streams up to it); above: prompt chunks
 PROMPT_ROWS = int(os.environ.get("TF_DSV41_DECODE_ROWS") or 32)
+# decode / verify rows: the indexer's q (after q's, on its branch) and head weights (a fourth branch) made beside the
+# window KV and the compressor instead of after the join (TF_DSV41_IDX_FORK=1; default 0). The same kernels and inputs
+IDX_FORK = os.environ.get("TF_DSV41_IDX_FORK", "0") == "1"
 # decode graphs are captured at these key widths (tokens) besides the full limit; a step replays the narrowest that
 # covers its rows' positions, so indexer scores, block choice and top-k run over [R, width // ratio] instead of the
 # limit's (the same entries are chosen: past a row's position every score is -inf). Each width's 32 graphs cost
@@ -1597,7 +1600,18 @@ class SerialEngine:
             if a.ratio > 0 and a.compressor is not None:
                 self.compress(layer, x, pos, static)
 
-        if R <= PROMPT_ROWS:                                            # independent: q, window KV, compressor
+        pre = None
+        if R <= PROMPT_ROWS and IDX_FORK and static and a.ratio > 0 and a.indexer is not None:
+            def q_iq_branch():                                          # (IDX_FORK: the indexer's q after q's)
+                qr, q = q_branch()
+                return qr, q, self._index_q(layer, qr, pos)
+
+            (qr, q, iq), _, _, wts = self.par(q_iq_branch, kv_branch, comp_branch,
+                                              lambda: self._index_wts(layer, x))
+            pre = (iq, wts)
+            if L2_BULK and L in self._pf_woa:
+                self._prefetch(self._pf_woa[L], site="woa")
+        elif R <= PROMPT_ROWS:                                          # independent: q, window KV, compressor
             (qr, q), _, _ = self.par(q_branch, kv_branch, comp_branch)
             if L2_BULK and L in self._pf_woa:
                 self._prefetch(self._pf_woa[L], site="woa")             # wo_a streams in during selection + core
@@ -1608,7 +1622,7 @@ class SerialEngine:
         comp = idx = None
         if a.ratio > 0:
             if a.indexer is not None:
-                self.topk[L] = self.select(layer, qr, x, pos, static)
+                self.topk[L] = self.select(layer, qr, x, pos, static, pre)
                 if self._idxc:                                          # (IDX_BASE: shifts of the old top-k)
                     for k in [k for k in self._idxc if k[0] == L]:
                         del self._idxc[k]
@@ -1726,16 +1740,23 @@ class SerialEngine:
             self.candidates = saved
         return notes
 
+    def _index_q(self, layer: LayerW, qr: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        c, a = self.c, layer.attn
+        cos, sin = self.tables_rope[a.ratio]
+        return K.rope_q(a.indexer.wq_b(qr).view(qr.shape[0], c.index_n_heads, c.index_head_dim), pos, cos, sin, IQ_Q)
+
+    def _index_wts(self, layer: LayerW, x: torch.Tensor) -> torch.Tensor:
+        c = self.c
+        return K.router_logits(x, layer.attn.indexer.weights_proj) * (c.index_head_dim ** -0.5 * c.index_n_heads ** -0.5)
+
     def select(self, layer: LayerW, qr: torch.Tensor, x: torch.Tensor, pos: torch.Tensor,
-               static: bool = True) -> torch.Tensor:
-        """This index source's top-k compressed entries for each row (shared by the layers after it)."""
+               static: bool = True, pre: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
+        """This index source's top-k compressed entries for each row (shared by the layers after it). ``pre``: the
+        indexer's (q, weights), already made beside the attention's branches (IDX_FORK)."""
 
         c, a = self.c, layer.attn
-        ix = a.indexer
         R = x.shape[0]
-        cos, sin = self.tables_rope[a.ratio]
-        iq = K.rope_q(ix.wq_b(qr).view(R, c.index_n_heads, c.index_head_dim), pos, cos, sin, IQ_Q)
-        wts = K.router_logits(x, ix.weights_proj) * (c.index_head_dim ** -0.5 * c.index_n_heads ** -0.5)
+        iq, wts = pre if pre is not None else (self._index_q(layer, qr, pos), self._index_wts(layer, x))
         L = layer.index
         src = max(s for s in c.kv_source_layer_ids if s <= L)
         keys = self.state.ik[src]
