@@ -997,7 +997,10 @@ def _index_scores_seg(IQ, WTS, KEYS, POS, OUT, n_keys, off, seg, out_stride, rat
     tl.store(OUT + r * out_stride + j, score, mask=j < seg)
 
 
-@triton.jit
+# its integer arguments follow the prompt's length (keys, segment offset and length, rows): specialized on them,
+# every new length class compiled and loaded mid-serving (late_kernels: 11 such loads in 18 minutes of soak + stress);
+# they set masks, bounds and offsets only, so one compiled kernel gives the same bits
+@triton.jit(do_not_specialize=["n_keys", "off", "seg", "out_stride", "ratio", "n_rows", "flag_stride", "best_stride"])
 def _index_scores_seg_rows(IQ, WTS, KEYS, POS, OUT, n_keys, off, seg, out_stride, ratio, n_rows, FLAGS, flag_stride,
                            BEST, best_stride, HI: tl.constexpr, DI: tl.constexpr, BS: tl.constexpr, RB: tl.constexpr,
                            FUSED: tl.constexpr = False, HAS_FLAGS: tl.constexpr = False,
