@@ -115,6 +115,16 @@ def _keep_words() -> list[int]:
     return [KEEP_MIN, int(os.environ.get("TF_DSV41_POOL_KEEP", "1") != "0")]
 
 
+def _copy_words() -> list[int]:
+    """Copy drafts in concurrent rounds (TF_MULTI_COPY; the match and cap): rank 1 recomputes rank 0's copy proposals
+    from them, so the ranks must agree."""
+
+    from .multi import MULTI_COPY, copy_settings
+
+    c = copy_settings()
+    return [int(MULTI_COPY), c.match, c.most] if c is not None else [int(MULTI_COPY), 0, 0]
+
+
 def _kv_words() -> list[int]:
     """The per-token cache format and its fp4 knobs (TF_DSV41_KV, TF_DSV41_IQ_FP4 / SWA_FP8 / COMP_BF16 /
     CUDA_MQA): a state's bytes and numerics follow them, and each rank sizes and keeps prompts from its own: the ranks
@@ -243,12 +253,13 @@ class Dsv41Engine:
                                     "there (or point TF_DSV41_ENGRAM_DIR at them)")
         self.streams = max(1, int(parallel))
         mine = [cap, int(bool(drafts)), int(explicit), self.streams, int(SHARED_POOL and self.streams > 1),
-                KEPT_ENTRIES, *_widths_words(), *_keep_words(), *_disk_words(), *_kv_words()]
+                KEPT_ENTRIES, *_widths_words(), *_keep_words(), *_disk_words(), *_kv_words(),
+                *_copy_words()]
         both = self._gather_ints(mine)
         if both[0] != both[1]:
             raise RuntimeError(f"the two ranks were started with different settings (context, drafts, parallel, "
-                               f"TF_DSV41_DISK*, TF_DSV41_KV and its knobs): rank 0 {both[0]}, rank 1 {both[1]}; "
-                               "give both the same flags")
+                               f"TF_DSV41_DISK*, TF_DSV41_KV and its knobs, TF_MULTI_COPY / TF_COPY_*): rank 0 "
+                               f"{both[0]}, rank 1 {both[1]}; give both the same flags")
         started = time.perf_counter()
         self._boot = [("start", started)]
         w = W.load(self.model_dir, rank=rank, log=lambda *a, **k: None, draft=bool(drafts))
@@ -323,6 +334,8 @@ class Dsv41Engine:
             top = PROMPT_ROWS if self.streams > 1 else (DRAFTS + 1 if drafts else 1)
             # copy-draft wiring follows MiaAI-Lab's GLM recipe patches 0007 / 0032 (Apache-2.0);
             # see THIRD_PARTY_NOTICES.md
+            # (with --parallel every row count to PROMPT_ROWS has a graph already: MultiDecoder's copy rounds,
+            # TF_MULTI_COPY, need no captures)
             if drafts and self.streams == 1 and os.environ.get("TF_COPY_DRAFTS", "1") != "0":   # longer copy windows
                 top = max(top, min(PROMPT_ROWS, int(os.environ.get("TF_COPY_MAX") or 15) + 1))
             for rows in range(2, top + 1):
@@ -388,6 +401,9 @@ class Dsv41Engine:
                 curve = " ".join(f"{v:.0f}" for v in self.multi.costs)
                 print(f"[tensorfold] verify ms by rows 1..{len(self.multi.costs)}: {curve}; a draft "
                       f"{self.multi.draft_ms:.1f} ms", flush=True)
+                if self.multi.copy is not None:
+                    print(f"[tensorfold] copy drafts in concurrent rounds: up to {self.multi.copy.most} (match "
+                          f"{self.multi.copy.match} tokens)", flush=True)
             if warm and os.environ.get("TF_DSV41_WARM_SERVING", "1") != "0":
                 self._warm_serving()
                 self._mark("serving warm-up")

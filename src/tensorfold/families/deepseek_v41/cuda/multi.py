@@ -10,7 +10,9 @@ else move to a free run, else evict kept prompts; the newest replayable stream g
 sending ADMIT / EVICT / MOVE / GROW for rank 1 to apply follow ``glm5_next/cuda/multi.py`` of MiaAI-Lab's
 GLM-5.3-Flash TensorFold recipe (patches 0030, 0040-0042; Apache License 2.0, Copyright 2026 MiaAI-Lab).
 ``_settle`` is adapted from its ``_settle``; the rest is rewritten for this engine (sid-keyed messages, the
-fewest whole kept extents chosen up front, no compaction, NoRoom). See THIRD_PARTY_NOTICES.md.
+fewest whole kept extents chosen up front, no compaction, NoRoom). Copy rounds (TF_MULTI_COPY) use
+``tensorfold.cuda.copy_drafts`` and follow the same recipe's copy-draft wiring (patches 0007, 0032). See
+THIRD_PARTY_NOTICES.md.
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from tensorfold.cuda.copy_drafts import WINDOW as COPY_WINDOW
+from tensorfold.cuda.copy_drafts import CopyDrafts, CopySettings
 from tensorfold.cuda.sampling import sample_rows
 from tensorfold.cuda.streams import Stream, next_fill
 
@@ -62,6 +66,27 @@ DRAFT_RELAX = float(os.environ.get("TF_DSV41_DRAFT_RELAX") or 0.02)
 # several kept states an extent and ``_settle``. TF_DSV41_KEEP_SHRINK=0: off
 KEEP_SHRINK = os.environ.get("TF_DSV41_KEEP_SHRINK", "1") != "0"
 KEEP_SHRINK_MIN = int(os.environ.get("TF_DSV41_KEEP_SHRINK_MIN") or 131072)
+# copy (prompt-lookup) drafts in concurrent rounds (TF_MULTI_COPY=1; 0, the default: none, as before): a stream whose
+# context's last tokens occurred before verifies what followed them (``copy_drafts``) instead of DSpark's drafts, as the
+# serial path does. Rank 0 plans a copy round as (sid, k + COPY_FLAG); both ranks then compute the same proposal from
+# the stream's prompt and reply. A stream copies while the running mean (each copy round weighs half) of the share of its copy
+# drafts kept stays at least MULTI_COPY_MIN; below it, it backs off 2, 4 .. 64 rounds before trying again; the round's
+# length is the cost curve's pick, as a draft count is. TF_COPY_DRAFTS=0: off everywhere; TF_COPY_MATCH, TF_COPY_MAX
+# (default 15 here) tune it. Copy-draft wiring after MiaAI-Lab's GLM recipe patches 0007 / 0032 (Apache-2.0); see
+# THIRD_PARTY_NOTICES.md
+MULTI_COPY = (os.environ.get("TF_MULTI_COPY") or "0") != "0"
+MULTI_COPY_MIN = float(os.environ.get("TF_MULTI_COPY_MIN") or 0.3)
+COPY_FLAG = 1 << 16                        # a plan's copy round: drafts + this (drafts < ROWS <= 2048)
+COPY_BACKOFF = 64                          # most rounds a stream waits after copy rounds that missed
+M_DSPARK, M_COPY = 1, 2                    # a stream's drafts this round (not the admission modes FRESH / TAKEOVER / COPY)
+
+
+def copy_settings() -> CopySettings | None:
+    """TF_MULTI_COPY's settings (both ranks must agree on them), or None: off."""
+
+    if not MULTI_COPY:
+        return None
+    return CopySettings.from_env(ROWS - 1 if os.environ.get("TF_COPY_MAX") else min(15, ROWS - 1))
 
 
 @dataclass(eq=False)
@@ -214,6 +239,8 @@ class MultiDecoder:
             self.kstats.update({"spills": 0, "spill_mb": 0.0, "spill_ms": 0.0, "disk_hits": 0, "disk_tokens": 0,
                                 "disk_bad": 0, "restore_ms": 0.0})
         self.drafts = drafts if e.drafter is not None else 0
+        # copy drafts (TF_MULTI_COPY), or None
+        self.copy = copy_settings()
 
         self.check = os.environ.get("TF_MULTI_CHECK") == "1"
         if os.environ.get("TF_MULTI_PROF"):
@@ -223,6 +250,8 @@ class MultiDecoder:
         self.prof = {"rounds": 0, "draft": 0.0, "verify": 0.0, "post": 0.0, "fill": 0.0, "round": 0.0, "rows": 0,
                      "streams": 0} \
             if os.environ.get("TF_MULTI_PROF") else None
+        if self.prof is not None and self.copy is not None:
+            self.prof.update({"copy_rounds": 0, "copy_accepted": 0})
         self.step_rows = step                      # prompt rows a fill step takes while other streams decode
         self.free = list(range(e.slots))
         self.streams: dict[int, Stream] = {}       # decoding, by sid
@@ -330,8 +359,9 @@ class MultiDecoder:
         if rev in ("", "unknown") or os.environ.get("TF_DSV41_CALIB", "cached") != "cached":
             return None
         e = self.e
+        # (not the copy-draft switches: both arms of an A/B read one curve)
         knobs = sorted((k, v) for k, v in os.environ.items() if k.startswith("TF_") and k not in
-                       ("TF_API_KEY", "TF_PORT", "TF_RANK", "TF_DSV41_LAUNCH_T0"))
+                       ("TF_API_KEY", "TF_PORT", "TF_RANK", "TF_DSV41_LAUNCH_T0", "TF_MULTI_COPY", "TF_MULTI_COPY_MIN"))
         key = [rev, torch.cuda.get_device_name(), torch.__version__, e.cap, e.slots, ROWS, widths, self.drafts,
                sorted(getattr(e.drafter, "multi_graphs", None) or {}), knobs]
         h = hashlib.sha256(json.dumps(key, default=str).encode()).hexdigest()[:16]
@@ -355,16 +385,21 @@ class MultiDecoder:
 
     def _allocate(self, live: list[Stream]) -> list[int]:
         """Drafts a stream this round: one at a time to the stream whose next draft raises the round's expected
-        tokens per ms the most, while any does (a draft is a verify row and, a stream's first, a drafting pass)."""
+        tokens per ms the most, while any does (a draft is a verify row and, a stream's first, a drafting pass).
+        With copy drafts, a stream with a copy proposal may instead take its first j copies (no drafting pass; each
+        expected kept at the stream's running share): its count + COPY_FLAG."""
 
         ks = [0] * len(live)
-        caps = []
+        caps, rooms = [], []
         for s in live:
             room = min(self.e.limit, self.e.extents[s.slot][1]) - len(self.e.views[s.slot].ids) - 1
             ok = s.draft and s.constraint is None and self.drafts
             caps.append(max(0, min(self.drafts, room, s.count - len(s.out) - 1)) if ok else 0)
-        if not any(caps) or self.costs is None:
+            rooms.append(room)
+        props = self._proposals(live, rooms) if self.copy is not None and self.costs is not None else None
+        if not any(caps) and not any(props or ()) or self.costs is None:
             return ks
+        mode: list[int | None] = [None] * len(live)
         need = max(len(self.e.views[s.slot].ids) for s in live) + ROWS   # the round's graph width (at most)
         self.costs = next((c for w, c in self.curves if need <= w), self.curves[-1][1])
         rows, drafting = len(live), 0
@@ -376,21 +411,54 @@ class MultiDecoder:
             # a time stops early where several would pay (3 streams: almost no drafting)
             best = None
             for i, s in enumerate(live):
-                base = self._expected(s.acc, ks[i])
-                for j in range(1, min(caps[i] - ks[i], ROWS - rows) + 1):
-                    gain = self._expected(s.acc, ks[i] + j) - base
-                    cost = self.costs[rows + j - 1] + self.overhead + self._draft_cost(drafting + (ks[i] == 0))
-                    r = (tokens + gain) / cost
-                    if r > rate and (best is None or r > best[0]):
-                        best = (r, i, j, gain)
+                if mode[i] != M_COPY:
+                    base = self._expected(s.acc, ks[i])
+                    for j in range(1, min(caps[i] - ks[i], ROWS - rows) + 1):
+                        gain = self._expected(s.acc, ks[i] + j) - base
+                        cost = self.costs[rows + j - 1] + self.overhead + self._draft_cost(drafting + (ks[i] == 0))
+                        r = (tokens + gain) / cost
+                        if r > rate and (best is None or r > best[0]):
+                            best = (r, i, j, gain, M_DSPARK)
+                if props is not None and props[i] and mode[i] != M_DSPARK:
+                    kept = max(s.cfrac, MULTI_COPY_MIN)            # a copy runs on until an edit: as a share
+                    for j in range(1, min(len(props[i]) - ks[i], ROWS - rows) + 1):
+                        gain = kept * j
+                        r = (tokens + gain) / (self.costs[rows + j - 1] + self.overhead + self._draft_cost(drafting))
+                        if r > rate and (best is None or r > best[0]):
+                            best = (r, i, j, gain, M_COPY)
             if best is None:
                 break
-            rate, i, j, gain = best
-            drafting += ks[i] == 0
+            rate, i, j, gain, how = best
+            drafting += how == M_DSPARK and ks[i] == 0
+            mode[i] = how
             ks[i] += j
             tokens += gain
             rows += j
-        return ks
+        return [k + COPY_FLAG if how == M_COPY else k for k, how in zip(ks, mode)]
+
+    def _proposals(self, live: list[Stream], rooms: list[int]) -> list[list[int]]:
+        """Rank 0: each stream's copy proposal this round ([]: none, a grammar's or a serial stream, or backing off
+        after copies that missed)."""
+
+        out = []
+        for s, room in zip(live, rooms):
+            cap = min(self.copy.most, room, s.count - len(s.out) - 1)
+            ok = s.draft and s.constraint is None and s.cwait == 0 and cap > 0
+            out.append(self._copies(s).propose(cap) if ok else [])
+        return out
+
+    def _copies(self, s: Stream) -> CopyDrafts:
+        """Stream ``s``'s copy index (both ranks): its prompt's last WINDOW tokens (all a search reads) and its reply,
+        the pending token last; built when its prompt ends (``_step``), caught up from the reply's tail here."""
+
+        c = s.copies
+        if c is None or len(c) - s.cbase > len(s.out):
+            s.cbase = min(len(s.prompt), COPY_WINDOW)
+            c = s.copies = CopyDrafts(s.prompt[len(s.prompt) - s.cbase:], self.copy)
+        have = len(c) - s.cbase
+        if have < len(s.out):
+            c.extend(s.out[have:])
+        return c
 
     def _draft_cost(self, streams: int) -> float:
         """ms of drafting for ``streams`` streams: one batched pass where captured, else a pass each."""
@@ -408,6 +476,35 @@ class MultiDecoder:
             hit = 1.0 if j < m else 0.0
             s.acc[j] = (1 - a) * s.acc[j] + a * hit
             self.prior[j] = (1 - a / 4) * self.prior[j] + a / 4 * hit
+
+    def _learn_copy(self, s: Stream, k: int, m: int) -> None:
+        """A copy round kept m of its k drafts: the running share; below MULTI_COPY_MIN, wait 2, 4 .. 64 rounds (a
+        wait for each such round in a row) and start again from MULTI_COPY_MIN."""
+
+        s.copy_rounds += 1
+        s.copy_accepted += m
+        if self.prof is not None and self.rank == 0:
+            self.prof["copy_rounds"] += 1
+            self.prof["copy_accepted"] += m
+        s.cfrac = 0.5 * s.cfrac + 0.5 * m / k
+        if s.cfrac < MULTI_COPY_MIN:
+            s.cmiss += 1
+            s.cwait = min(2 ** s.cmiss, COPY_BACKOFF)
+            s.cfrac = MULTI_COPY_MIN               # (the next try copies again unless it keeps less)
+        else:
+            s.cmiss = 0
+
+    def _agree_copies(self, plan, spans, rows) -> None:
+        """TF_MULTI_CHECK=1: both ranks hash the round's copy windows and compare (a mismatch: out of step)."""
+
+        import zlib
+
+        words = [x for (sid, _, _), (r0, nrows, _, _, copied) in zip(plan, spans) if copied
+                 for x in (sid, *(t for _, t in rows[r0:r0 + nrows]))]
+        h = zlib.crc32(np.asarray(words, dtype=np.int64).tobytes())
+        both = self.gather([h])
+        if both[0] != both[1]:
+            raise RuntimeError(f"the ranks disagree on a round's copy drafts (hash {both[0][0]} vs {both[1][0]})")
 
     def reset_policy(self) -> None:
         """The running acceptance estimate back to its start (a measurement's requests then plan as a fresh server's
@@ -863,6 +960,10 @@ class MultiDecoder:
     def _queue(self, s: Stream, base: int = -1, size: int = -1, eid: int = -1, mode: int = FRESH,
                k: Kept | None = None, m: int = 0) -> None:
         s.acc = list(self.prior0 if self.reset_prior else self.prior)
+        if self.copy is not None:                  # copy drafts: the index (at the prompt's end), the commit rule
+            s.copies, s.cbase = None, 0
+            s.cfrac, s.cmiss, s.cwait = 1.0, 0, 0  # running kept share, copy rounds missed in a row, rounds to wait
+            s.copy_rounds = s.copy_accepted = 0
         s.slot = self.free.pop(0)
         s.pos = -1                                 # prompt tokens prefilled so far (-1: not started)
         if base >= 0:                              # the stream's extent of the shared pool (rank 1: rank 0's place)
@@ -971,6 +1072,8 @@ class MultiDecoder:
         finally:
             s.prefill_s += time.perf_counter() - t0
         s.context = list(s.prompt)
+        if self.copy is not None and s.draft and s.constraint is None:
+            self._copies(s)                        # (off the rounds: a long prompt's window to int64 once)
         s.started = time.perf_counter()
         self.filling = [x for x in self.filling if x is not s]
         self.streams[s.sid] = s
@@ -1005,7 +1108,8 @@ class MultiDecoder:
 
     # -- rounds ---------------------------------------------------------------------------------------------------
     def _plan(self, live: list[Stream]) -> list[tuple[int, int]]:
-        """(sid, drafts) a stream: drafts while the round's rows fit (none for a grammar's stream yet)."""
+        """(sid, drafts) a stream: drafts while the round's rows fit (none for a grammar's stream yet); a copy round's
+        drafts + COPY_FLAG."""
 
         return [(s.sid, k) for s, k in zip(live, self._allocate(live))]
 
@@ -1049,7 +1153,7 @@ class MultiDecoder:
                 s.done, s.finished = True, time.perf_counter()
         if rs is not None:
             rs.mark("emit")
-            rs.end(sum(k for _, k in plan) + len(plan))
+            rs.end(sum(k & (COPY_FLAG - 1) for _, k in plan) + len(plan))
         if self.prof is not None and self.rank == 0:
             self.prof["round"] += time.perf_counter() - tr
         return done + [s for s in live if s.done]
@@ -1062,7 +1166,9 @@ class MultiDecoder:
         try:
             rows, spans = [], []
             t0 = time.perf_counter()
-            want = [(sid, k) for sid, k in plan if k]
+            # (sid, drafts, copied): a copy round's k + COPY_FLAG decoded once, here; spans carry it on
+            plan = [(sid, k & (COPY_FLAG - 1), k >= COPY_FLAG) for sid, k in plan]
+            want = [(sid, k) for sid, k, copied in plan if k and not copied]
             rs = self.rsplit
             rs is not None and want and rs.event("d0")
             batched = getattr(e.drafter, "multi_graphs", None) if e.drafter is not None else None
@@ -1071,19 +1177,27 @@ class MultiDecoder:
                 items = [(self.streams[sid].slot, self.streams[sid].out[-1], len(e.views[self.streams[sid].slot].ids))
                          for sid, _ in want]
                 proposals = {sid: d for (sid, _), d in zip(want, e.drafter.propose_multi(items))}
-            for sid, k in plan:
+            for sid, k, copied in plan:
                 s = self.streams[sid]
                 pending = s.out[-1]
                 drafts: list[int] = []
-                if k and sid in proposals:
+                if copied:                                 # both ranks: the same search of the same context
+                    if self.copy is None:
+                        raise RuntimeError("the ranks disagree on copy drafts (TF_MULTI_COPY)")
+                    drafts = self._copies(s).propose(k)[:k]
+                    if len(drafts) != k:
+                        raise RuntimeError(f"stream {sid}: a copy proposal of {len(drafts)} tokens, planned {k}")
+                elif k and sid in proposals:
                     drafts = proposals[sid][:k]
                 elif k:
                     e.select_slot(s.slot)
                     drafts = e.drafter.propose(pending, len(e.views[s.slot].ids))[:k]
                 if s.constraint is not None:
                     s.constraint.advance([pending])
-                spans.append((len(rows), len(drafts) + 1, len(e.views[s.slot].ids)))
+                spans.append((len(rows), len(drafts) + 1, len(e.views[s.slot].ids), k, copied))
                 rows += [(s.slot, t) for t in [pending, *drafts]]
+            if self.check and self.gather is not None and any(c for *_, c in spans):
+                self._agree_copies(plan, spans, rows)
             if rs is not None:
                 want and rs.event("d1")
                 rs.mark("draft")
@@ -1094,7 +1208,7 @@ class MultiDecoder:
                 e._rsplit = None
             if self.check and len(rows) > 1:               # debug: row 0 of each stream alone, at the same position
                 main = logits[:len(rows)].float().clone()
-                for (sid, k), (r0, nrows, p0) in zip(plan, spans):
+                for (sid, _, _), (r0, nrows, p0, _, _) in zip(plan, spans):
                     s = self.streams[sid]
                     ids = e.views[s.slot].ids
                     keep = ids[p0:]
@@ -1124,10 +1238,12 @@ class MultiDecoder:
                     print(f"[multi] {n} rounds: draft {1e3 * p['draft'] / n:.1f} ms, verify {1e3 * p['verify'] / n:.1f} ms, "
                           f"post {1e3 * p['post'] / n:.1f} ms, fill {1e3 * p['fill'] / n:.1f} ms, round "
                           f"{1e3 * p['round'] / n:.1f} ms, {p['rows'] / n:.1f} rows, {p['streams'] / n:.1f} streams"
+                          + (f"; copy rounds {p['copy_rounds']} kept {p['copy_accepted']} drafts"
+                             if "copy_rounds" in p else "")
                           + (f"; kept {len(self.kept)} {self.kstats}" if self.kept_on else ""), flush=True)
             t2 = time.perf_counter()
             news = []
-            for (sid, k), (r0, nrows, p0) in zip(plan, spans):
+            for (sid, _, _), (r0, nrows, p0, k, copied) in zip(plan, spans):
                 s = self.streams[sid]
                 if s.sampling is not None and s.sampling.temperature > 0 or s.constraint is not None:
                     block = logits[r0:r0 + nrows].float()
@@ -1141,10 +1257,14 @@ class MultiDecoder:
                 while m < len(drafts) and drafts[m] == target[m]:
                     m += 1
                 del e.views[s.slot].ids[p0 + 1 + m:]           # rejected rows: overwritten later
-                if k:
+                if copied:                                     # only the copy rule learns from copy rounds
+                    self._learn_copy(s, k, m)
+                elif k:
                     self._learn(s, k, m)
                 elif DRAFT_RELAX > 0:
                     s.acc = [a + DRAFT_RELAX * (p - a) for a, p in zip(s.acc, self.prior0)]
+                if self.copy is not None and not copied and s.cwait > 0:
+                    s.cwait -= 1
                 if s.constraint is not None and m:
                     s.constraint.advance(drafts[:m])
                 s.counted(nrows)
@@ -1248,4 +1368,7 @@ class MultiDecoder:
 
 
 def stream_stats(s: Stream) -> dict[str, Any]:
-    return s.stats()
+    out = s.stats()
+    if hasattr(s, "copy_rounds"):                  # copy drafts on (TF_MULTI_COPY)
+        out.update({"copy_rounds": s.copy_rounds, "copy_accepted": s.copy_accepted})
+    return out
