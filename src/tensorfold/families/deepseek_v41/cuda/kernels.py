@@ -1229,6 +1229,9 @@ def index_select(iq: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos: t
 # non-zero term, the weights' total a running sum in pick order, so any count gives the same bits (1: peer
 # bertholomus/TensorFold bbaa6cd's one-warp route, Apache-2.0)
 ROUTE_WARPS = int(os.environ.get("TF_DSV41_ROUTE_WARPS") or 4)
+# the router matmul's experts a program (TF_ROUTER_BE, default 32; 16: twice the programs). Each logit's k16 MMA
+# chain within its slice does not depend on it (checked bit for bit in tests/test_dsv41_router.py)
+ROUTER_BE = int(os.environ.get("TF_ROUTER_BE") or 32)
 
 
 @triton.jit(do_not_specialize=["ns"])
@@ -1327,7 +1330,7 @@ def router_logits(x: torch.Tensor, w: torch.Tensor, parts: bool = False) -> torc
 
     R, D = x.shape
     E = w.shape[0]
-    BR, BE, BK = 16, 32, 64
+    BR, BE, BK = 16, ROUTER_BE, 64
     KS = ROUTER_SLICES if D % (ROUTER_SLICES * BK) == 0 else 1
     part = torch.empty((KS, R, E), dtype=torch.float32, device=x.device)
     _router_logits[(triton.cdiv(R, BR), triton.cdiv(E, BE), KS)](x.contiguous(), w, part, R, E=E, D=D, BR=BR,

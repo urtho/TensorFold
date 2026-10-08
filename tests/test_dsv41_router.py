@@ -40,3 +40,19 @@ def test_one_warp_route_equals_four(R, monkeypatch):
         monkeypatch.setattr(K, "ROUTE_WARPS", nw)
         out[nw] = K.route(logits, bias, 6, 2.5)
     assert torch.equal(out[4][0], out[1][0]) and torch.equal(out[4][1].view(torch.int32), out[1][1].view(torch.int32))
+
+
+@pytest.mark.parametrize("R", [1, 2, 6, 16])
+@pytest.mark.parametrize("E,D", [(384, 5120), (32, 5120)])
+def test_router_be16_equals_be32(R, E, D, monkeypatch):
+    """TF_ROUTER_BE=16: the same logits (summed and as slices) as 32 experts a program, bit for bit."""
+
+    g = torch.Generator(device="cuda").manual_seed(70 + R + E)
+    x = torch.randn((R, D), generator=g, device="cuda").to(torch.bfloat16)
+    w = (torch.randn((E, D), generator=g, device="cuda") * 0.02).half()
+    out = {}
+    for be in (32, 16):
+        monkeypatch.setattr(K, "ROUTER_BE", be)
+        out[be] = (K.router_logits(x, w), K.router_logits(x, w, parts=True))
+    for a, b in zip(out[32], out[16]):
+        assert torch.equal(a.view(torch.int32), b.view(torch.int32))

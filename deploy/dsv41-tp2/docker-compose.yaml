@@ -107,6 +107,7 @@ services:
       TF_X3LD_PDL: ${TF_X3LD_PDL:-}                   # 1: the expert load kernels as programmatic dependent launches
       TF_DSV41_CAND_BOUND: ${TF_DSV41_CAND_BOUND:-}   # 1: the candidate top-k scans only the listed blocks' lanes
       TF_DSV41_ROUTE_WARPS: ${TF_DSV41_ROUTE_WARPS:-} # 1: the routing kernel on one warp (same bits)
+      TF_ROUTER_BE: ${TF_ROUTER_BE:-}                 # 16: the router matmul with twice the programs (same bits)
       # copy drafts in concurrent rounds (empty / 0: off, 1: on; exact) and the kept share under which a stream backs
       # off (0.3); neither enters the calibration cache's key
       TF_MULTI_COPY: ${TF_MULTI_COPY:-}
