@@ -14,6 +14,10 @@
 // A proxy thread spins on ctrl.seq; for every new sequence number it posts two RDMA writes on one reliable QP: the
 // payload into the peer's recv[slot], then the 4-byte seq into the peer's flags[slot]. Writes on one RC QP are placed
 // in order, so a flag never becomes visible before its payload. The GPU polls its own flags[slot].
+//
+// TF_RDMA_TRACE (tf_rdma_trace before tf_rdma_start; off: a NULL ring, no stamps): per sequence, CLOCK_REALTIME ns of
+// the doorbell seen, the writes posted and the flag write completed (the peer's ack), in a host ring of int64
+// {seq, seen, posted, completed} entries at index seq & (n - 1).
 #define _GNU_SOURCE
 #include <errno.h>
 #include <infiniband/verbs.h>
@@ -24,7 +28,7 @@
 #include <string.h>
 #include <time.h>
 
-#define TF_RDMA_ABI 1
+#define TF_RDMA_ABI 2
 #define CTRL_BYTES 64
 #define FLAG_BYTES 64
 #define SLOTS 2
@@ -51,10 +55,24 @@ typedef struct {
     volatile int running, failed;
     uint32_t last_seq, inflight;
     uint64_t posted, completed;
+    int64_t *trace;                                     // TF_RDMA_TRACE ring (NULL: off), trace_mask = entries - 1
+    uint64_t trace_mask;
     char error[256];
 } tf_rdma;
 
 int tf_rdma_abi(void) { return TF_RDMA_ABI; }
+
+// the trace ring (``entries`` a power of two, 4 int64 an entry; NULL: off); set before tf_rdma_start
+void tf_rdma_trace(tf_rdma *r, int64_t *ring, uint64_t entries) {
+    r->trace = ring;
+    r->trace_mask = entries ? entries - 1 : 0;
+}
+
+static int64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
 
 // offsets {ctrl, flags, send, recv, total} for a slot size (slot_bytes a multiple of 4096)
 void tf_rdma_layout(uint64_t slot_bytes, uint64_t *out) {
@@ -192,6 +210,10 @@ static int reap(tf_rdma *r) {
         }
         r->completed++;
         r->inflight--;
+        if (r->trace) {                                 // (only the flag write is signaled: wr_id is its seq)
+            int64_t *e = r->trace + 4 * (wc[i].wr_id & r->trace_mask);
+            if ((uint64_t)e[0] == wc[i].wr_id) e[3] = now_ns();
+        }
     }
     return 0;
 }
@@ -240,7 +262,14 @@ static void *loop(void *arg) {
         if (seq != r->last_seq) {
             while (r->last_seq != seq && !r->failed) {       // in order, including any the GPU rang meanwhile
                 r->last_seq++;
+                int64_t *e = r->trace ? r->trace + 4 * (r->last_seq & r->trace_mask) : NULL;
+                if (e) {
+                    e[0] = r->last_seq;
+                    e[1] = now_ns();
+                    e[3] = 0;
+                }
                 if (post(r, r->last_seq)) break;
+                if (e) e[2] = now_ns();
             }
             idle = 0;
         } else if (++idle > 2000000) {                        // idle a while: poll gently

@@ -250,6 +250,11 @@ Parts of the DeepSeek-V4.1 serving path are adapted from Jay Leaton's
     `src/tensorfold/families/deepseek_v41/cuda/serial.py`; the kept prompts' `vd` in `multi.py`) follows its CED
     bounded-replay prefill (`replay.py`, `TF_DSV41_PREFILL=replay`, an approximate replay over a prompt's last 128 rows
     that it attributes to DeepSeek's V4.1-Flash technical report). Ours is exact.
+  - The RoCE gather's phase trace (`TF_RDMA_TRACE`: the timer stamps in `src/tensorfold/cuda/rdma/gather.cu` and
+    `rdma_proxy.c`, `trace_phases` in `rdma/__init__.py`) follows the gather phase split of its G14 work on
+    `gather_fast_kernel` (`roce.cu` in `patches/0002`, Apache License 2.0, Copyright 2026 Jay Leaton), and the
+    one-exchange ROUND message (`TF_DSV41_SEND=one`, `src/tensorfold/families/deepseek_v41/cuda/share.py`) follows
+    the idea of its plan link (`TF_DSV41_PLAN_LINK`, G14).
   - The THP guards in `deploy/dsv41-tp2/docker-compose.yaml` (`NUMPY_MADVISE_HUGEPAGE=0`, `MIMALLOC_ALLOW_THP=0`) follow
     the prefill stall reported in its G12 notes.
 

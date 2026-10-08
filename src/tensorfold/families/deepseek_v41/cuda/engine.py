@@ -87,6 +87,11 @@ SHARED_POOL = os.environ.get("TF_DSV41_SHARED_POOL", "1") != "0"
 # kept prompts inside the shared pool: their per-token caches stay in the pool's free rows, their window rings (a
 # slot's DRING rows of every ring, SLOT_BYTES) in a bank of this many entries
 KEPT_ENTRIES = int(os.environ.get("TF_DSV41_KEPT_ENTRIES") or "32")
+# rank 0's messages to rank 1: two (default) blocking exchanges each (length, values), or one (``share.OneExchange``:
+# one exchange, no host sync on rank 0; messages of 64+ values add the second); both ranks must agree
+SEND = os.environ.get("TF_DSV41_SEND") or "two"
+if SEND not in ("one", "two"):
+    raise ValueError(f"TF_DSV41_SEND={SEND}: one or two")
 
 
 # the decode graphs' buffers that scale with a stream's limit ([R, limit // ratio] indexer scores and top-k scratch):
@@ -232,6 +237,11 @@ class Dsv41Engine:
         self.nccl = NCCL(rank, 2, master, port)
         self.nccl.barrier()
         self._use_rdma(rank)
+        self._one = None
+        if SEND == "one":
+            from .share import OneExchange
+
+            self._one = OneExchange(self.nccl, rank)
         from tensorfold.cuda import doorbell
 
         # rank 1 waits for rank 0's next request on a CPU socket while the server idles, not in a GPU collective
@@ -243,11 +253,12 @@ class Dsv41Engine:
                                     "there (or point TF_DSV41_ENGRAM_DIR at them)")
         self.streams = max(1, int(parallel))
         mine = [cap, int(bool(drafts)), int(explicit), self.streams, int(SHARED_POOL and self.streams > 1),
-                KEPT_ENTRIES, *_widths_words(), *_keep_words(), *_disk_words(), *_kv_words()]
+                KEPT_ENTRIES, *_widths_words(), *_keep_words(), *_disk_words(), *_kv_words(), int(SEND == "one")]
         both = self._gather_ints(mine)
         if both[0] != both[1]:
             raise RuntimeError(f"the two ranks were started with different settings (context, drafts, parallel, "
-                               f"TF_DSV41_DISK*, TF_DSV41_KV and its knobs): rank 0 {both[0]}, rank 1 {both[1]}; "
+                               f"TF_DSV41_DISK*, TF_DSV41_KV and its knobs, TF_DSV41_SEND): rank 0 {both[0]}, rank 1 "
+                               f"{both[1]}; "
                                "give both the same flags")
         started = time.perf_counter()
         self._boot = [("start", started)]
@@ -536,10 +547,12 @@ class Dsv41Engine:
     def _share(self, values: list[int] | None) -> list[int]:
         """Rank 0's int list on every rank (its length first, then the values). The first message after an idle
         point (the doorbell armed) rings it first on rank 0; rank 1 waits for the ring on the CPU, and gets [] when
-        rank 0 closed the doorbell instead (it stopped)."""
+        rank 0 closed the doorbell instead (it stopped). TF_DSV41_SEND=one: ``share.OneExchange``."""
 
         if self.bell is not None and not self.bell.gate():
             return []
+        if self._one is not None:
+            return self._one.share(values)
         count = self._gather_ints([len(values) if self.rank == 0 else 0])[0][0]
         if count == 0:
             return []

@@ -18,6 +18,11 @@
 //      records the sequence in ctrl[4] and stops further launches);
 //   4. every block copies the peer's shard from recv to the output (four loads in flight a thread);
 //   5. the last block to leave advances the device epoch, so a CUDA graph replays the exchange with the next seq.
+//
+// TF_RDMA_TRACE=N (``gather_kernel<true>``; off: ``<false>``, the kernel as before): %globaltimer stamps of each
+// gather's phases in a device ring of N entries (index seq & (N-1)), read by ``RdmaGather.trace_stats``. The phase
+// split follows jayleaton/deepseek-v41-tensorfold-spark's G14a gather trace (patch 0002 roce.cu, Apache-2.0; the idea,
+// no code copied).
 #include <ATen/ATen.h>
 #include <torch/types.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -44,6 +49,11 @@ __device__ __forceinline__ void st_relaxed_sys(uint32_t* p, uint32_t v) {
 __device__ __forceinline__ void st_release_sys(uint32_t* p, uint32_t v) {
     asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
+__device__ __forceinline__ unsigned long long globaltimer() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
 __device__ __forceinline__ uint4 ld_sys_v4(const uint4* p) {
     uint4 v;
     asm volatile("ld.relaxed.sys.global.v4.u32 {%0, %1, %2, %3}, [%4];"
@@ -51,15 +61,26 @@ __device__ __forceinline__ uint4 ld_sys_v4(const uint4* p) {
     return v;
 }
 
+// trace entry (TRACE): [0] seq, [1] start (block 0), [2] staged (block 0, its stores done), [3] rung (the last block
+// to arrive, after the doorbell), [4] flag seen (block 0), [5] copied (block 0, its copy-out done), [6] end (the last
+// block to leave), [7] block 0's flag polls; globaltimer ns
+template <bool TRACE>
 __global__ void __launch_bounds__(256) gather_kernel(const uint4* __restrict__ in, uint4* __restrict__ out, int packs,
                                                      uint32_t nbytes, char* region, long long flag_off,
                                                      long long send_off, long long recv_off, long long slot_bytes,
-                                                     uint32_t* state, uint32_t spin, int rank) {
+                                                     uint32_t* state, uint32_t spin, int rank,
+                                                     unsigned long long* trace, uint32_t trace_mask) {
     // state: [0] epoch (last completed seq), [1] arrivals, [2] departures, [3] stopped (a wait timed out)
     __shared__ int ok;
     const int tid = threadIdx.x;
     const uint32_t seq = ld_relaxed_gpu(state) + 1u, slot = seq & 1u;
     uint32_t* ctrl = reinterpret_cast<uint32_t*>(region);
+    unsigned long long* te = TRACE ? trace + 8ull * (seq & trace_mask) : nullptr;
+    const bool lead = TRACE && blockIdx.x == 0 && tid == 0;
+    if (lead) {
+        te[0] = seq;
+        te[1] = globaltimer();
+    }
     if (ld_relaxed_gpu(state + 3) != 0u) return;
     const int index = blockIdx.x * blockDim.x + tid, stride = gridDim.x * blockDim.x;
 
@@ -71,6 +92,7 @@ __global__ void __launch_bounds__(256) gather_kernel(const uint4* __restrict__ i
         mine_out[i] = v;
     }
     __syncthreads();                                  // the block's stores, then one system fence for them all
+    if (lead) te[2] = globaltimer();
     if (tid == 0) {                                                                           // 2. doorbell
         __threadfence_system();
         const uint32_t prior = atomicAdd(state + 1, 1u);
@@ -78,6 +100,7 @@ __global__ void __launch_bounds__(256) gather_kernel(const uint4* __restrict__ i
             __threadfence_system();
             st_relaxed_sys(ctrl + 1 + slot, nbytes);
             st_release_sys(ctrl, seq);
+            if (TRACE) te[3] = globaltimer();
         }
         const uint32_t* flag = reinterpret_cast<const uint32_t*>(region + flag_off + slot * 64);   // 3. wait
         uint32_t polls = 0;
@@ -89,6 +112,10 @@ __global__ void __launch_bounds__(256) gather_kernel(const uint4* __restrict__ i
                 ok = 0;
                 break;
             }
+        }
+        if (lead) {
+            te[4] = globaltimer();
+            te[7] = polls;
         }
     }
     __syncthreads();
@@ -108,8 +135,10 @@ __global__ void __launch_bounds__(256) gather_kernel(const uint4* __restrict__ i
     }
     __threadfence();                                                                          // 5. epoch
     __syncthreads();
+    if (lead) te[5] = globaltimer();
     if (tid == 0) {
         const uint32_t prior = atomicAdd(state + 2, 1u);
+        if (TRACE && (prior + 1u) % gridDim.x == 0u) te[6] = globaltimer();
         if ((prior + 1u) % gridDim.x == 0u && ld_relaxed_gpu(state + 3) == 0u) atomicExch(state, seq);
     }
 }
@@ -117,7 +146,8 @@ __global__ void __launch_bounds__(256) gather_kernel(const uint4* __restrict__ i
 }  // namespace
 
 void rdma_gather(const at::Tensor& in, at::Tensor& out, int64_t region, int64_t flag_off, int64_t send_off,
-                 int64_t recv_off, int64_t slot_bytes, at::Tensor& state, int64_t spin, int64_t rank) {
+                 int64_t recv_off, int64_t slot_bytes, at::Tensor& state, int64_t spin, int64_t rank, int64_t trace,
+                 int64_t trace_mask) {
     TORCH_CHECK(in.is_cuda() && out.is_cuda() && state.is_cuda(), "rdma gather: CUDA tensors");
     TORCH_CHECK(in.is_contiguous() && out.is_contiguous(), "rdma gather: contiguous tensors");
     const int64_t nbytes = in.numel() * in.element_size();
@@ -126,10 +156,12 @@ void rdma_gather(const at::Tensor& in, at::Tensor& out, int64_t region, int64_t 
     TORCH_CHECK(reinterpret_cast<uintptr_t>(in.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0,
                 "rdma gather: 16-byte aligned tensors");
     const at::cuda::CUDAGuard guard(in.device());
-    gather_kernel<<<GRID, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+    auto kernel = trace ? gather_kernel<true> : gather_kernel<false>;       // trace: a device ring of 8 x u64 entries
+    kernel<<<GRID, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const uint4*>(in.data_ptr()), reinterpret_cast<uint4*>(out.data_ptr()), (int)(nbytes / 16),
         (uint32_t)nbytes, reinterpret_cast<char*>(region), flag_off, send_off, recv_off, slot_bytes,
-        reinterpret_cast<uint32_t*>(state.data_ptr()), (uint32_t)spin, (int)rank);
+        reinterpret_cast<uint32_t*>(state.data_ptr()), (uint32_t)spin, (int)rank,
+        reinterpret_cast<unsigned long long*>(trace), (uint32_t)trace_mask);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
