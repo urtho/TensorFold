@@ -271,7 +271,9 @@ merged-off / on, alternating x2; the quick tier with every switch on gives bbc5e
 - [ ] `TF_MULTI_COPY` (copy drafts in concurrent rounds): A/B on the edit / docs jaybench workloads and 16 clients
 - [ ] `TF_DSV41_SEND=one` (one exchange a message) and `TF_RDMA_TRACE`: measure on the served path
 - [ ] Draft policy: the calibrated verify costs over-price 5-6-row windows by 6-20% (server 43 / 49 ms vs decode-bench
-      38.0 / 40.7 and jaybench rounds 40.7 / 44.7): a realistic-depth cost curve (design.json "draft-policy")
+      38.0 / 40.7 and jaybench rounds 40.7 / 44.7): a realistic-depth cost curve (design.json "draft-policy");
+      built as `TF_DSV41_COSTS=depth` (perf9/draft-policy, default off): A/B jaybench 5 reps a mode with the k
+      histogram, `--jb-serial` sha equal, and `--decoder-test` under it
 - [ ] Still open from the design: wo_a rotation folded into the attention merge, norm + rot_in fusion, dense-lane EXL3
       decode, Triton PDL, RoCE two rails, the serving warm-up trim (27-54 s a start), first-start PP dip diagnosis
 - [x] Grammar-constrained streams draft (`TF_DSV41_DRAFT_GRAMMAR`, 6542b0d; on in the deployment): before, every

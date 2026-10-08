@@ -126,6 +126,13 @@ stopped drafting drifts back toward it (`TF_DSV41_DRAFT_RELAX`, 0.02 a round wit
 drafted rounds, so before this a stream that stopped never drafted again). `TF_DSV41_DRAFT_RESET=0` carries the running
 estimate across requests (the old behaviour in full: also `TF_DSV41_DRAFT_RELAX=0 TF_DSV41_DRAFT_PRIOR=0.6`). Single requests: old start (0.6, carried) code 76.9-78.0, prose 39.8-41.5,
 structured 109.1-114.1, c1 98.7-99.3, hard 38.8; now 77.3-79.8 / 42.3 / 114.0 / 99.5, hard 47.4.
+`TF_DSV41_COSTS=depth` (or `depth:N`; default off): the startup curve times random rows over the slots at position
+200, which over-prices one stream's 5-6-row windows (server 43 / 49 ms vs decode-bench 38.0 / 40.7 at 2K); with it,
+calibration also prefills a natural 2048 (N) token prompt (this package's source, tokenized) into slot 0 and times 1 ..
+drafts + 1 rows of the next natural tokens through `step_multi` (median of 5), before the slots are reset. One-stream
+rounds at that key width are then priced by it (rows past it: its last plus the random curve's steps); rank 0's depth is
+used on both ranks (the rows are collectives and the timings gathered), and the calibration cache key carries it. The
+startup prints both curves (`one-stream rounds ... priced by rows 1..6: ... (random rows: ...)`). Draft counts only.
 
 L2 prefetch (`serial.py`, default `TF_L2_PREFETCH=bulk`, paced at `TF_L2_PACE_GBPS=150` through `l2pace.cu`, all three
 sites, joined at the step's end; `TF_L2_PREFETCH=0` off, `TF_L2_SITES`, `TF_L2_PACE_CTAS`, `TF_L2_PACE_DELAY_US`,
