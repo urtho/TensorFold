@@ -72,9 +72,12 @@ DRAFT_GRAMMAR = os.environ.get("TF_DSV41_DRAFT_GRAMMAR", "0") == "1"
 # a measured verify curve that replaces the calibrated one for every round (TF_DSV41_COST_CURVE="ms1,ms2,..": ms of
 # 1, 2, .. rows; rows past the list add the calibrated curve's increments; empty, the default: the calibration's).
 # An experiment knob: draft counts only, never tokens (rank 0 plans, agree() sends its k)
-# replays a calibration timing takes the best of (TF_DSV41_CALIB_REPS, default 4): at 4, the 5-6-row costs vary by
-# process enough to flip one stream's draft count (jaybench structured 112 / 124 tok/s with the same tokens)
-CALIB_REPS = max(1, int(os.environ.get("TF_DSV41_CALIB_REPS") or "4"))
+# replays a calibration timing of 1 .. CALIB_FEW rows takes the best of (TF_DSV41_CALIB_REPS, default 16; wider rows:
+# 4): at 4 the 4-6-row costs varied by process (2026-10-09, 16 processes: row 4 38.98-40.31 ms, row 5 44.39-46.79)
+# enough to flip one stream's draft count for the process's life (jaybench structured 112 / 124 tok/s, the same
+# tokens); at 16, over 4 processes: 39.14-39.19, 44.55-44.75. ~5 s more calibration
+CALIB_REPS = max(1, int(os.environ.get("TF_DSV41_CALIB_REPS") or "16"))
+CALIB_FEW = 8
 COST_CURVE = [float(v) for v in (os.environ.get("TF_DSV41_COST_CURVE") or "").split(",") if v.strip()]
 # a prompt of KEEP_SHRINK_MIN tokens or more is also kept at 3/4 and 7/8 of its length (exact states), and room is made
 # by dropping loose extents' longest kept states before whole extents are evicted (``_trim``): a long document's
@@ -378,7 +381,7 @@ class MultiDecoder:
                 g["pos"].copy_(torch.arange(R) + 200)
                 g["sid"].copy_(torch.arange(R) % e.slots)
                 best = float("inf")
-                for _ in range(CALIB_REPS):
+                for _ in range(CALIB_REPS if R <= CALIB_FEW else 4):
                     torch.cuda.synchronize()
                     t = time.perf_counter()
                     e._replay_free(g)
