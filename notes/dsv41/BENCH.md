@@ -156,6 +156,8 @@ bf16 Z instead of fp16 cost 8K NLL +0.001 (rel 2.7e-3 vs 4.2e-4 on one layer), h
 Second link: `rocep1s0f0` (aiai) / `rocep1s0f1` (aiai2) needed IPv4 for a RoCE v2 GID; persistent in the
 NetworkManager profile `cx7-companion-mtu` (10.43.0.1/24 on aiai `enp1s0f0np0`, 10.43.0.2/24 on aiai2
 `enp1s0f1np1`, never-default, MTU 9000). vLLM stays pinned to the first half (`roceP2p1s0f0`/`...f1`).
+Since 2026-10-08 aiai's cable is in its f1 port, the same as aiai2's: both profiles there are bound to `enP2p1s0f1np1` /
+`enp1s0f1np1`, and rank 0 uses `roceP2p1s0f1,rocep1s0f1` (`rank0.env`, `tools/dsv41_*2.sh`).
 Chunk profile now: experts 740 ms, dense GEMM 260, NCCL 164, MQA 143, _post 76, rot_in 58 + 57, unpack 45.
 
 ## 2026-10-01 — prefill past 1,250 tok/s (`TF_DUAL=1 --profile-prefill 2048`)

@@ -25,7 +25,7 @@ MEM_READY_GIB  ?= 112
 MEM_READY_WAIT ?= 600
 # each rank's RoCE devices: its rankN.env NCCL_IB_HCA (NCCL stripes over both halves of the 200G port)
 hcas_of      = $(shell grep -E '^NCCL_IB_HCA=' $(DIR)/$(1) 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/^[=^]*//; s/:[0-9]*//g; s/,/ /g')
-HCAS0        ?= $(or $(call hcas_of,rank0.env),roceP2p1s0f0)
+HCAS0        ?= $(or $(call hcas_of,rank0.env),roceP2p1s0f1)
 HCAS1        ?= $(or $(call hcas_of,rank1.env),roceP2p1s0f1)
 
 env_of = $(shell grep -E '^$(1)=' $(DIR)/.env 2>/dev/null | tail -1 | cut -d= -f2-)
