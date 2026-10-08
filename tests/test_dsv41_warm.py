@@ -36,21 +36,23 @@ def test_full_battery_is_the_old_one():
 
 
 def test_modes(monkeypatch):
-    for v, mode in [("", "full"), ("1", "full"), ("full", "full"), ("0", "0"), ("trim", "trim"), ("audit", "audit"),
+    for v, mode in [("", "trim"), ("1", "full"), ("full", "full"), ("0", "0"), ("trim", "trim"), ("audit", "audit"),
                     ("lean", "full")]:
         monkeypatch.setenv("TF_DSV41_WARM_SERVING", v)
         assert EN.warm_serving_mode() == mode
     monkeypatch.delenv("TF_DSV41_WARM_SERVING")
     monkeypatch.delenv("TF_DSV41_WARM_RARE", raising=False)
     monkeypatch.delenv("TF_DSV41_WARM_TRACE", raising=False)
-    assert EN.warm_serving_mode() == "full" and not EN.warm_rare_on() and not EN.warm_trace_on()
+    assert EN.warm_serving_mode() == "trim" and EN.warm_rare_on() and not EN.warm_trace_on()
+    monkeypatch.setenv("TF_DSV41_WARM_SERVING", "full")
+    assert not EN.warm_rare_on()
     monkeypatch.setenv("TF_DSV41_WARM_SERVING", "trim")
     assert EN.warm_rare_on() and not EN.warm_trace_on()
     monkeypatch.setenv("TF_DSV41_WARM_RARE", "0")
     assert not EN.warm_rare_on()
     monkeypatch.setenv("TF_DSV41_WARM_SERVING", "audit")
     assert EN.warm_trace_on()
-    monkeypatch.setenv("TF_DSV41_WARM_SERVING", "")
+    monkeypatch.setenv("TF_DSV41_WARM_SERVING", "full")
     monkeypatch.setenv("TF_DSV41_WARM_RARE", "1")
     monkeypatch.setenv("TF_DSV41_WARM_TRACE", "1")
     assert EN.warm_rare_on() and EN.warm_trace_on()

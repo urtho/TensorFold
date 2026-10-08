@@ -38,10 +38,12 @@ PROMPT_TRANSIENT_GIB = 1.5       # a prompt chunk's buffers beyond the context's
 
 
 def warm_serving_mode() -> str:
-    """TF_DSV41_WARM_SERVING: 0 (off), full (the battery of 13 waves; also empty / 1, the default), trim (the waves
-    that load distinct kernels, ~2.8K prompt tokens), audit (trim, then full from a clean pool: what only full loads)."""
+    """TF_DSV41_WARM_SERVING: 0 (off), trim (the waves that load distinct kernels, ~2.8K prompt tokens; empty, the
+    default since 2026-10-08: on GB10 the audit found 0 kernels only full loads, the warm-up took 16.8 s instead of
+    26.7, a 15-minute soak and the stress run were clean with no late kernel loads), full (the old battery of 13
+    waves; also 1 or any other value), audit (trim, then full from a clean pool: what only full loads)."""
 
-    v = os.environ.get("TF_DSV41_WARM_SERVING", "")
+    v = os.environ.get("TF_DSV41_WARM_SERVING", "") or "trim"
     return v if v in ("0", "trim", "audit") else "full"
 
 

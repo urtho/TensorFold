@@ -55,8 +55,8 @@ prompt and concurrent streams through the decoder) any Triton kernel loaded for 
 (`late kernel load ...`) and counted in `/health` (`late_kernel_loads`): such a load mid-serving once failed with CUDA
 800 in a peer engine. A count above zero names a shape the warm-up should cover.
 
-The serving-path battery is `TF_DSV41_WARM_SERVING` (`.env`): empty / `full` the 13 waves (~19.9K prompt tokens,
-27-54 s), `trim` three waves (~2.8K tokens: a 2600-token prompt kept at 2048 and its end, a sampled 100-token prompt
+The serving-path battery is `TF_DSV41_WARM_SERVING` (`.env`): `full` the 13 waves (~19.9K prompt tokens,
+27-54 s), empty / `trim` (the default since 2026-10-08: 16.8 s on GB10, the audit found nothing only full loads) three waves (~2.8K tokens: a 2600-token prompt kept at 2048 and its end, a sampled 100-token prompt
 decoding while that prompt resumes with 48 more, a 7-token prompt), `audit` trim then full from a clean pool, printing
 `[warm-trace] audit: N kernels only the full battery loads`, `0` none. `TF_DSV41_WARM_RARE=1` (empty: on under
 trim / audit) also loads two prompt-chunk shapes no warm-up prompt reaches: an indexer key segment of one key and the

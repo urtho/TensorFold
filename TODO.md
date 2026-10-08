@@ -268,34 +268,24 @@ merged-off / on, alternating x2; the quick tier with every switch on gives bbc5e
 - [x] Measured, left off: `TF_DSV41_HC_SPLIT` and `HC_SIDE_PART=0` (no gain), `TF_X3LD_ORDER=expert` (-0.1..-0.5 ms,
       marginal), `TF_DSV41_L2_DISCARD=po` (0) / `po,moe` (R=1 +0.4, R=6 -0.9: mixed), `TF_DSV41_RES_FOLD` (0),
       `TF_DSV41_MQA_FEW` 2 / 6 (worse than 1)
-- [ ] `TF_MULTI_COPY` (copy drafts in concurrent rounds): A/B on the edit / docs jaybench workloads and 16 clients
+- [x] Copy drafts in concurrent rounds (`TF_MULTI_COPY`), on by default (26570cc): jaybench edit 107.5 -> 178.1, docs
+      94.9 -> 115.1, code unchanged, the same reply shas; served soak + stress clean. 16-client run not done
+- [x] Phase 9 workflow (out/perf/phase9.json, branches perf9/*, merged in perf9/integrate): every switch exact on GB10
+      (GPU unit tests 335 pass; quick tier fingerprints equal with ROT_FUSE=1 PDL=1; reply shas equal in every arm).
+      Same-session A/B, alternating x2 (out/perf/ab3-*), windows 1 / 6 rows and jaybench code / prose / structured / c1:
+      base 22.9-23.1 / 39.7-39.8 ms, 82.5-85.3 / 45.4-46.7 / 122.2-122.7 / 101.6-107.3; no arm outside that noise:
+  - `TF_DSV41_ROT_FUSE` (merge writes wo_a's rotated rows, wo_a's epilogue wo_b's; 80 rot_in launches a step fewer):
+    22.9-23.6 / 40.0-40.3 ms. Left off; the q-norm part not built (the design's >= 0.1 ms bar not met)
+  - `TF_DSV41_PDL` (Triton decode kernels as programmatic dependent launches): 22.8-22.9 / 39.8-40.0 ms. Left off
+  - `TF_DSV41_COSTS=depth` (one stream's verify curve at 2K depth): still prices 5 / 6 rows at 43.8 / 46.3 ms against
+    decode-bench 38 / 40 (it times the whole step_multi call); jaybench unchanged. Left off. Over-pricing stays open:
+    time bare replays at depth, or correct online from measured rounds
+  - [x] Serving warm-up trim, default since this round: GB10 audit boot "0 kernels only the full battery loads"; trim
+    16.8 s vs 26.7 (boot 61.5 s vs 92), 15-minute soak (288 requests, 0 errors, 0 sha splits) + stress clean, no
+    late kernel loads. `TF_DSV41_WARM_SERVING=full` keeps the old battery. Not run: a >128K request after a trim
+    boot (warm_rare's shapes), encode (BOUNDED_TAIL) chunks in either battery
 - [ ] `TF_DSV41_SEND=one` (one exchange a message) and `TF_RDMA_TRACE`: measure on the served path
-- [ ] Draft policy: the calibrated verify costs over-price 5-6-row windows by 6-20% (server 43 / 49 ms vs decode-bench
-      38.0 / 40.7 and jaybench rounds 40.7 / 44.7): a realistic-depth cost curve (design.json "draft-policy");
-      built as `TF_DSV41_COSTS=depth` (perf9/draft-policy, default off): A/B jaybench 5 reps a mode with the k
-      histogram, `--jb-serial` sha equal, and `--decoder-test` under it
-- [ ] Still open from the design: wo_a rotation folded into the attention merge, norm + rot_in fusion, dense-lane EXL3
-      38.0 / 40.7 and jaybench rounds 40.7 / 44.7): a realistic-depth cost curve (design.json "draft-policy")
-- [ ] `TF_DSV41_ROT_FUSE` attn,wob (the merge writes wo_a's rotated rows, wo_a's epilogue wo_b's: 80 rot_in launches
-      a step fewer; rot128.cuh, exact by the rot_mode() check, form 0 on the local CUDA 13.1 sm_120 build): GB10 bitwise
-      tests (tests/cuda/test_dsv41_rot_fuse.py), suite fingerprints on/off, then the window A/B (>= 5 reps, R=1 / 6;
-      the design guesses 0.1-0.13 ms). The q-norm part (wq_b / ix.wq_b) only if this gains >= 0.1 ms
-- [ ] Still open from the design: norm + rot_in fusion, dense-lane EXL3
-      decode, Triton PDL, RoCE two rails, the serving warm-up trim (27-54 s a start), first-start PP dip diagnosis
-      38.0 / 40.7 and jaybench rounds 40.7 / 44.7): a realistic-depth cost curve (design.json "draft-policy")
-- [ ] Serving warm-up trim (perf9/warmup-trim, default still the full battery): `TF_DSV41_WARM_SERVING=trim` (3 waves,
-      ~2.8K prompt tokens vs ~19.9K) / `audit` (trim, then full from a clean pool: what only full loads),
-      `TF_DSV41_WARM_RARE` (the one-key indexer segment and packed-FP4 prompt attention past FULL_DEQ_MIB, which no
-      battery reached), `TF_DSV41_WARM_TRACE=1` (first loads by stage and wave, seconds, the set's digest). To do on
-      GB10: a traced full boot (per-wave seconds), an audit boot with 0 misses, then soak + stress + a >128K run with
-      `late_kernel_loads` 0 before trim becomes the default. Neither battery runs encode (BOUNDED_TAIL) chunks: those
-      need a prompt step ending tail_min (~2.7K) before a kept point, i.e. a ~6.3K prompt alone
-- [ ] Still open from the design: wo_a rotation folded into the attention merge, norm + rot_in fusion, dense-lane EXL3
-      decode, Triton PDL, RoCE two rails, first-start PP dip diagnosis
-- [ ] Triton PDL (`TF_DSV41_PDL`, default off): rmsnorm, rope, rope_q / Fp4Rows.store, router logits, route, mHC
-      pre / post as programmatic dependent launches (peer bd0024d `_pdl()`). PTX at 0 equals a5dd0ca's; at 1 bit-equal
-      in captured graphs behind a racing producer (tests/cuda/test_dsv41_pdl.py, RTX 5070 sm_120). Local 40-layer
-      chain: R=1 -2.3%, R=6 0 (+-1%): small, since most predecessors (exl3, torch) never trigger early. GB10 A/B due
+- [ ] Still open from the design: norm + rot_in fusion, dense-lane EXL3 decode, RoCE two rails, first-start PP dip
 - [x] Grammar-constrained streams draft (`TF_DSV41_DRAFT_GRAMMAR`, 6542b0d; on in the deployment): before, every
       response_format / tool-grammar reply verified one row a round, its reasoning included (accepted=0/0). Served:
       the same replies (12 verdicts' tokens and content equal; structured schemas PASS), ~55% of drafts kept, but at 6
