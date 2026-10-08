@@ -16,11 +16,17 @@ THIRD_PARTY_NOTICES.md.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 BS = 1024           # entries a block of the scan
+# MODE 3 scans only the lanes of the row's listed blocks (TF_DSV41_CAND_BOUND=1; 0, the default: all n_keys lanes):
+# the ids are packed first and -1 padded, every lane past them -inf, so the same choice. At 2K context 2048 of the
+# 16384 lanes (the 65536-key graphs keep the candidate path on at every context)
+CAND_BOUND = os.environ.get("TF_DSV41_CAND_BOUND", "0") == "1"
 
 
 @triton.jit
@@ -42,7 +48,7 @@ def _untie(s, i):
 
 @triton.jit
 def _topk(S, POS, FLAGS, OUT, FLAGS_OUT, s_stride, f_stride, o_stride, n_keys, ratio, k, block, nb_out,
-          MODE: tl.constexpr, BS: tl.constexpr):
+          MODE: tl.constexpr, BS: tl.constexpr, BOUND: tl.constexpr = False):
     """MODE 0: entries of S (row r, n_keys of them, visible below (pos + 1) // ratio). MODE 1: the same, kept only
     in blocks FLAGS marks. MODE 2: candidate blocks: S holds block maxima (n_keys blocks of ``block`` entries; the
     newest visible block is pinned), writes FLAGS_OUT [r, block] = 1 for the chosen ones (0 below ``nb_out``).
@@ -55,6 +61,13 @@ def _topk(S, POS, FLAGS, OUT, FLAGS_OUT, s_stride, f_stride, o_stride, n_keys, r
     nvis = (p + 1) // ratio
     if MODE == 3:
         n = n_keys
+        if BOUND:                                   # the listed blocks' lanes: the ids >= 0, packed first
+            listed = tl.zeros((), dtype=tl.int32)
+            for b0 in range(0, (n_keys + block - 1) // block, BS):
+                i = b0 + tl.arange(0, BS)
+                f = tl.load(FLAGS + r * f_stride + i, mask=i < (n_keys + block - 1) // block, other=-1)
+                listed += tl.sum((f >= 0).to(tl.int32), axis=0)
+            n = tl.minimum(n_keys, listed * block)
     elif MODE == 2:
         n = tl.minimum(n_keys, (nvis + block - 1) // block)
         newest = tl.maximum(nvis - 1, 0) // block
@@ -186,5 +199,5 @@ def top_entries_cand(scores: torch.Tensor, pos: torch.Tensor, ratio: int, topk: 
     R, C = scores.shape
     out = torch.empty((R, topk), dtype=torch.int32, device=scores.device)
     _topk[(R,)](scores, pos, ids, out, out, scores.stride(0), ids.stride(0), out.stride(0), C, ratio, topk, block, 0,
-                MODE=3, BS=BS, num_warps=8)
+                MODE=3, BS=BS, BOUND=CAND_BOUND, num_warps=8)
     return out

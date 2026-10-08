@@ -9,6 +9,7 @@ per 16 heads; chunks of keys run as separate programs and a merge adds the sink 
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 import triton
@@ -1224,6 +1225,12 @@ def index_select(iq: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos: t
 
     return top_entries(index_scores(iq, wts, keys, pos, ratio), topk)
 
+# warps of the routing kernel (TF_DSV41_ROUTE_WARPS, default 4): its reductions are a max, a min index and a sum of one
+# non-zero term, the weights' total a running sum in pick order, so any count gives the same bits (1: peer
+# bertholomus/TensorFold bbaa6cd's one-warp route, Apache-2.0)
+ROUTE_WARPS = int(os.environ.get("TF_DSV41_ROUTE_WARPS") or 4)
+
+
 @triton.jit(do_not_specialize=["ns"])
 def _route(L, BIAS, PICK, WTS, scale, ns, E: tl.constexpr, EP: tl.constexpr, K: tl.constexpr, KP: tl.constexpr,
            KS: tl.constexpr = 1, PDL: tl.constexpr = False):
@@ -1267,7 +1274,7 @@ def route(logits: torch.Tensor, bias: torch.Tensor, k: int, scale: float) -> tup
     pick = torch.empty((R, k), dtype=torch.int32, device=logits.device)
     wts = torch.empty((R, k), dtype=torch.float32, device=logits.device)
     _route[(R,)](logits.contiguous(), bias, pick, wts, scale, R * E, E=E, EP=triton.next_power_of_2(E), K=k,
-                 KP=triton.next_power_of_2(k), KS=KS, num_warps=4, **pdl())
+                 KP=triton.next_power_of_2(k), KS=KS, num_warps=ROUTE_WARPS, **pdl())
     return pick, wts
 
 

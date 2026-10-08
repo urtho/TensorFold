@@ -23,3 +23,20 @@ def test_parts_routed_equal_summed(R, E, D):
     pa, wa = K.route(summed, bias, 6, 2.5)
     pb, wb = K.route(K.router_logits(x, w, parts=True), bias, 6, 2.5)
     assert torch.equal(pa, pb) and torch.equal(wa.view(torch.int32), wb.view(torch.int32))
+
+
+@pytest.mark.parametrize("R", [1, 6, 16])
+def test_one_warp_route_equals_four(R, monkeypatch):
+    """TF_DSV41_ROUTE_WARPS=1: the same picks and weights as 4 warps, also with tied score + bias (lowest id wins)."""
+
+    g = torch.Generator(device="cuda").manual_seed(40 + R)
+    E = 384
+    logits = torch.randn((R, E), generator=g, device="cuda")
+    logits[:, 100:110] = logits[:, 100:101]                         # ties
+    bias = torch.randn((E,), generator=g, device="cuda") * 0.1
+    bias[100:110] = 0.0
+    out = {}
+    for nw in (4, 1):
+        monkeypatch.setattr(K, "ROUTE_WARPS", nw)
+        out[nw] = K.route(logits, bias, 6, 2.5)
+    assert torch.equal(out[4][0], out[1][0]) and torch.equal(out[4][1].view(torch.int32), out[1][1].view(torch.int32))

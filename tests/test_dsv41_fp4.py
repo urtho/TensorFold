@@ -658,8 +658,9 @@ def test_kv_mode_defaults_to_fp4():
 
 
 @gpu
+@pytest.mark.parametrize("bound", [False, True])
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_candidate_only_reindex_equals_the_masked_full_width(ratio):
+def test_candidate_only_reindex_equals_the_masked_full_width(ratio, bound, monkeypatch):
     """index_scores_cand + top_entries_cand (the layers after the candidate source score only its blocks) == the
     full-width scores masked to the candidate flags (top_entries with flags): the same scores bit for bit at every
     candidate entry and the same choice, for rows of several streams (key bases), rows short of the pool (every
@@ -668,6 +669,7 @@ def test_candidate_only_reindex_equals_the_masked_full_width(ratio):
     K = _kernels()
     from tensorfold.families.deepseek_v41.cuda import topk as TK
 
+    monkeypatch.setattr(TK, "CAND_BOUND", bound)                  # (TF_DSV41_CAND_BOUND: the listed lanes only)
     n_keys, block, keep, topk = 20000, 8, 2048, 512             # (> the 16,384-entry pool; 3 streams in _ik's table)
     keys = _ik(K, 3 * n_keys, 31)
     g = torch.Generator(device="cuda").manual_seed(5)
@@ -694,3 +696,32 @@ def test_candidate_only_reindex_equals_the_masked_full_width(ratio):
     assert torch.equal(cs[live], full.gather(1, entry.clamp(0, n_keys - 1))[live])
     assert bool(torch.isinf(cs[~live]).all())
     assert torch.equal(TK.top_entries_cand(cs, pos, ratio, topk, ids, block), ref)
+
+
+@gpu
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_candidate_bound_at_block_edges(ratio, monkeypatch):
+    """TF_DSV41_CAND_BOUND: rows whose visible entries end at, before and after block and pool edges (1, 7 .. 16385)
+    choose the same entries with the bound as without."""
+
+    K = _kernels()
+    from tensorfold.families.deepseek_v41.cuda import topk as TK
+
+    n_keys, block, keep, topk = 20000, 8, 2048, 512
+    keys = _ik(K, n_keys, 37)
+    g = torch.Generator(device="cuda").manual_seed(6)
+    vis = torch.tensor([1, 7, 8, 9, 512, 513, 2047, 2048, 16383, 16384, 16385], device="cuda")
+    R = vis.numel()
+    pos = vis * ratio - 1
+    kbase = torch.zeros(R, dtype=torch.long, device="cuda")
+    iq = (torch.randn((R, 64, 128), generator=g, device="cuda") * 0.3).to(torch.bfloat16)
+    wts = torch.randn((R, 64), generator=g, device="cuda")
+    src = K.index_scores(iq, wts, keys, pos, ratio, kbase=kbase, n_keys=n_keys, shared=True)
+    flags = TK.candidate_flags(src, pos, ratio, block, keep)
+    ids = TK.candidate_ids(flags, keep)
+    cs = K.index_scores_cand(iq, wts, keys, pos, ratio, ids, block, kbase, n_keys)
+    got = {}
+    for bound in (False, True):
+        monkeypatch.setattr(TK, "CAND_BOUND", bound)
+        got[bound] = TK.top_entries_cand(cs, pos, ratio, topk, ids, block)
+    assert torch.equal(got[False], got[True])
