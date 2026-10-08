@@ -1,4 +1,5 @@
-"""x3ld (TF_EXPERT_LOADS) routed experts give bit-identical results to upstream's grouped kernel (GPU)."""
+"""x3ld (TF_EXPERT_LOADS) routed experts give bit-identical results to upstream's grouped kernel, under every
+TF_EXPERT_LOADS_CFG and TF_X3LD_ORDER (GPU)."""
 
 import pytest
 
@@ -53,3 +54,122 @@ def test_x3ld_equals_grouped(k2s, I, cfg, monkeypatch):
         assert torch.equal(outs[0], outs[1]), (R, k2s, I, cfg)
         assert taken[-2:] == [True, True]                # both launches of the "on" run went through x3ld
         assert torch.isfinite(outs[0]).all()
+
+
+# TF_X3LD_ORDER / deeper rings: Z bit for bit against today's (grid order, "4,2") at the model's per-rank shapes
+# (gate/up 5120 -> 1152 at 4 K splits: 20 k steps a warp; down 1152 -> 5120 at 1: 18), every Z cell compared --
+# the written ones and the ones left alone (a sentinel), so an order writes exactly the same cells.
+DSV41_E, DSV41_D, DSV41_I, DSV41_SLOTS = 32, 5120, 1152, 6
+SENTINEL = 1234.5
+
+
+def picks(R, E, slots, g):
+    """Distinct experts a row; odd rows from a pool of 8 (experts shared by rows); every third row a dead slot (E)."""
+
+    rows = []
+    for r in range(R):
+        p = torch.randperm(8 if r % 2 else E, generator=g, device="cuda")[:slots].int()
+        if r % 3 == 2:
+            p[-1] = E
+        rows.append(p)
+    return torch.stack(rows)
+
+
+def z_of(ex, R, x0, x1, pick, mats, cfg, order, probe=0):
+    s = ex3.Scratch(ex, R, DSV41_SLOTS)
+    ids, members = s.window(R)
+    ex3._ext().group(pick, ids, s.count, members, R, DSV41_SLOTS, ex.count)
+    z = torch.full_like(s.z, SENTINEL)
+    P = R * DSV41_SLOTS
+    if mats == 2:
+        _, w, sk, _ = s.cfg_gu
+        ok = x3ld.grouped(x0, x1, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, z, 2,
+                          ex.dims, ex.width, P, sk, DSV41_SLOTS, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1], cfg=cfg,
+                          order=order, probe=probe)
+    else:
+        _, w, sk, _ = s.cfg_d
+        ok = x3ld.grouped(x0, x0, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, z, 1,
+                          ex.width, ex.dims, P, sk, DSV41_SLOTS, ex.cb, w, ex.k2_d[0], ex.k2_d[1], cfg=cfg,
+                          order=order, probe=probe)
+    assert ok, (mats, cfg, order)
+    return z
+
+
+@pytest.fixture(scope="module", params=["routed", "wide", "dspark"])
+def dsv41_layer(request):
+    E = DSV41_E
+    widths = {"routed": [4 + 2 * (e % 2) for e in range(E)],          # 2/3-bit: the 4..6 instance at pd >= 3
+              "wide": [4 + 2 * (e % 4) for e in range(E)],            # up to 5 bits: 2..10 (pd 4 spills there)
+              "dspark": [8] * E}[request.param]                       # DSpark's 4-bit experts: 8..8
+    return request.param, layer(E, DSV41_D, DSV41_I, widths, 11 + len(request.param))
+
+
+GU_CFGS = [(4, 2), (4, 4), (8, 2), (8, 1)]
+DN_CFGS = [(4, 2), (4, 3), (8, 3), (8, 2)]
+
+
+@pytest.mark.parametrize("R", [1, 2, 4, 6, 16])
+def test_orders_and_rings_give_todays_z(dsv41_layer, R):
+    kind, ex = dsv41_layer
+    g = torch.Generator(device="cuda").manual_seed(100 + R)
+    pick = picks(R, ex.count, DSV41_SLOTS, g)
+    P = R * DSV41_SLOTS
+    xg = torch.randn((P, DSV41_D), generator=g, device="cuda").half()
+    xu = torch.randn((P, DSV41_D), generator=g, device="cuda").half()
+    xd = torch.randn((P, DSV41_I), generator=g, device="cuda").half()
+    for mats, x0, x1, cfgs in ((2, xg, xu, GU_CFGS), (1, xd, xd, DN_CFGS)):
+        ref = z_of(ex, R, x0, x1, pick, mats, (4, 2), 0)
+        assert (ref != SENTINEL).any() and torch.isfinite(ref).all()
+        for cfg in cfgs:
+            for order in (0, 1):
+                z = z_of(ex, R, x0, x1, pick, mats, cfg, order)
+                assert torch.equal(z, ref), (kind, R, mats, cfg, order)
+
+
+@pytest.mark.parametrize("order", ["grid", "expert"])
+@pytest.mark.parametrize("cfg", ["4,2", "4,4/4,3", "8,2/8,3"])
+def test_routed_with_order_and_cfg_equals_upstream(cfg, order, monkeypatch):
+    """The whole routed() (group, rot_in, both launches, epilogues) under the switches as parsed, against upstream's."""
+
+    monkeypatch.setenv("TF_EXPERT_LOADS_CFG", cfg)
+    monkeypatch.setenv("TF_X3LD_ORDER", order)
+    parsed = x3ld._parse()
+    E = DSV41_E
+    ex = layer(E, DSV41_D, DSV41_I, [4 + 2 * (e % 2) for e in range(E)], 3)
+    g = torch.Generator(device="cuda").manual_seed(9)
+    taken = []
+    real = x3ld.grouped
+    monkeypatch.setattr(x3ld, "grouped", lambda *a, **k: taken.append(real(*a, **k)) or taken[-1])
+    for R in (1, 3, 6, 16):
+        x = torch.randn((R, DSV41_D), generator=g, device="cuda").to(torch.bfloat16)
+        pick = picks(R, E, DSV41_SLOTS, g)
+        wts = torch.rand((R, DSV41_SLOTS), generator=g, device="cuda")
+        outs = []
+        for on in (False, True):
+            for k, v in parsed.items():
+                monkeypatch.setitem(x3ld.CFG, k, v)
+            monkeypatch.setitem(x3ld.CFG, "on", on)
+            s = ex3.Scratch(ex, 16, DSV41_SLOTS)
+            outs.append(ex3.routed(x, pick, wts, ex, s, None, R).clone())
+        assert torch.equal(outs[0], outs[1]), (R, cfg, order)
+        assert taken[-2:] == [True, True]
+
+
+@pytest.mark.parametrize("order", [0, 1])
+@pytest.mark.parametrize("cfg", list(x3ld.PROBE_CFGS))
+def test_probe_instances_launch(cfg, order):
+    """PROBE 3 (timing only: a wrong Z by design) has its instances at the model's shapes."""
+
+    E = DSV41_E
+    ex = layer(E, DSV41_D, DSV41_I, [4 + 2 * (e % 2) for e in range(E)], 5)
+    g = torch.Generator(device="cuda").manual_seed(1)
+    R = 4
+    pick = picks(R, E, DSV41_SLOTS, g)
+    P = R * DSV41_SLOTS
+    xg = torch.randn((P, DSV41_D), generator=g, device="cuda").half()
+    xd = torch.randn((P, DSV41_I), generator=g, device="cuda").half()
+    if x3ld.fits(DSV41_D, DSV41_I, 4, 4, cfg):
+        z_of(ex, R, xg, xg, pick, 2, cfg, order, probe=3)
+    if x3ld.fits(DSV41_I, DSV41_D, 1, 4, cfg):
+        z_of(ex, R, xd, xd, pick, 1, cfg, order, probe=3)
+    torch.cuda.synchronize()

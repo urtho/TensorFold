@@ -65,6 +65,10 @@ services:
       TF_DSV41_WARM_SERVING: ${TF_DSV41_WARM_SERVING:-}
       TF_RDMA_HOST: ${TF_RDMA_HOST:-}
       TF_RDMA_MAX_KB: ${TF_RDMA_MAX_KB:-}
+      # routed experts' load path (the same Z): "nt,pd" or "nt,pd/nt,pd" (gate/up, down; empty: 4,2, e.g. 4,4/4,3)
+      # and the program order, grid | expert (expert-major, dead slots last; empty: grid)
+      TF_EXPERT_LOADS_CFG: ${TF_EXPERT_LOADS_CFG:-}
+      TF_X3LD_ORDER: ${TF_X3LD_ORDER:-}
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       TF_DSV41_PREPARED: /prepared                       # read the prepared folder when current (fastboot)
       # the NVMe tier of kept prompts: off unless set (/kvdisk); budget (128 GiB), smallest state written (2048

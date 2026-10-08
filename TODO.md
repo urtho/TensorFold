@@ -101,6 +101,8 @@ copy none of it into this Apache-2.0 tree.
 - [x] Shared expert folded into the grouped call: implemented, measured slower (35.0 vs 36.0 serial), off (`TF_FOLD_SHARED=1`)
 - [ ] Serial decode >= 40 tok/s (now ~37.8 with x3ld + fast top-k + RoCE, GPU-bound 96 %): EXL3 decode GEMV toward ~240 GB/s (now ~215 large,
       110-180 small, 199 routed), fuse input rotation into the linear kernel, HC pre/post into one, router + route
+  - [ ] x3ld expert-major order (dead slots last) + pd 3/4 rings on a 4..6 width instance: built, off until A/B
+        (`TF_X3LD_ORDER=expert`, `TF_EXPERT_LOADS_CFG=4,4/4,3`; same Z; `TF_X3LD_PROBE=3` times the load path alone)
 - [x] Decode graphs at narrow key widths on one graph memory pool (`TF_DSV41_WIDTHS`, default one 64K width;
       4.05 GiB for 32 graphs -> 0.27 GiB for 128): 16 clients at 16 × 614400 101.2 -> 122.5 tok/s (2026-10-03)
 - [ ] Eager == graph checks per width; more narrow widths once graph driver memory allows (see Open)

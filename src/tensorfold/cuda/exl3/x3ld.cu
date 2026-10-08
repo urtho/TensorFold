@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Jay Leaton. The DeepSeek-V4.1-Flash family of TensorFold (Apache-2.0): see THIRD_PARTY_NOTICES.md.
-// Modified for TensorFold dsv41-cuda: moved from patches/0002 families/deepseek_v41/cuda/ under tensorfold/cuda/exl3 (beside upstream's experts_grouped.cuh), loaded by x3ld.py; code unchanged.
+// Modified for TensorFold dsv41-cuda: moved from patches/0002 families/deepseek_v41/cuda/ under tensorfold/cuda/exl3 (beside upstream's experts_grouped.cuh), loaded by x3ld.py;
+// added the ORDER flag (the expert-major order of bertholomus/TensorFold deepseek-v41-tp2 grouped_cp_kernel,
+// Apache-2.0, Copyright 2026 BertholomusAI; re-implemented), the (4,3)/(4,4)/(8,3) and PROBE (4,*) instances and the
+// 4..6 width range.
 // DeepSeek-V4.1-Flash routed experts (TF_DSV41_EXPERT_LOADS=1): TensorFold 0.6.0's grouped EXL3 expert GEMV
 // (tensorfold/cuda/exl3/experts_grouped.cuh: any codebook, a width per expert, mul1 for this checkpoint) with the
 // load path of our GLM patch 0580 (docs/DECODE-KERNELS-2.md in the GLM repo; adopted in W19: in situ routed decode
@@ -26,7 +29,10 @@
 //     words, contiguous in the [K/16, N/16, 16 K2] trellis; lane l loads words 4 l + 128 v .. + 3 (v < NV), stores
 //     them to a warp staging area (its own slice of `red`, unused until the reduction) and reads word lane + 32 l of
 //     each tile back -- upstream's load_words layout, conflict-free;
-//   - PDL (optional launch attribute): the prologue runs before griddepcontrol.wait, X and Z after it.
+//   - PDL (optional launch attribute): the prologue runs before griddepcontrol.wait, X and Z after it;
+//   - ORDER 1 (TF_X3LD_ORDER=expert): the same grid read expert-major -- program lin = x + X (y + Y z) is
+//     (u = lin / (Y Z), n block = lin % Y, z = lin % (Y Z) / Y), so one expert's programs are adjacent and the dead
+//     slots (u >= ucount) are the grid's tail instead of interleaved with live ones. ORDER 0 is blockIdx as is.
 //
 // PROBE 3 (timing only, wrong results): no decode and no mma -- the load path alone (the 0580 gate, W19: 226-231 GB/s).
 
@@ -94,6 +100,10 @@ __device__ __forceinline__ void ld_tiles(const uint32_t* __restrict__ T, int NTI
 #pragma unroll
     for (int d = 0; d < PD; ++d) issue_w(d, d);                 // PD <= nkt (host)
 
+    // Invariant: no X read and no Z store moves above this line. Under PDL (x3ld.py launches without it today) the
+    // kernels before -- rot_in writing X, gateup_epilogue reading the Z this launch rewrites (and any L2 discard of
+    // it) -- may run until it returns. Above it: the trellis words (weights) and, in ld_kernel's prologue, ucount /
+    // uids / members / TP / K2 (group's, a launch further back).
     pdl_wait();                                                  // X (and Z) belong to the kernels before
     __syncthreads();                                             // rows_sh
     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
@@ -154,21 +164,37 @@ __device__ __forceinline__ void ld_tiles(const uint32_t* __restrict__ T, int NTI
 }
 
 // Program (u, n block, (mat * SK + split) * MT + member tile): grouped_kernel<CB, NT, 4, *, LO, HI>'s work item.
-template <int CB, int NT, int PD, int LO, int HI, int PROBE>
+// The program's (u, n block, z) coordinate D: ORDER 0 blockIdx as is (u fastest), 1 expert-major (see the header).
+// Unsigned and read where used, as blockIdx was (ORDER 0 compiles to the code before the flag).
+template <int ORDER, int D>
+__device__ __forceinline__ unsigned program() {
+    if constexpr (ORDER == 0) {
+        return D == 0 ? blockIdx.x : D == 1 ? blockIdx.y : blockIdx.z;
+    } else {
+        const unsigned Y = gridDim.y, YZ = gridDim.y * gridDim.z;
+        const unsigned lin = blockIdx.x + gridDim.x * (blockIdx.y + Y * blockIdx.z);
+        return D == 0 ? lin / YZ : D == 1 ? lin % YZ % Y : lin % YZ / Y;
+    }
+}
+
+// The work item of a (u, n block, z) is the same under either ORDER.
+template <int CB, int NT, int PD, int LO, int HI, int PROBE, int ORDER>
 __global__ void __launch_bounds__(W * 32, NT == 8 ? 3 : 4) ld_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
     static_assert(PD >= 1 && PD <= 4, "PD 1-4");
-    const int u = blockIdx.x;
+    static_assert(ORDER == 0 || ORDER == 1, "ORDER 0 (grid) or 1 (expert-major)");
+    const int u = program<ORDER, 0>();
     const int MT = (maxm + 15) / 16;
-    const int mtile = blockIdx.z % MT;
-    const int split = (blockIdx.z / MT) % SK;
-    const int mat = blockIdx.z / MT / SK;
+    const int mtile = program<ORDER, 2>() % MT;
+    const int split = (program<ORDER, 2>() / MT) % SK;
+    const int mat = program<ORDER, 2>() / MT / SK;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
 
-    // round trip 1: none of these depends on another (uids / members are sized by the grid: always in bounds)
+    // round trip 1: none of these depends on another (uids / members are sized by the grid: always in bounds); kept
+    // one trip under ORDER 1 too (a ucount-first exit would put a second dependent trip on every live program)
     const int cnt = __ldcg(ucount);
     const int e = __ldcg(uids + u);
     const int m = mtile * 16 + threadIdx.x;
@@ -187,7 +213,7 @@ __global__ void __launch_bounds__(W * 32, NT == 8 ? 3 : 4) ld_kernel(
     const int KT = K >> 4, NTILES = N >> 4;
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = program<ORDER, 1>() * NT;
     uint32_t* stage = reinterpret_cast<uint32_t*>(&red[warp][0][0]);
 
     float acc[NT][2][4];
@@ -246,7 +272,7 @@ __global__ void __launch_bounds__(W * 32, NT == 8 ? 3 : 4) ld_kernel(
         float s = red[0][row][col];
 #pragma unroll
         for (int w = 1; w < W; ++w) s += red[w][row][col];
-        Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
+        Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;   // after pdl_wait (ld_tiles)
     }
 }
 
@@ -264,7 +290,7 @@ struct Args {
     int K, N, P, SK, maxm, slots, nexp_max, mats;
 };
 
-template <int CB, int NT, int PD, int LO, int HI, int PROBE>
+template <int CB, int NT, int PD, int LO, int HI, int PROBE, int ORDER>
 void launch(const Args& a, cudaStream_t stream, bool pdl) {
     const int MT = (a.maxm + 15) / 16;
     cudaLaunchConfig_t cfg = {};
@@ -277,19 +303,38 @@ void launch(const Args& a, cudaStream_t stream, bool pdl) {
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = pdl ? 1 : 0;
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, ld_kernel<CB, NT, PD, LO, HI, PROBE>, a.x0, a.x1, a.tp0, a.tp1, a.k2_0,
-                                      a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm,
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, ld_kernel<CB, NT, PD, LO, HI, PROBE, ORDER>, a.x0, a.x1, a.tp0, a.tp1,
+                                      a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm,
                                       a.slots));
 }
 
-// The instances: mul1 (this checkpoint's codebook); widths 8..8 (DSpark's 4-bit experts) and 2..10 (routed 2/3-bit
-// + the shared expert at 4/5 bits), as upstream's TF_RANGES picks them; (nt, pd) as 0580's settings.
-template <int NT, int PD, int PROBE>
+// The instances: mul1 (this checkpoint's codebook); widths 8..8 (DSpark's 4-bit experts), 4..6 (routed 2/3-bit
+// alone, for pd >= 3: the K2 10 path no longer sets the registers of a deeper ring) and 2..10 (routed + the shared
+// expert at 4/5 bits), as x3ld.py's k2_range picks them (the first that holds); (nt, pd) as 0580's plus deeper rings.
+template <int NT, int PD, int PROBE, int ORDER>
 bool dispatch_ranges(const Args& a, cudaStream_t stream, bool pdl, int lo, int hi) {
-    if (lo == 8 && hi == 8) launch<2, NT, PD, 8, 8, PROBE>(a, stream, pdl);
-    else if (lo >= 2 && hi <= 10) launch<2, NT, PD, 2, 10, PROBE>(a, stream, pdl);
+    if constexpr (PD >= 3) {
+        if (lo == 4 && hi == 6) {
+            launch<2, NT, PD, 4, 6, PROBE, ORDER>(a, stream, pdl);
+            return true;
+        }
+    }
+    if (lo == 8 && hi == 8) launch<2, NT, PD, 8, 8, PROBE, ORDER>(a, stream, pdl);
+    else if (lo >= 2 && hi <= 10) launch<2, NT, PD, 2, 10, PROBE, ORDER>(a, stream, pdl);
     else return false;
     return true;
+}
+
+template <int PROBE, int ORDER>
+bool dispatch_cfg(const Args& a, cudaStream_t stream, bool pdl, int nt, int pd, int lo, int hi) {
+    if (nt == 8 && pd == 1) return dispatch_ranges<8, 1, PROBE, ORDER>(a, stream, pdl, lo, hi);
+    if (nt == 8 && pd == 2) return dispatch_ranges<8, 2, PROBE, ORDER>(a, stream, pdl, lo, hi);
+    if constexpr (PROBE == 0)                                    // (8, 3): no probe instance
+        if (nt == 8 && pd == 3) return dispatch_ranges<8, 3, PROBE, ORDER>(a, stream, pdl, lo, hi);
+    if (nt == 4 && pd == 2) return dispatch_ranges<4, 2, PROBE, ORDER>(a, stream, pdl, lo, hi);
+    if (nt == 4 && pd == 3) return dispatch_ranges<4, 3, PROBE, ORDER>(a, stream, pdl, lo, hi);
+    if (nt == 4 && pd == 4) return dispatch_ranges<4, 4, PROBE, ORDER>(a, stream, pdl, lo, hi);
+    return false;
 }
 
 }  // namespace dsv41_x3ld
@@ -298,7 +343,7 @@ void dsv41_x3ld_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const a
                              const at::Tensor& TP1, const at::Tensor& B0, const at::Tensor& B1,
                              const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, at::Tensor& Z,
                              int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t slots, int64_t cb,
-                             int64_t nt, int64_t pd, int64_t probe, int64_t lo, int64_t hi, bool pdl) {
+                             int64_t nt, int64_t pd, int64_t probe, int64_t lo, int64_t hi, bool pdl, int64_t order) {
     using namespace dsv41_x3ld;
     TORCH_CHECK(cb == 2, "x3ld: built for the mul1 codebook (cb 2) only");
     TORCH_CHECK(K % (16 * SK * W) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
@@ -320,15 +365,14 @@ void dsv41_x3ld_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const a
     a.nexp_max = (int)uids.size(0);
     a.mats = (int)mats;
     auto stream = at::cuda::getCurrentCUDAStream();
+    TORCH_CHECK((int64_t)a.nexp_max * (N / (16 * nt)) * mats * SK * ((a.maxm + 15) / 16) < (1ll << 32),
+                "x3ld: the grid's linear index must fit 32 bits");
+    const int n = (int)nt, d = (int)pd, l = (int)lo, h = (int)hi;
     bool ok = false;
-    if (probe == 0) {
-        if (nt == 8 && pd == 1) ok = dispatch_ranges<8, 1, 0>(a, stream, pdl, (int)lo, (int)hi);
-        else if (nt == 8 && pd == 2) ok = dispatch_ranges<8, 2, 0>(a, stream, pdl, (int)lo, (int)hi);
-        else if (nt == 4 && pd == 2) ok = dispatch_ranges<4, 2, 0>(a, stream, pdl, (int)lo, (int)hi);
-    } else if (probe == 3) {
-        if (nt == 8 && pd == 1) ok = dispatch_ranges<8, 1, 3>(a, stream, pdl, (int)lo, (int)hi);
-        else if (nt == 8 && pd == 2) ok = dispatch_ranges<8, 2, 3>(a, stream, pdl, (int)lo, (int)hi);
-    }
-    TORCH_CHECK(ok, "x3ld: unsupported (nt, pd, probe, lo, hi) = (", nt, ", ", pd, ", ", probe, ", ", lo, ", ", hi,
-                ")");
+    if (probe == 0 && order == 0) ok = dispatch_cfg<0, 0>(a, stream, pdl, n, d, l, h);
+    else if (probe == 0 && order == 1) ok = dispatch_cfg<0, 1>(a, stream, pdl, n, d, l, h);
+    else if (probe == 3 && order == 0) ok = dispatch_cfg<3, 0>(a, stream, pdl, n, d, l, h);
+    else if (probe == 3 && order == 1) ok = dispatch_cfg<3, 1>(a, stream, pdl, n, d, l, h);
+    TORCH_CHECK(ok, "x3ld: unsupported (nt, pd, probe, lo, hi, order) = (", nt, ", ", pd, ", ", probe, ", ", lo, ", ",
+                hi, ", ", order, ")");
 }
