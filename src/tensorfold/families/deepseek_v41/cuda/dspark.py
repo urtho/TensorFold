@@ -16,6 +16,7 @@ from __future__ import annotations
 import torch
 
 from tensorfold.cuda.exl3 import experts as ex3
+from tensorfold.cuda.exl3 import linear as lx3
 
 from . import hc as hcf
 from . import kernels as K
@@ -23,6 +24,9 @@ from .weights import LayerW
 
 BF, F32 = torch.bfloat16, torch.float32
 VARIANT = set(filter(None, __import__("os").environ.get("DSPARK_VARIANT", "").split(",")))
+# (exact, empty: off) TF_DSV41_DRAFT_GROUP=1: the draft blocks' wo_a slices as one grouped launch (rot_in route only:
+# TF_EXL3_ROT_FUSE keeps the slices) and wq_a beside wkv on the engine's Par streams
+GROUP = __import__("os").environ.get("TF_DSV41_DRAFT_GROUP") == "1"
 
 
 class DSpark:
@@ -123,14 +127,34 @@ class DSpark:
             out.append(prev)
         return torch.cat(out)
 
+    def _qkv(self, a, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(q_norm(wq_a(x)), kv_norm(wkv(x))); GROUP: the two on Par streams (separate counters and scratch)."""
+
+        eps = self.c.rms_norm_eps
+        q = lambda: K.rmsnorm(a.wq_a(x), a.q_norm, eps)
+        kv = lambda: K.rmsnorm(a.wkv(x), a.kv_norm, eps)
+        if GROUP:
+            return tuple(self.eng.par(q, kv))
+        return q(), kv()
+
+    @staticmethod
+    def _wo_a(a, o: torch.Tensor, R: int, H: int, Dh: int) -> torch.Tensor:
+        """wo_a of the merged heads o [R, H, Dh] -> [R, groups * n]; GROUP: one launch (the same K order and splits,
+        rot_in per 128-block with the concatenated suh: the slices' bits)."""
+
+        if GROUP and a.wo_a_grouped is not None and not lx3.ROT_FUSE:
+            return a.wo_a_grouped(o.reshape(R, -1))
+        groups = len(a.wo_a)
+        o = o.view(R, groups, (H // groups) * Dh)
+        return torch.cat([wo(o[:, g].contiguous()) for g, wo in enumerate(a.wo_a)], dim=1)
+
     def attention(self, j: int, block: LayerW, x: torch.Tensor, pos: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
         """Window-only attention: query i sees context keys P + i - 127 .. P - 1 and every block row."""
 
         c, eng, a = self.c, self.eng, block.attn
         R, Dh, W = x.shape[0], c.head_dim, c.sliding_window
         cos, sin = eng.tables_rope[0]
-        qr = K.rmsnorm(a.wq_a(x), a.q_norm, c.rms_norm_eps)
-        kv = K.rmsnorm(a.wkv(x), a.kv_norm, c.rms_norm_eps)
+        qr, kv = self._qkv(a, x)
         H = a.wq_b.n // Dh
         q = K.rope(a.wq_b(qr).view(R, H, Dh), pos, cos, sin).float()
         base = self.g_base                                                  # the drafting stream's ring
@@ -147,10 +171,7 @@ class DSpark:
         full = torch.cat([s, a.sink.view(1, H, 1).expand(R, H, 1)], dim=-1)
         o = torch.einsum("ths,sd->thd", torch.softmax(full, dim=-1)[..., :-1], keys)
         o = K.rope(o, pos, cos, sin, inverse=True, out_dtype=BF)
-        groups = len(a.wo_a)
-        o = o.view(R, groups, (H // groups) * Dh)
-        z = torch.cat([wo(o[:, g].contiguous()) for g, wo in enumerate(a.wo_a)], dim=1)
-        return eng.comm.partials(a.wo_b(z, out_dtype=F32))
+        return eng.comm.partials(a.wo_b(self._wo_a(a, o, R, H, Dh), out_dtype=F32))
 
     # -- graph --------------------------------------------------------------------------------------------------
     def capture(self) -> None:
@@ -223,8 +244,7 @@ class DSpark:
         c, eng, a = self.c, self.eng, block.attn
         R, Dh, W, N = x.shape[0], c.head_dim, c.sliding_window, self.N
         cos, sin = eng.tables_rope[0]
-        qr = K.rmsnorm(a.wq_a(x), a.q_norm, c.rms_norm_eps)
-        kv = K.rmsnorm(a.wkv(x), a.kv_norm, c.rms_norm_eps)
+        qr, kv = self._qkv(a, x)
         H = a.wq_b.n // Dh
         q = K.rope(a.wq_b(qr).view(R, H, Dh), pos, cos, sin).float().view(M, N, H, Dh)
         self.swa_big[j].index_copy_(0, rbase + pos % self.ring, K.rope_q(kv, pos, cos, sin, self.swa_q))
@@ -237,10 +257,7 @@ class DSpark:
         full = torch.cat([sc, a.sink.view(1, 1, H, 1).expand(M, N, H, 1)], dim=-1)
         o = torch.einsum("mths,msd->mthd", torch.softmax(full, dim=-1)[..., :-1], keys).reshape(R, H, Dh)
         o = K.rope(o, pos, cos, sin, inverse=True, out_dtype=BF)
-        groups = len(a.wo_a)
-        o = o.view(R, groups, (H // groups) * Dh)
-        z = torch.cat([wo(o[:, g].contiguous()) for g, wo in enumerate(a.wo_a)], dim=1)
-        return eng.comm.partials(a.wo_b(z, out_dtype=F32))
+        return eng.comm.partials(a.wo_b(self._wo_a(a, o, R, H, Dh), out_dtype=F32))
 
     def capture_multi(self, streams: int) -> None:
         """Draft graphs for 1..``streams`` streams at once (each stream's N block rows: M * N <= the decode rows)."""
