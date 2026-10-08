@@ -35,10 +35,17 @@ def reload(monkeypatch):
 
 
 @pytest.mark.parametrize("value,po,moe", [("", False, False), ("po", True, False), ("moe", False, True),
-                                          ("po,moe", True, True), ("all", True, True), ("lin", False, False)])
+                                          ("po,moe", True, True), ("all", True, True), ("lin", False, False),
+                                          ("po, moe", True, True), (" moe ,", False, True)])
 def test_switch_tokens(reload, value, po, moe):
     assert reload(mqa_fp4, TF_DSV41_L2_DISCARD=value).DISCARD is po
     assert reload(ex3, TF_DSV41_L2_DISCARD=value).DISCARD is moe
+
+
+@pytest.mark.parametrize("mod", ["mqa_fp4", "ex3"])
+def test_switch_rejects_unknown(reload, mod):
+    with pytest.raises(ValueError, match="moee"):
+        reload(mqa_fp4 if mod == "mqa_fp4" else ex3, TF_DSV41_L2_DISCARD="po,moee")
 
 
 def test_defaults_off(monkeypatch, reload):

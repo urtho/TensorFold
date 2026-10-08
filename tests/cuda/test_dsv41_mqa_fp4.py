@@ -260,7 +260,7 @@ def test_l2_discard_is_bit_identical(cuda_mqa, monkeypatch, R, n_idx):
         for _ in range(3):
             graph.replay()
             seq.append(out.clone())
-        buf.po = buf.po[1:]                                # 4 bytes off a line: the merge must not discard
+        buf.po = buf.po[4:]                                # 16 bytes off a line (float4-aligned): no discard
         seq.append(K.mqa(q, rows, idx, swa, pos, sink, W, buf, D ** -0.5, cos, sin, **kw).clone())
         outs[on] = seq
     for a, b in zip(outs[False], outs[True]):

@@ -25,7 +25,11 @@ GLM_DOWN = (8, 4, 1, 1)
 # TF_DSV41_L2_DISCARD with "moe" (or "all"; a comma list, default none): routed() with wts drops its dead scratch from L2
 # without the write-back: gate/up Z past the down Z, xg / xu (gateup_epilogue), the down Z and xd (down_combine), and
 # stores no y. No value changes. y stays stored under TF_SKIP_SHARED=1 (timing: its skipped slots read y rows).
-DISCARD = bool(set(os.environ.get("TF_DSV41_L2_DISCARD", "").split(",")) & {"moe", "all"})
+# Exact only while no weighted pick is >= E (down_combine reads y rows for those): route() never makes one.
+_L2 = {t.strip() for t in os.environ.get("TF_DSV41_L2_DISCARD", "").split(",")} - {""}
+if _L2 - {"po", "moe", "all", "lin"}:                         # (the same check as deepseek_v41/cuda/mqa_fp4.py)
+    raise ValueError(f"TF_DSV41_L2_DISCARD: unknown {sorted(_L2 - {'po', 'moe', 'all', 'lin'})}")
+DISCARD = bool(_L2 & {"moe", "all"})
 SKIP_SHARED = os.environ.get("TF_SKIP_SHARED") == "1"
 
 
