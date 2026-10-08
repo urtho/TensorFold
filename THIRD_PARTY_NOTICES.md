@@ -315,6 +315,10 @@ deepseek-v41-tp2:
   one system fence a block and the own slice copied early (bd0024d); dead decode scratch (split partials, expert Z)
   dropped from L2 with discard.global.L2 once read (its TF_EXL3_L2_DISCARD, bd0024d; here TF_DSV41_L2_DISCARD). The counts without bincount's host read follow
   jayleaton/deepseek-v41-tensorfold-spark PR #17 (Apache-2.0).
+- `src/tensorfold/families/deepseek_v41/cuda/kernels.py` `pdl()` and the `PDL` constexpr of its and `hc.py`'s small
+  decode kernels (`TF_DSV41_PDL`): the programmatic dependent launch pattern of its `kernels.py` `_pdl()` (bd0024d,
+  TF_DS_TRITON_PDL: griddepcontrol.wait, then launch_dependents, launched with Triton's launch_pdl); changed: off by
+  default, weights (only) loaded before the wait, on this engine's own kernels.
 
 ## Ideas from AGPL-licensed recipes (no code included)
 

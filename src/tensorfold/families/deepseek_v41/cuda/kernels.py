@@ -13,6 +13,7 @@ import functools
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 HEAD_TILE = 16              # heads a chunk program (decode and verify rows; prompt chunks use FULL_HT)
 KEY_TILE = 64
@@ -24,16 +25,35 @@ CHUNK = int(__import__("os").environ.get("TF_MQA_CHUNK") or 128)   # keys a chun
 # kernels) instead of _mqa_chunks + _mqa_merge; set by serial (fp4 KV, TF_DSV41_CUDA_MQA). fp8 / bf16 caches never
 # take it.
 CUDA_MQA = False
+# TF_DSV41_PDL=1: the small decode kernels (rmsnorm, rope, rope_q, route, router logits; hc's pre / post) as
+# programmatic dependent launches (griddepcontrol, sm_90+). Each loads only weights (never written while serving)
+# before griddepcontrol.wait, every activation load and every store after it, and lets the next kernel launch only
+# after its wait: so when one starts, at most the kernel just before it still runs, and the wait covers all its graph
+# predecessors (a cross-stream join's edges too). Scheduling only: the same instructions on the same values. Never on
+# spinning kernels (_await_rows, l2pace, _l2_*). After bertholomus/TensorFold bd0024d (_pdl, TF_DS_TRITON_PDL; Apache
+# License 2.0, Copyright 2026 BertholomusAI)
+PDL = __import__("os").environ.get("TF_DSV41_PDL", "0") == "1"
+
+
+def pdl() -> dict:
+    """Launch options of a PDL-ready kernel: its PDL constexpr and Triton's launch_pdl (both off: the old launch)."""
+
+    return {"PDL": True, "launch_pdl": True} if PDL else {}
 
 
 @triton.jit
-def _rmsnorm(X, W, OUT, x_stride, eps, N: tl.constexpr, BLOCK: tl.constexpr):
+def _rmsnorm(X, W, OUT, x_stride, eps, N: tl.constexpr, BLOCK: tl.constexpr, PDL: tl.constexpr = False):
     r = tl.program_id(0)
     o = tl.arange(0, BLOCK)
     ok = o < N
+    if PDL:                                 # the weight before the wait (as loaded below)
+        w = tl.load(W + o, mask=ok, other=0.0).to(tl.float32)
+        gdc_wait()
+        gdc_launch_dependents()
     x = tl.load(X + r * x_stride + o, mask=ok, other=0.0).to(tl.float32)
     rinv = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / N + eps)
-    w = tl.load(W + o, mask=ok, other=0.0).to(tl.float32)
+    if not PDL:
+        w = tl.load(W + o, mask=ok, other=0.0).to(tl.float32)
     tl.store(OUT + r * N + o, (x * rinv * w).to(tl.bfloat16), mask=ok)
 
 
@@ -42,14 +62,18 @@ def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
 
     R, N = x.shape
     out = torch.empty((R, N), dtype=torch.bfloat16, device=x.device)
-    _rmsnorm[(R,)](x, w, out, x.stride(0), eps, N=N, BLOCK=triton.next_power_of_2(N), num_warps=4)
+    _rmsnorm[(R,)](x, w, out, x.stride(0), eps, N=N, BLOCK=triton.next_power_of_2(N), num_warps=4, **pdl())
     return out
 
 
 @triton.jit
-def _rope(X, POS, COS, SIN, OUT, heads, D: tl.constexpr, HALF: tl.constexpr, SIGN: tl.constexpr):
+def _rope(X, POS, COS, SIN, OUT, heads, D: tl.constexpr, HALF: tl.constexpr, SIGN: tl.constexpr,
+          PDL: tl.constexpr = False):
     """GPT-J rotation of the last 2*HALF dims of each [D] head vector at the row's position; others copied."""
 
+    if PDL:                                 # (the tables are read at POS: after the wait)
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     h = tl.program_id(1)
     base = (r * heads + h) * D
@@ -74,7 +98,7 @@ def rope(x: torch.Tensor, pos: torch.Tensor, cos: torch.Tensor, sin: torch.Tenso
     x3 = x.reshape(shape[0], -1, shape[-1]).contiguous()
     out = torch.empty(x3.shape, dtype=out_dtype or x.dtype, device=x.device)
     _rope[(x3.shape[0], x3.shape[1])](x3, pos, cos, sin, out, x3.shape[1], D=shape[-1], HALF=cos.shape[1],
-                                      SIGN=-1.0 if inverse else 1.0, num_warps=4)
+                                      SIGN=-1.0 if inverse else 1.0, num_warps=4, **pdl())
     return out.reshape(shape)
 
 
@@ -253,12 +277,15 @@ def _pow2_ceil(t):
 
 @triton.jit
 def _rope_q(X, POS, COS, SIN, OUT, OS, SLOT, heads, D: tl.constexpr, HALF: tl.constexpr, G: tl.constexpr,
-            MODE: tl.constexpr):
+            MODE: tl.constexpr, PDL: tl.constexpr = False):
     """_rope of each [D] head vector (its last 2 * HALF dims), rounded to bf16 as the reference's apply_rotary_emb
     writes it, then DeepSeek's quantizer over groups of G values. MODE 0: NVFP4 (e4m3 scale = amax / 6 rounded), 1:
     MXFP4 (2^k scale), both packed into row SLOT[r] of OUT (nibbles) / OS (scale bytes); 2: MXFP4, 3: FP8 e4m3 (2^k
     scale per G), both written back to OUT as bf16 (fake quant: every value times its scale is exact in bf16)."""
 
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     h = tl.program_id(1)
     base = (r * heads + h) * D
@@ -319,7 +346,7 @@ def rope_q(x: torch.Tensor, pos: torch.Tensor, cos: torch.Tensor, sin: torch.Ten
     x3 = x.reshape(shape[0], -1, shape[-1]).contiguous()
     out = torch.empty(x3.shape, dtype=torch.bfloat16, device=x.device)
     _rope_q[(x3.shape[0], x3.shape[1])](x3, pos, cos, sin, out, out, pos, x3.shape[1], D=shape[-1], HALF=cos.shape[1],
-                                        G=32, MODE=3 if fmt == "fp8" else 2, num_warps=4)
+                                        G=32, MODE=3 if fmt == "fp8" else 2, num_warps=4, **pdl())
     return out.reshape(shape)
 
 
@@ -347,7 +374,8 @@ class Fp4Rows(QRows):
         """Rows ``slot`` <- ``x`` [R, dim] RoPE'd at ``pos`` and quantized, in one launch (no host sync)."""
 
         _rope_q[(x.shape[0], 1)](x.contiguous(), pos, cos, sin, self.q, self.s, slot, 1, D=self.dim,
-                                 HALF=cos.shape[1], G=self.group, MODE=0 if self.scale == "e4m3" else 1, num_warps=4)
+                                 HALF=cos.shape[1], G=self.group, MODE=0 if self.scale == "e4m3" else 1, num_warps=4,
+                                 **pdl())
 
     def dequant_rows(self, out: torch.Tensor, off: int, n: int) -> torch.Tensor:
         """Rows off .. off + n - 1 as bf16 into ``out`` [>= n, dim] (the kernels' decode); returns out[:n]."""
@@ -1198,19 +1226,25 @@ def index_select(iq: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos: t
 
 @triton.jit(do_not_specialize=["ns"])
 def _route(L, BIAS, PICK, WTS, scale, ns, E: tl.constexpr, EP: tl.constexpr, K: tl.constexpr, KP: tl.constexpr,
-           KS: tl.constexpr = 1):
+           KS: tl.constexpr = 1, PDL: tl.constexpr = False):
     """sqrt(softplus) scores; the K best of score + bias (lowest id on ties); weights = scores renormalized x scale.
     KS > 1: L holds the router's K slices [KS, R, E] (``ns`` = R * E apart), added here in _sum_slices' order."""
 
     r = tl.program_id(0)
     e = tl.arange(0, EP)
     ok = e < E
+    if PDL:                                 # the bias before the wait (as loaded below)
+        bias = tl.load(BIAS + e, mask=ok, other=0.0)
+        gdc_wait()
+        gdc_launch_dependents()
     x = tl.load(L + r * E + e, mask=ok, other=0.0)
     for s in tl.static_range(1, KS):
         x += tl.load(L + s * ns + r * E + e, mask=ok, other=0.0)
     sp = tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(tl.minimum(x, 20.0))))
     sc = tl.sqrt(sp)
-    choice = tl.where(ok, sc + tl.load(BIAS + e, mask=ok, other=0.0), float("-inf"))
+    if not PDL:
+        bias = tl.load(BIAS + e, mask=ok, other=0.0)
+    choice = tl.where(ok, sc + bias, float("-inf"))
     total = 0.0
     for k in tl.static_range(K):
         best = tl.max(choice, axis=0)
@@ -1233,16 +1267,19 @@ def route(logits: torch.Tensor, bias: torch.Tensor, k: int, scale: float) -> tup
     pick = torch.empty((R, k), dtype=torch.int32, device=logits.device)
     wts = torch.empty((R, k), dtype=torch.float32, device=logits.device)
     _route[(R,)](logits.contiguous(), bias, pick, wts, scale, R * E, E=E, EP=triton.next_power_of_2(E), K=k,
-                 KP=triton.next_power_of_2(k), KS=KS, num_warps=4)
+                 KP=triton.next_power_of_2(k), KS=KS, num_warps=4, **pdl())
     return pick, wts
 
 
 @triton.jit
 def _router_logits(X, W, OUT, R, E: tl.constexpr, D: tl.constexpr, BR: tl.constexpr, BE: tl.constexpr,
-                   BK: tl.constexpr, KS: tl.constexpr):
+                   BK: tl.constexpr, KS: tl.constexpr, PDL: tl.constexpr = False):
     """OUT [KS, R, E] fp32: slice ks of X [R, D] fp16 @ W [E, D]^T fp16 over D / KS inputs; a row's K order within
     a slice is fixed and MMA rows are independent."""
 
+    if PDL:                                 # (the weights stream with the rows in the K loop: after the wait)
+        gdc_wait()
+        gdc_launch_dependents()
     rb = tl.program_id(0)
     eb = tl.program_id(1)
     ks = tl.program_id(2)
@@ -1258,9 +1295,12 @@ def _router_logits(X, W, OUT, R, E: tl.constexpr, D: tl.constexpr, BR: tl.conste
 
 
 @triton.jit
-def _sum_slices(P, OUT, n, KS: tl.constexpr, B: tl.constexpr):
+def _sum_slices(P, OUT, n, KS: tl.constexpr, B: tl.constexpr, PDL: tl.constexpr = False):
     """OUT [n] = P [KS, n] summed over the slices in order (fixed per element)."""
 
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     i = tl.program_id(0) * B + tl.arange(0, B)
     m = i < n
     acc = tl.load(P + i, mask=m, other=0.0)
@@ -1284,13 +1324,13 @@ def router_logits(x: torch.Tensor, w: torch.Tensor, parts: bool = False) -> torc
     KS = ROUTER_SLICES if D % (ROUTER_SLICES * BK) == 0 else 1
     part = torch.empty((KS, R, E), dtype=torch.float32, device=x.device)
     _router_logits[(triton.cdiv(R, BR), triton.cdiv(E, BE), KS)](x.contiguous(), w, part, R, E=E, D=D, BR=BR,
-                                                                 BE=BE, BK=BK, KS=KS, num_warps=4)
+                                                                 BE=BE, BK=BK, KS=KS, num_warps=4, **pdl())
     if KS == 1:
         return part[0]
     if parts:
         return part
     out = torch.empty((R, E), dtype=torch.float32, device=x.device)
-    _sum_slices[(triton.cdiv(R * E, 1024),)](part, out, R * E, KS=KS, B=1024, num_warps=4)
+    _sum_slices[(triton.cdiv(R * E, 1024),)](part, out, R * E, KS=KS, B=1024, num_warps=4, **pdl())
     return out
 
 
