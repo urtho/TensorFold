@@ -63,8 +63,10 @@ def effort_levels(template: str | None) -> frozenset[str]:
 def coerce_effort(effort: str | None, levels: frozenset[str] = frozenset()) -> str | None:
     """The nearest level the template names, ties going higher. None stays None, and xhigh stays xhigh."""
 
-    if effort is None:
-        return None
+    if effort is None or not isinstance(effort, str):        # (an int effort goes to the template as it is)
+        return effort
+    if effort == "xhigh" and "max" in levels and "xhigh" not in levels:
+        return "max"                                           # DeepSeek-V4.1 names low / high / max, no xhigh
     if not levels:
         if effort in ("high", "max"):
             return "xhigh"
@@ -82,7 +84,14 @@ def heard_effort(explicit: str | None, default: str | None, levels: frozenset[st
     return coerce_effort(default if explicit is None else explicit, levels)
 
 
-def thinking_fields(body: dict[str, Any], levels: frozenset[str] = frozenset()) -> dict[str, Any]:
+def numeric_effort(template: str | None) -> bool:
+    """Whether a chat template takes an integer reasoning effort (DeepSeek-V4.1: "int 1..100", 50 / 75 / 100 being its
+    low / high / max)."""
+
+    return bool(re.search(r"\bint\s*1\s*\.\.\s*100\b", template or ""))
+
+
+def thinking_fields(body: dict[str, Any], levels: frozenset[str] = frozenset(), numeric: bool = False) -> dict[str, Any]:
     """A request's ``reasoning_effort`` and ``enable_thinking`` where it sets them; unset is the server's default."""
 
     kwargs = body.get("chat_template_kwargs") or {}
@@ -91,8 +100,11 @@ def thinking_fields(body: dict[str, Any], levels: frozenset[str] = frozenset()) 
     if effort is None and isinstance(kwargs, dict):
         effort = kwargs.get("reasoning_effort")           # where vLLM's clients put it
     if effort is not None:
-        if not isinstance(effort, str) or effort not in EFFORTS:
-            raise RequestError("reasoning_effort must be none, minimal, low, medium, high, xhigh or max")
+        # a named level, or an int 1..100 where the template takes a number (``numeric``)
+        number = numeric and isinstance(effort, int) and not isinstance(effort, bool) and 1 <= effort <= 100
+        if not number and (not isinstance(effort, str) or effort not in EFFORTS):
+            raise RequestError("reasoning_effort must be none, minimal, low, medium, high, xhigh or max"
+                               + (" or an integer 1..100" if numeric else ""))
         fields["reasoning_effort"] = coerce_effort(effort, levels)
         fields["enable_thinking"] = effort != "none"
     if isinstance(kwargs, dict) and "enable_thinking" in kwargs:          # an explicit switch wins

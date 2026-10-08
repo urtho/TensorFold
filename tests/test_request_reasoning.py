@@ -361,3 +361,37 @@ def test_a_top_level_effort_wins_over_chat_template_kwargs():
         server.shutdown()
         server.server_close()
         app.close()
+
+
+DSV41 = "{# 'low' 'high' 'max' #}"                 # DeepSeek-V4.1's names (it also takes an int 1..100)
+
+
+@pytest.mark.parametrize("asked, want", [("xhigh", "max"), ("max", "max"), ("high", "high"), ("medium", "high"),
+                                         ("minimal", "low"), ("low", "low")])
+def test_deepseek_levels_never_hand_its_template_xhigh(asked, want):
+    from tensorfold.server.request_options import effort_levels, thinking_fields
+
+    assert thinking_fields({"reasoning_effort": asked}, effort_levels(DSV41))["reasoning_effort"] == want
+
+
+@pytest.mark.parametrize("asked, ok", [(1, True), (30, True), (100, True), (0, False), (101, False), (True, False),
+                                       (2.5, False)])
+def test_integer_efforts_reach_the_template(asked, ok):
+    from tensorfold.server.errors import RequestError
+    from tensorfold.server.request_options import effort_levels, thinking_fields
+
+    if ok:
+        assert thinking_fields({"reasoning_effort": asked}, effort_levels(DSV41), True) == {
+            "reasoning_effort": asked, "enable_thinking": True}
+    else:
+        with pytest.raises(RequestError):
+            thinking_fields({"reasoning_effort": asked}, effort_levels(DSV41), True)
+    with pytest.raises(RequestError):                         # a template that takes no number: refused
+        thinking_fields({"reasoning_effort": 30}, effort_levels(DSV41))
+
+
+def test_numeric_effort_read_from_the_template():
+    from tensorfold.server.request_options import numeric_effort
+
+    assert numeric_effort('reasoning_effort    "low"|"high"|"max" or int 1..100, default "high"')
+    assert not numeric_effort("{# 'xhigh' 'medium' 'low' #}")

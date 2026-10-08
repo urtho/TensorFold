@@ -56,6 +56,11 @@ services:
       # loop guard: a thinking reply whose last 3 windows of 1,024 tokens each held < 2% new 8-grams has its
       # thinking closed (1: the server default; a request's "loop_guard" overrides it)
       TF_LOOP_GUARD: ${TF_LOOP_GUARD:-0}
+      # thinking replies with no thinking_budget: thinking closed at max_tokens - max(MIN, RESERVE x max_tokens), so a
+      # reasoning that would hit the cap still answers (empty: off)
+      TF_THINK_RESERVE: ${TF_THINK_RESERVE:-}
+      TF_THINK_RESERVE_MIN: ${TF_THINK_RESERVE_MIN:-}
+      TF_LOOP_GUARD_DIGITS: ${TF_LOOP_GUARD_DIGITS:-}
       # kept prompts of >= TF_DSV41_KEEP_SHRINK_MIN tokens also kept at 3/4 and 7/8, trimmed to them before evicted
       TF_DSV41_KEEP_SHRINK: ${TF_DSV41_KEEP_SHRINK:-}
       TF_DSV41_KEEP_SHRINK_MIN: ${TF_DSV41_KEEP_SHRINK_MIN:-}

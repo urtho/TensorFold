@@ -264,7 +264,7 @@ class App:
         kwargs = dict(kwargs)
         # reasoning_effort and enable_thinking as the Mac server reads them: the template hears an effort when thinking
         levels = getattr(self.template, "efforts", frozenset())
-        fields = thinking_fields(body, levels)
+        fields = thinking_fields(body, levels, getattr(self.template, "numeric_effort", False))
         kwargs.pop("enable_thinking", None)
         kwargs.pop("reasoning_effort", None)
         thinking = bool(fields.get("enable_thinking", self.default_thinking))
