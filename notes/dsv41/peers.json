@@ -1,0 +1,38 @@
+{
+  "_doc": "Repos tools/dsv41_peers.py watches: other DeepSeek-V4.1-Flash EXL3 TP=2 recipes and engines on two DGX Sparks. branches: a regex over branch names (default: the default branch only). See PEERS.md.",
+  "watch": [
+    {"repo": "jayleaton/deepseek-v41-tensorfold-spark", "group": "tensorfold"},
+    {"repo": "bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10", "group": "tensorfold"},
+    {"repo": "bertholomus/TensorFold", "group": "tensorfold", "branches": "deepseek|dsv41|v41"},
+    {"repo": "sfxnz/DeepSeek-V4.1-Flash-EXL3-TensorFold-2x-DGX-Spark", "group": "tensorfold"},
+    {"repo": "sfxnz/TensorFold", "group": "tensorfold", "branches": "deepseek|dsv41|v41"},
+    {"repo": "soumyarupsarkar/deepseek-v4.1-flash-2X-GB10-TensorFold", "group": "tensorfold"},
+    {"repo": "ZackO2o/DeepSeek-V4.1-Flash-TensorFold-DGXSpark-TP2", "group": "tensorfold"},
+    {"repo": "MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks", "group": "vllm"},
+    {"repo": "sfxnz/DeepSeek-V4.1-Flash-EXL3-vLLM-2x-DGX-Spark", "group": "vllm"},
+    {"repo": "coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark", "group": "vllm"},
+    {"repo": "0xSero/DeepSeek-V4.1-Flash-Two-Sparks", "group": "vllm"},
+    {"repo": "vcruz305/DeepSeek-V4.1-Flash-EXL3-DGX-Spark-recipe", "group": "vllm"}
+  ],
+  "ignore": [
+    "urtho/TensorFold",
+    "Capicua25x/deepseek-v4.1-tensorfold-tp2-2xgb10",
+    "jvr0x/DeepSeek-V4.1-Flash-EXL3-DGX-Spark-recipe",
+    "drowzeys/keys-DeepSeek-V4.1-Flash-Abliterated-Mia-2x-Spark-EXL3",
+    "drowzeys/TensorFold",
+    "MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks",
+    "Snail3D/dsv41-vision-2xspark",
+    "ajensenwaud/recursant-two-sparks-deepseekv4.1-flash",
+    "ivanusto/dsv41-flash-vllm030-2x-gb10"
+  ],
+  "discover_require": "spark|gb10",
+  "discover": [
+    "DeepSeek-V4.1-Flash EXL3",
+    "DeepSeek-V4.1-Flash spark",
+    "DeepSeek-v4.1-Flash DGX Sparks",
+    "deepseek-v4.1 gb10",
+    "dsv41 spark",
+    "tensorfold deepseek",
+    "deepseek v41 tensorfold"
+  ]
+}
