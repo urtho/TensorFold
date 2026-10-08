@@ -75,7 +75,7 @@ def test_ext_name_bumped(monkeypatch):
         R._ext()
     finally:
         R._ext.cache_clear()
-    assert seen["name"] == "tensorfold_rdma_gather_v3"
+    assert seen["name"] == "tensorfold_rdma_gather_v4"
 
 
 def test_proxy_abi_and_trace_symbol():

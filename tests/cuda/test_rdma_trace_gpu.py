@@ -36,9 +36,10 @@ class Side:
         if flag:
             self.host[FLAG + slot * 64:FLAG + slot * 64 + 4].view("<u4")[0] = self.seq
 
-    def gather(self, x: torch.Tensor, out: torch.Tensor, rank: int, spin: int = 50_000_000) -> None:
+    def gather(self, x: torch.Tensor, out: torch.Tensor, rank: int, spin: int = 50_000_000, pred: int = 0) -> None:
         ptr, mask = (0, 0) if self.trace is None else (self.trace.data_ptr(), TRACE - 1)
-        R._ext().gather(x, out, self.region.data_ptr(), FLAG, SEND, RECV, SLOT, self.state, spin, rank, ptr, mask)
+        R._ext().gather(x, out, self.region.data_ptr(), FLAG, SEND, RECV, SLOT, self.state, spin, rank, ptr, mask,
+                        pred)
 
     def ctrl(self) -> list[int]:
         return self.host[:20].view("<u4").tolist()
@@ -121,3 +122,27 @@ def test_trace_timeout_records_as_before():
         torch.cuda.synchronize()
     assert sides[0].ctrl() == sides[1].ctrl() and sides[0].ctrl()[4] == 1
     assert sides[0].state.tolist() == sides[1].state.tolist() == [0, 8, 8, 1]
+
+
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_pred_copy_out_equals_plain(rank, trace):
+    """TF_RDMA_COPY=pred: the same output, send slot, ctrl words and state as the plain copy-out, over payloads from
+    16 B to the slot: one pack, decode rows (20 KiB each: 1, 2, 4, 6) and sizes around three of the four 2048-pack
+    strides a thread copies."""
+
+    sizes = [16, 4096, 20480, 40960, 81920, 122880, 3 * 32768 - 16, 3 * 32768 + 16, SLOT - 16, SLOT]
+    plain, pred = Side(trace), Side(trace)
+    for i, nbytes in enumerate(sizes * 2):
+        x, theirs = _payload(nbytes, 7 * i), _payload(nbytes, 7 * i + 1)
+        outs = []
+        for side, p in ((plain, 0), (pred, 1)):
+            side.peer(theirs)
+            out = torch.full((2 * nbytes // 4,), -1, dtype=torch.int32, device="cuda")
+            side.gather(x, out, rank, pred=p)
+            outs.append(out)
+        torch.cuda.synchronize()
+        want = torch.cat([x, theirs] if rank == 0 else [theirs, x])
+        assert torch.equal(outs[0], want) and torch.equal(outs[1], want), nbytes
+        assert plain.sent(nbytes) == pred.sent(nbytes) and plain.ctrl() == pred.ctrl()
+        assert plain.state.tolist() == pred.state.tolist()

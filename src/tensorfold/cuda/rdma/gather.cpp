@@ -5,7 +5,7 @@
 
 void rdma_gather(const at::Tensor& in, at::Tensor& out, int64_t region, int64_t flag_off, int64_t send_off,
                  int64_t recv_off, int64_t slot_bytes, at::Tensor& state, int64_t spin, int64_t rank, int64_t trace,
-                 int64_t trace_mask);
+                 int64_t trace_mask, int64_t pred);
 
 // The device address of host memory registered with cudaHostRegister (0 when it has none).
 int64_t device_pointer(int64_t host) {

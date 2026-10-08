@@ -109,6 +109,7 @@ services:
       # the RoCE gathers' phase trace (ring entries, a power of two; empty: off)
       TF_DSV41_SEND: ${TF_DSV41_SEND:-}
       TF_RDMA_TRACE: ${TF_RDMA_TRACE:-}
+      TF_RDMA_COPY: ${TF_RDMA_COPY:-}                 # pred: the copy-out issues all its guarded loads, then stores
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       TF_DSV41_PREPARED: /prepared                       # read the prepared folder when current (fastboot)
       # the NVMe tier of kept prompts: off unless set (/kvdisk); budget (128 GiB), smallest state written (2048

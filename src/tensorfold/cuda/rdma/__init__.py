@@ -36,6 +36,11 @@ SLOT_ALIGN = 4096
 INFO_WORDS = 7                       # tf_rdma_info: qpn, psn, rkey, addr, mtu, gid_hi, gid_lo
 SPIN = 20_000_000                    # flag polls before a wait gives up (~20 s): the peer died or never sent
 TRACE = int(os.environ.get("TF_RDMA_TRACE") or 0)       # trace ring entries (0: off)
+# the copy-out of the peer's shard (TF_RDMA_COPY): "pred", all of a thread's guarded loads then the stores; empty, the
+# default: groups of four then a serial tail. A plain copy either way
+COPY = os.environ.get("TF_RDMA_COPY", "")
+if COPY not in ("", "pred"):
+    raise ValueError(f"TF_RDMA_COPY={COPY}: pred or empty")
 _LOCK = threading.Lock()
 
 
@@ -78,7 +83,7 @@ def proxy() -> ctypes.CDLL:
 def _ext():
     from tensorfold.cuda.build import load
 
-    return load("tensorfold_rdma_gather_v3", [str(HERE / "gather.cpp"), str(HERE / "gather.cu")],
+    return load("tensorfold_rdma_gather_v4", [str(HERE / "gather.cpp"), str(HERE / "gather.cu")],
                 extra_cuda_cflags=["-O3"])
 
 
@@ -233,7 +238,8 @@ class RdmaGather:
 
     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
         _ext().gather(send, recv, self.region.data_ptr(), self.flag_off, self.send_off, self.recv_off, self.slot_bytes,
-                      self.state, SPIN, self.rank, 0 if self.trace is None else self.trace.data_ptr(), max(TRACE - 1, 0))
+                      self.state, SPIN, self.rank, 0 if self.trace is None else self.trace.data_ptr(), max(TRACE - 1, 0),
+                      int(COPY == "pred"))
         if not torch.cuda.is_current_stream_capturing():
             self.check()
 

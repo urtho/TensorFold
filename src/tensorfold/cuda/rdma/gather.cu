@@ -19,7 +19,9 @@
 //   4. every block copies the peer's shard from recv to the output (four loads in flight a thread);
 //   5. the last block to leave advances the device epoch, so a CUDA graph replays the exchange with the next seq.
 //
-// TF_RDMA_TRACE=N (``gather_kernel<true>``; off: ``<false>``, the kernel as before): %globaltimer stamps of each
+// TF_RDMA_COPY=pred (``gather_kernel<.., true>``): step 4 issues all of a thread's (<= 4) guarded loads, then the
+// stores, as bertholomus/TensorFold rdma_gather.cu (Apache-2.0) does; a plain copy either way.
+// TF_RDMA_TRACE=N (``gather_kernel<true, ..>``; off: ``<false, ..>``, the kernel as before): %globaltimer stamps of each
 // gather's phases in a device ring of N entries (index seq & (N-1)), read by ``RdmaGather.trace_stats``. The phase
 // split follows jayleaton/deepseek-v41-tensorfold-spark's G14a gather trace (patch 0002 roce.cu, Apache-2.0; the idea,
 // no code copied).
@@ -64,7 +66,7 @@ __device__ __forceinline__ uint4 ld_sys_v4(const uint4* p) {
 // trace entry (TRACE): [0] seq, [1] start (block 0), [2] staged (block 0, its stores done), [3] rung (the last block
 // to arrive, after the doorbell), [4] flag seen (block 0), [5] copied (block 0, its copy-out done), [6] end (the last
 // block to leave), [7] block 0's flag polls; globaltimer ns
-template <bool TRACE>
+template <bool TRACE, bool PRED>
 __global__ void __launch_bounds__(256) gather_kernel(const uint4* __restrict__ in, uint4* __restrict__ out, int packs,
                                                      uint32_t nbytes, char* region, long long flag_off,
                                                      long long send_off, long long recv_off, long long slot_bytes,
@@ -122,16 +124,28 @@ __global__ void __launch_bounds__(256) gather_kernel(const uint4* __restrict__ i
     if (ok) {                                                                                 // 4. copy out
         const uint4* peer = reinterpret_cast<const uint4*>(region + recv_off + slot * slot_bytes);
         uint4* peer_out = out + (long long)(1 - rank) * packs;
-        int i = index;
-        for (; i + 3 * stride < packs; i += 4 * stride) {     // four loads in flight a thread
-            const uint4 a = ld_sys_v4(peer + i), b = ld_sys_v4(peer + i + stride);
-            const uint4 c = ld_sys_v4(peer + i + 2 * stride), d = ld_sys_v4(peer + i + 3 * stride);
-            peer_out[i] = a;
-            peer_out[i + stride] = b;
-            peer_out[i + 2 * stride] = c;
-            peer_out[i + 3 * stride] = d;
+        if (PRED) {                   // every guarded load of a group of four in flight, then the stores (the peer's
+            for (int i = index; i < packs; i += 4 * stride) {       // rdma_gather.cu copy-out): no serial tail loads
+                uint4 v[4];
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                    if (i + k * stride < packs) v[k] = ld_sys_v4(peer + i + k * stride);
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                    if (i + k * stride < packs) peer_out[i + k * stride] = v[k];
+            }
+        } else {
+            int i = index;
+            for (; i + 3 * stride < packs; i += 4 * stride) {     // four loads in flight a thread
+                const uint4 a = ld_sys_v4(peer + i), b = ld_sys_v4(peer + i + stride);
+                const uint4 c = ld_sys_v4(peer + i + 2 * stride), d = ld_sys_v4(peer + i + 3 * stride);
+                peer_out[i] = a;
+                peer_out[i + stride] = b;
+                peer_out[i + 2 * stride] = c;
+                peer_out[i + 3 * stride] = d;
+            }
+            for (; i < packs; i += stride) peer_out[i] = ld_sys_v4(peer + i);
         }
-        for (; i < packs; i += stride) peer_out[i] = ld_sys_v4(peer + i);
     }
     __threadfence();                                                                          // 5. epoch
     __syncthreads();
@@ -147,7 +161,7 @@ __global__ void __launch_bounds__(256) gather_kernel(const uint4* __restrict__ i
 
 void rdma_gather(const at::Tensor& in, at::Tensor& out, int64_t region, int64_t flag_off, int64_t send_off,
                  int64_t recv_off, int64_t slot_bytes, at::Tensor& state, int64_t spin, int64_t rank, int64_t trace,
-                 int64_t trace_mask) {
+                 int64_t trace_mask, int64_t pred) {
     TORCH_CHECK(in.is_cuda() && out.is_cuda() && state.is_cuda(), "rdma gather: CUDA tensors");
     TORCH_CHECK(in.is_contiguous() && out.is_contiguous(), "rdma gather: contiguous tensors");
     const int64_t nbytes = in.numel() * in.element_size();
@@ -156,7 +170,8 @@ void rdma_gather(const at::Tensor& in, at::Tensor& out, int64_t region, int64_t 
     TORCH_CHECK(reinterpret_cast<uintptr_t>(in.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0,
                 "rdma gather: 16-byte aligned tensors");
     const at::cuda::CUDAGuard guard(in.device());
-    auto kernel = trace ? gather_kernel<true> : gather_kernel<false>;       // trace: a device ring of 8 x u64 entries
+    auto kernel = trace ? (pred ? gather_kernel<true, true> : gather_kernel<true, false>)   // trace: a device ring
+                        : (pred ? gather_kernel<false, true> : gather_kernel<false, false>);  // of 8 x u64 entries
     kernel<<<GRID, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const uint4*>(in.data_ptr()), reinterpret_cast<uint4*>(out.data_ptr()), (int)(nbytes / 16),
         (uint32_t)nbytes, reinterpret_cast<char*>(region), flag_off, send_off, recv_off, slot_bytes,

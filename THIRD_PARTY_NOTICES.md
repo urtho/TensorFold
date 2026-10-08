@@ -304,16 +304,15 @@ deepseek-v41-tp2:
 - Ideas, re-implemented here: kept prompts shrunk to 3/4 and 7/8 boundaries before being forgotten (v0.5, 508bfb3);
   candidate-only reindex scoring (v0.5; also coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark 1d8ac64); the prompt-chunk
   expert work list built on the device (v0.5, `work_list_kernel`); RoCE gather rings in cudaHostRegister'd memory with
-  one system fence a block and the own slice copied early (bd0024d); a decode round's index arithmetic once a graph
-  piece (bd0024d rounds.py `_ix`, TF_DS_ROUND_GLUE; here `serial.py` `_round_bases`, `TF_DSV41_IDX_BASE`); the
-  mHC finish split into Sinkhorn | collapse and the partial mixes + Sinkhorn on a side stream (bd0024d TF_DS_HC_SPLIT
-  / HC_DEFER / HC_DOTS; here `hc.py` `_pre_finish2` / `_pre_sinkhorn` / `_pre_collapse`, the halves being
-  `_pre_finish`'s own code). The counts without bincount's host read follow jayleaton/deepseek-v41-tensorfold-spark
-  PR #17 (Apache-2.0).
-  one system fence a block and the own slice copied early (bd0024d); the routed experts' expert-major program order
-  with the dead expert slots last (`experts_grouped.cuh` `grouped_cp_kernel`; `TF_X3LD_ORDER=expert` in `x3ld.cu`). The counts without bincount's host read follow
-  one system fence a block and the own slice copied early (bd0024d); dead decode scratch (split partials, expert Z)
-  dropped from L2 with discard.global.L2 once read (its TF_EXL3_L2_DISCARD, bd0024d; here TF_DSV41_L2_DISCARD). The counts without bincount's host read follow
+  one system fence a block and the own slice copied early (bd0024d); the gather's copy-out issuing all of a thread's
+  guarded loads before its stores (`rdma_gather.cu`; here `TF_RDMA_COPY=pred`); a decode round's index arithmetic
+  once a graph piece (bd0024d rounds.py `_ix`, TF_DS_ROUND_GLUE; here `serial.py` `_round_bases`,
+  `TF_DSV41_IDX_BASE`); the mHC finish split into Sinkhorn | collapse and the partial mixes + Sinkhorn on a side
+  stream (bd0024d TF_DS_HC_SPLIT / HC_DEFER / HC_DOTS; here `hc.py` `_pre_finish2` / `_pre_sinkhorn` /
+  `_pre_collapse`, the halves being `_pre_finish`'s own code); the routed experts' expert-major program order with the
+  dead expert slots last (`experts_grouped.cuh` `grouped_cp_kernel`; `TF_X3LD_ORDER=expert` in `x3ld.cu`); dead decode
+  scratch (split partials, expert Z) dropped from L2 with discard.global.L2 once read (its TF_EXL3_L2_DISCARD,
+  bd0024d; here TF_DSV41_L2_DISCARD). The counts without bincount's host read follow
   jayleaton/deepseek-v41-tensorfold-spark PR #17 (Apache-2.0).
 - `src/tensorfold/families/deepseek_v41/cuda/kernels.py` `pdl()` and the `PDL` constexpr of its and `hc.py`'s small
   decode kernels (`TF_DSV41_PDL`): the programmatic dependent launch pattern of its `kernels.py` `_pdl()` (bd0024d,
