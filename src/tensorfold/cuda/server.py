@@ -56,6 +56,12 @@ class PreparedRequest:
 
 # the loop guard's server default (``ThinkLoop``; a request's "loop_guard": true / false overrides it)
 LOOP_GUARD = os.environ.get("TF_LOOP_GUARD", "0") == "1"
+# the answer's share of a thinking reply's max_tokens (TF_THINK_RESERVE, e.g. 0.15; 0: off): a request with no
+# thinking_budget of its own (and no server default) gets max_tokens - max(TF_THINK_RESERVE_MIN, that share) as one,
+# so a reasoning that would run to the cap is closed as a thinking budget closes it, with room left for the answer
+# (a reply cut at max_tokens inside its reasoning has empty content). Only where max_tokens holds the reserve twice.
+THINK_RESERVE = float(os.environ.get("TF_THINK_RESERVE") or 0)
+THINK_RESERVE_MIN = int(os.environ.get("TF_THINK_RESERVE_MIN") or 256)
 
 
 def _native_context(model_dir: Path) -> int:
@@ -264,6 +270,10 @@ class App:
             kwargs["reasoning_effort"] = effort
         budget = parse_numbers({"thinking_budget": body.get("thinking_budget")})["thinking_budget"]
         budget = int(budget or getattr(self, "thinking_budget", 0)) if chat and thinking else 0     # 0: the default
+        if not budget and chat and thinking and THINK_RESERVE > 0 and body.get("thinking_budget") is None:
+            reserve = max(THINK_RESERVE_MIN, int(max_tokens * THINK_RESERVE))
+            if max_tokens >= 2 * reserve:
+                budget = max_tokens - reserve
         spec = grammar.request_spec(body)
         if spec is None:                     # an output format wins over strict tools (the reply is then JSON)
             spec = self._tool_grammar(body, tools, chat)
@@ -612,18 +622,19 @@ class App:
         return ThinkBudget(prepared.think_budget, close, think_end)
 
     def _think_loop(self, body: dict[str, Any], prepared: PreparedRequest, thinking: bool) -> ThinkLoop | None:
-        """The loop guard for a thinking chat reply (TF_LOOP_GUARD, or the request's "loop_guard"); none under a
-        grammar or a thinking budget (their own closes)."""
+        """The loop guard for a thinking chat reply (TF_LOOP_GUARD, or the request's "loop_guard"). Under a grammar
+        its close is </think> alone (the grammar starts there, as after a thinking budget's close); beside a thinking
+        budget the earlier cut wins (each gate stops at the other's </think>)."""
 
         asked = body.get("loop_guard")
-        if not (LOOP_GUARD if asked is None else asked is True) or not thinking or prepared.grammar is not None \
-                or prepared.think_budget > 0:
+        if not (LOOP_GUARD if asked is None else asked is True) or not thinking:
             return None
         end = self.tok.token_to_id("</think>")
         if end is None:
             return None
-        close = [*self.tok.encode("\n", add_special_tokens=False).ids, end,
-                 *self.tok.encode("\n\n", add_special_tokens=False).ids]
+        close = [*self.tok.encode("\n", add_special_tokens=False).ids, end]
+        if prepared.grammar is None:
+            close += self.tok.encode("\n\n", add_special_tokens=False).ids
         return ThinkLoop(close, end)
 
     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:

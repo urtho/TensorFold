@@ -263,6 +263,72 @@ def test_the_budget_under_a_grammar_closes_at_think_end_and_the_grammar_starts_a
     assert second[len(first):] == [ord("a"), ord("b"), ord("c"), 10, THINK_END]     # no blank line under a grammar
 
 
+def test_the_loop_guard_under_a_grammar_closes_at_think_end(tmp_path, monkeypatch):
+    """A reasoning that repeats itself under response_format: the loop guard (a narrow window here) closes it with
+    </think> alone and the grammar answers."""
+
+    import functools
+
+    monkeypatch.setattr(server, "ThinkLoop", functools.partial(server.ThinkLoop, width=4, n=2))
+    xgr = pytest.importorskip("xgrammar")
+    torch = pytest.importorskip("torch")
+    from tensorfold.engine import grammar
+
+    V, STOP, THINK_END = 128, 0, 127
+    info = xgr.TokenizerInfo([""] + [chr(t) for t in range(1, V)], xgr.VocabType.RAW, vocab_size=V,
+                             stop_token_ids=[STOP])
+
+    class Text:
+        def encode(self, text, **kwargs):
+            return SimpleNamespace(ids=[THINK_END if c == "\x7f" else ord(c) for c in text.replace("</think>", "\x7f")])
+
+        def decode(self, ids, **kwargs):
+            return "".join("</think>" if t == THINK_END else chr(t) for t in ids if t != STOP)
+
+        def token_to_id(self, text):
+            return THINK_END if text == "</think>" else None
+
+    class Engine:
+        eos = (STOP,)
+
+        def __init__(self):
+            self.calls = []
+
+        def generate(self, prompt, max_tokens, sampling, on_tokens, draft=True, constraint=None):
+            self.calls.append((list(prompt), constraint.think_end, constraint.active))
+            thinking = not constraint.active
+            for t in ([ord(c) for c in "abcd" * 20] if thinking else [ord(c) for c in '{"k":42}'] + [STOP]):
+                if not thinking:
+                    logits = torch.zeros(1, V)
+                    logits[0, t] = 1.0
+                    t = int(constraint.mask(logits).argmax())
+                constraint.advance([t])
+                if on_tokens([t]) or t == STOP:
+                    break
+            return {}
+
+    engine = Engine()
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"chat_template": TEMPLATE}))
+    app = server.App.__new__(server.App)
+    app.engine, app.served, app.tok, app.model_dir = engine, "fake-cuda", Text(), tmp_path
+    app.template = server.ChatTemplate(tmp_path)
+    app.default_thinking, app.reasoning_effort, app.thinking_budget = True, None, 0
+    app.sampling, app.max_tokens = {"temperature": 0.0}, 64
+    app.native_context_window = app.context_window = 0
+    app.lock = threading.Lock()
+    app.grammars = grammar.Grammars(info)
+    schema = {"type": "object", "properties": {"k": {"type": "integer"}}, "required": ["k"]}
+    status, body = ask(app, response_format={"type": "json_schema", "json_schema": {"name": "v", "schema": schema}},
+                       loop_guard=True)
+    message = body["choices"][0]["message"]
+    assert status == 200 and message["reasoning_content"] == "abcd" * 5 + "\n" and json.loads(message["content"]) == {"k": 42}
+    (first, end0, active0), (second, end1, active1) = engine.calls
+    assert (end0, active0, end1, active1) == (THINK_END, False, None, True)
+    # window 1 new; window 2 has one new gram across its edge ("da"); windows 3-5 dry: the cut after the fifth
+    assert second[len(first):] == [ord(c) for c in "abcd" * 5] + [10, THINK_END]
+
+
+
 def test_the_budget_matches_the_lane_engine(tmp_path):
     """The same chain through the Mac's lane engine (drafted and serial) and through the CUDA server's cut."""
 
@@ -318,3 +384,16 @@ def test_the_budget_matches_the_lane_engine(tmp_path):
             prepared = server.PreparedRequest(list(prompt), count, [], True, None, think_budget=budget)
             result = app.run({"return_token_ids": True}, True, lambda delta: True, prepared=prepared)
             assert result["stats"]["token_ids"] == want, (budget, width)
+
+
+@pytest.mark.parametrize("fields, max_tokens, cut", [({}, 24, 18), ({}, 11, None), ({"thinking_budget": 5}, 24, 5),
+                                                     ({"thinking_budget": -1}, 24, None)])
+def test_the_answer_reserve_budgets_a_request_without_one(tmp_path, monkeypatch, fields, max_tokens, cut):
+    """TF_THINK_RESERVE: a request with no thinking_budget is closed max(reserve min, share) before max_tokens; a
+    request's own budget (or -1: none) wins, and a max_tokens too small to hold the reserve twice gets none."""
+
+    monkeypatch.setattr(server, "THINK_RESERVE", 0.25)
+    monkeypatch.setattr(server, "THINK_RESERVE_MIN", 6)
+    engine = ChainEngine()
+    status, body = ask(app_for(tmp_path, engine), max_tokens=max_tokens, **fields)
+    assert status == 200 and body["tensorfold"]["token_ids"] == meant(THINK, cut or 0, max_tokens)
