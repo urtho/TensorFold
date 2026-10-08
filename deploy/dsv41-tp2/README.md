@@ -55,6 +55,17 @@ prompt and concurrent streams through the decoder) any Triton kernel loaded for 
 (`late kernel load ...`) and counted in `/health` (`late_kernel_loads`): such a load mid-serving once failed with CUDA
 800 in a peer engine. A count above zero names a shape the warm-up should cover.
 
+The serving-path battery is `TF_DSV41_WARM_SERVING` (`.env`): empty / `full` the 13 waves (~19.9K prompt tokens,
+27-54 s), `trim` three waves (~2.8K tokens: a 2600-token prompt kept at 2048 and its end, a sampled 100-token prompt
+decoding while that prompt resumes with 48 more, a 7-token prompt), `audit` trim then full from a clean pool, printing
+`[warm-trace] audit: N kernels only the full battery loads`, `0` none. `TF_DSV41_WARM_RARE=1` (empty: on under
+trim / audit) also loads two prompt-chunk shapes no warm-up prompt reaches: an indexer key segment of one key and the
+packed-FP4 attention past `TF_DSV41_FULL_DEQ_MIB` (ratio-1 layers past 128K). `TF_DSV41_WARM_TRACE=1` prints the
+Triton kernels each startup stage and wave loaded first, their seconds, and the serving warm-up's set with a digest: a
+full boot and a trim boot loading the same set print the same digest. Before making trim the default: an audit boot
+with 0 misses, then `late_kernel_loads` 0 after a soak, a stress run and a long run past 128K. None of these switches
+enters the calibration or NVMe-tier keys.
+
 ## Watchdog
 
 `watchdog.sh` checks the pair once a minute from a systemd user timer (`make watch-install`; the user must linger

@@ -1625,6 +1625,63 @@ class SerialEngine:
         return self.comm.partials_rows(lambda r0, r1: a.wo_b(z[r0:r1], out_dtype=F32 if R <= PROMPT_ROWS else BF), R,
                                        during=(lambda: self._prefetch(pf, site="moe")) if pf is not None else None)
 
+    @torch.no_grad()
+    def warm_rare(self) -> list[str]:
+        """Prompt-chunk kernel shapes no warm-up prompt reaches, loaded now (TF_DSV41_WARM_RARE) through the chunk
+        path's own calls on a 2048-row chunk of zeros: (a) ``select`` over SELECT_SEG + 1 visible indexer keys, a last
+        key segment of one key (``_fp4_dequant`` / ``_tie_pick`` at n == 1: S % 16384 == 1, ratio-1 past 16K, ratio-2
+        past 32K); (b) ``mqa`` with no shared decode, _mqa_full over packed FP4 entries (FMT 2), what a chunk takes past
+        TF_DSV41_FULL_DEQ_MIB of visible entries (ratio-1 layers past 128K, ratio-2 past 256K), for the layers this
+        context can take there. Reads the current slot's caches, writes fresh scratch only (``candidates`` restored);
+        no collective (each rank on its own). Returns what it left out and why."""
+
+        from .weights import Linear
+
+        c, st = self.c, self.state
+        R, S = MAX_ROWS, K.SELECT_SEG + 1
+        notes: list[str] = []
+        lays = [lw for lw in self.w.layers if lw.attn.ratio > 0]
+        src_of = {lw.index: max(s for s in c.kv_source_layer_ids if s <= lw.index) for lw in lays}
+        short = [lw.index for lw in lays if lw.attn.indexer is not None
+                 and (S * lw.attn.ratio > self.limit or st.ik[src_of[lw.index]].shape[0] < S)]
+        saved, topk = self.candidates, {}
+        x = torch.zeros((R, c.hidden_size), dtype=BF, device=self.dev)
+        Linear.prompt_mode = True
+        try:
+            if short:
+                notes.append(f"one-key indexer segment: context {self.limit} too short (layers {short})")
+            else:
+                for lw in lays:
+                    a = lw.attn
+                    if a.indexer is None:
+                        continue
+                    pos = torch.arange(S * a.ratio - R, S * a.ratio, device=self.dev)
+                    qr = K.rmsnorm(a.wq_a(x), a.q_norm, c.rms_norm_eps)
+                    topk[lw.index] = (pos, self.select(lw, qr, x, pos, static=False))
+            deep = []
+            for lw in lays:
+                a, L = lw.attn, lw.index
+                comp = st.comp[src_of[L]]
+                if not (K.FULL_DEQ and isinstance(comp, K.Fp4Rows)
+                        and (self.limit // a.ratio) * comp.dim * 2 > K.FULL_DEQ_MIB << 20):
+                    continue                                            # (never past the shared decode here)
+                isrc = max((s for s in c.index_source_layer_ids if s <= L), default=None)
+                if isrc not in topk:
+                    deep.append(L)
+                    continue
+                pos, idx = topk[isrc]
+                Dh = c.head_dim
+                cos, sin = self.tables_rope[a.ratio]
+                q = torch.zeros((R, a.wq_b.n // Dh, Dh), dtype=BF, device=self.dev)
+                K.mqa(q, comp, idx, st.swa[L], pos, a.sink, c.sliding_window, self.attnbuf, Dh ** -0.5, cos, sin)
+            if deep:
+                notes.append(f"packed-FP4 prompt attention: no top-k for layers {deep}")
+            torch.cuda.synchronize()
+        finally:
+            Linear.prompt_mode = False
+            self.candidates = saved
+        return notes
+
     def select(self, layer: LayerW, qr: torch.Tensor, x: torch.Tensor, pos: torch.Tensor,
                static: bool = True) -> torch.Tensor:
         """This index source's top-k compressed entries for each row (shared by the layers after it)."""

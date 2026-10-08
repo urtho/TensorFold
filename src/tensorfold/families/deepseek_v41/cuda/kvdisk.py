@@ -61,7 +61,14 @@ SKIP_KNOBS = ("TF_PORT", "TF_API_KEY", "TF_RANK", "TF_DSV41_MEMLOG", "TF_MULTI_P
               "TF_DSV41_FIXED_GIB", "TF_DSV41_RESERVE_GIB", "TF_CARVEOUT", "TF_COMM", "TF_MULTI_CHECK",
               "TF_DSV41_LAUNCH_T0", "TF_HEALTH", "TF_STALL_S", "TF_DSV41_TOOL_GRAMMAR", "TF_DSV41_PREPARED",
               "TF_DSV41_CALIB", "TF_DSV41_WARM", "TF_DSV41_ENGRAM_DIR", "TF_REVISION", "TF_DSV41_SEND", "TF_RDMA_TRACE",
-              "TF_RDMA_TRACE_OUT")
+              "TF_RDMA_TRACE_OUT", "TF_DSV41_WARM_RARE", "TF_DSV41_WARM_TRACE")
+# the serving warm-up's battery (engine._warm_serving) changes no cached byte or timing: its new modes key as the
+# default ("") did, its old values ("", "1", "0") as before
+WARM_MODES = ("trim", "full", "audit")
+
+
+def knob_value(k: str, v: str) -> str:
+    return "" if k == "TF_DSV41_WARM_SERVING" and v in WARM_MODES else v
 
 
 def _up(n: int) -> int:
@@ -75,7 +82,7 @@ def compat_hash(ident: dict) -> str:
 def knobs_from_env(prefix: str = "TF_", skip: Sequence[str] = SKIP_KNOBS) -> dict:
     """The knobs that may change bytes: every ``prefix`` variable but the operational ones and TF_DSV41_DISK*."""
 
-    return {k: v for k, v in sorted(os.environ.items())
+    return {k: knob_value(k, v) for k, v in sorted(os.environ.items())
             if k.startswith(prefix) and k not in skip and not k.startswith("TF_DSV41_DISK")}
 
 
