@@ -282,6 +282,16 @@ merged-off / on, alternating x2; the quick tier with every switch on gives bbc5e
       the design guesses 0.1-0.13 ms). The q-norm part (wq_b / ix.wq_b) only if this gains >= 0.1 ms
 - [ ] Still open from the design: norm + rot_in fusion, dense-lane EXL3
       decode, Triton PDL, RoCE two rails, the serving warm-up trim (27-54 s a start), first-start PP dip diagnosis
+      38.0 / 40.7 and jaybench rounds 40.7 / 44.7): a realistic-depth cost curve (design.json "draft-policy")
+- [ ] Serving warm-up trim (perf9/warmup-trim, default still the full battery): `TF_DSV41_WARM_SERVING=trim` (3 waves,
+      ~2.8K prompt tokens vs ~19.9K) / `audit` (trim, then full from a clean pool: what only full loads),
+      `TF_DSV41_WARM_RARE` (the one-key indexer segment and packed-FP4 prompt attention past FULL_DEQ_MIB, which no
+      battery reached), `TF_DSV41_WARM_TRACE=1` (first loads by stage and wave, seconds, the set's digest). To do on
+      GB10: a traced full boot (per-wave seconds), an audit boot with 0 misses, then soak + stress + a >128K run with
+      `late_kernel_loads` 0 before trim becomes the default. Neither battery runs encode (BOUNDED_TAIL) chunks: those
+      need a prompt step ending tail_min (~2.7K) before a kept point, i.e. a ~6.3K prompt alone
+- [ ] Still open from the design: wo_a rotation folded into the attention merge, norm + rot_in fusion, dense-lane EXL3
+      decode, Triton PDL, RoCE two rails, first-start PP dip diagnosis
 - [x] Grammar-constrained streams draft (`TF_DSV41_DRAFT_GRAMMAR`, 6542b0d; on in the deployment): before, every
       response_format / tool-grammar reply verified one row a round, its reasoning included (accepted=0/0). Served:
       the same replies (12 verdicts' tokens and content equal; structured schemas PASS), ~55% of drafts kept, but at 6

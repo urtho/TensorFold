@@ -487,11 +487,14 @@ class MultiDecoder:
         if rev in ("", "unknown") or os.environ.get("TF_DSV41_CALIB", "cached") != "cached":
             return None
         e = self.e
-        # (not the copy-draft switches: both arms of an A/B read one curve; TF_DSV41_COSTS: by the depth both ranks
-        # took, so the calib arm keeps its key and the depth arm, a curve longer by one stream's, has its own)
-        knobs = sorted((k, v) for k, v in os.environ.items() if k.startswith("TF_") and k not in
+        from .kvdisk import knob_value
+
+        # (not the copy-draft switches: both arms of an A/B read one curve; nor the warm-up's, which run after it;
+        # TF_DSV41_COSTS: by the depth both ranks took, so the calib arm keeps its key and the depth arm, a curve
+        # longer by one stream's, has its own)
+        knobs = sorted((k, knob_value(k, v)) for k, v in os.environ.items() if k.startswith("TF_") and k not in
                        ("TF_API_KEY", "TF_PORT", "TF_RANK", "TF_DSV41_LAUNCH_T0", "TF_MULTI_COPY", "TF_MULTI_COPY_MIN",
-                        "TF_DSV41_COSTS"))
+                        "TF_DSV41_COSTS", "TF_DSV41_WARM_RARE", "TF_DSV41_WARM_TRACE"))
         key = [rev, torch.cuda.get_device_name(), torch.__version__, e.cap, e.slots, ROWS, widths, self.drafts,
                sorted(getattr(e.drafter, "multi_graphs", None) or {}), knobs]
         if self.one_rows:

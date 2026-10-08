@@ -37,6 +37,64 @@ RESERVE_GIB = float(os.environ.get("TF_DSV41_RESERVE_GIB") or "3")
 PROMPT_TRANSIENT_GIB = 1.5       # a prompt chunk's buffers beyond the context's (expert Z, GEMM workspace, ...)
 
 
+def warm_serving_mode() -> str:
+    """TF_DSV41_WARM_SERVING: 0 (off), full (the battery of 13 waves; also empty / 1, the default), trim (the waves
+    that load distinct kernels, ~2.8K prompt tokens), audit (trim, then full from a clean pool: what only full loads)."""
+
+    v = os.environ.get("TF_DSV41_WARM_SERVING", "")
+    return v if v in ("0", "trim", "audit") else "full"
+
+
+def serving_waves(battery: str) -> list[tuple[str, list[tuple[list[int], int, bool]]]]:
+    """The serving warm-up's waves: (label, [(prompt, tokens, sampled)]), the streams of a wave admitted together.
+    full: the battery as it was (its prompts the same draws). trim: what full loads by the trace, in 2.8K tokens of
+    other draws: a 2600-token prompt alone (a 2048-row chunk at 0, kept there, a 552-row tail: R % 16 != 0 at p0 > 0,
+    kept at its end), a sampled 100-token prompt (R % 16 != 0 at 0) decoding while that kept prompt resumes with 48
+    tokens (R % 16 == 0 at p0 > 0), a 7-token prompt (a decode graph). Specializations follow R through those two
+    classes (== 1 is never an eager chunk) and through visible entries (p0 + R) // ratio: both classes again."""
+
+    import random
+
+    if battery == "full":
+        rng = random.Random(0)
+
+        def ids(n: int) -> list[int]:
+            return [rng.randrange(1000, 100000) for _ in range(n)]
+
+        doc = ids(3000)
+        waves = [(str(n), [ids(n)]) for n in (1, 7, 16, 100, 2048, 2048 + 33, 2048 + 48)]
+        waves += [("doc 3000", [doc]), ("doc + 40", [doc + ids(40)]), ("doc + 2100", [doc + ids(2100)]),
+                  ("500 | 2600 | 5000", [ids(500), ids(2600), ids(5000)])]
+        out = [(label, [(p, 12, False) for p in wave]) for label, wave in waves]
+        out.append(("300 sampled", [(ids(300), 12, True)]))
+        return out
+    if battery != "trim":
+        raise ValueError(f"no serving warm-up battery {battery!r}")
+    rng = random.Random(1)
+
+    def ids(n: int) -> list[int]:
+        return [rng.randrange(1000, 100000) for _ in range(n)]
+
+    doc = ids(2600)
+    return [("doc 2600", [(doc, 12, False)]),
+            ("100 sampled | doc + 48", [(ids(100), 12, True), (doc + ids(48), 12, False)]),
+            ("7", [(ids(7), 12, False)])]
+
+
+def warm_rare_on() -> bool:
+    """TF_DSV41_WARM_RARE (``SerialEngine.warm_rare``): 1 on, 0 off; empty: on under the trim / audit batteries."""
+
+    v = os.environ.get("TF_DSV41_WARM_RARE", "")
+    return v == "1" if v else warm_serving_mode() in ("trim", "audit")
+
+
+def warm_trace_on() -> bool:
+    """TF_DSV41_WARM_TRACE=1 (and the audit battery): each startup stage and serving warm-up wave prints the Triton
+    kernels it loaded first (``late_kernels.trace``), and its seconds."""
+
+    return os.environ.get("TF_DSV41_WARM_TRACE") == "1" or warm_serving_mode() == "audit"
+
+
 def available_bytes() -> int:
     """What the system can still give us: MemAvailable (GB10 memory is unified; it counts the reclaimable page cache,
     which right after loading holds the weight files and which CUDA's free figure leaves out), else CUDA's free."""
@@ -272,6 +330,11 @@ class Dsv41Engine:
                                f"TF_DSV41_SEND): rank 0 {both[0]}, rank 1 {both[1]}; give both the same flags")
         started = time.perf_counter()
         self._boot = [("start", started)]
+        self._traced: dict[str, list[str]] | None = None
+        if warm_trace_on():
+            from tensorfold.cuda import late_kernels
+
+            self._traced = {} if late_kernels.trace() else None
         w = W.load(self.model_dir, rank=rank, log=lambda *a, **k: None, draft=bool(drafts))
         self._mark("weights")
         # the NVMe tier of kept prompts (TF_DSV41_DISK; shared pool only): its pinned stage before memory is measured
@@ -385,6 +448,18 @@ class Dsv41Engine:
             self._warm()
             self._mark("warm-up")
             self._memlog("after warm-up")
+        if warm and warm_rare_on():                     # both ranks, each on its own (no collective)
+            t = time.perf_counter()
+            notes = self.e.warm_rare()
+            self.torch.cuda.empty_cache()               # its scratch back before the kept-prompt pool is sized
+            self._mark("rare shapes")
+            if rank == 0:
+                print(f"[tensorfold] rare prompt shapes warmed in {time.perf_counter() - t:.1f}s"
+                      + (f" (left out: {'; '.join(notes)})" if notes else ""), flush=True)
+            if self._traced is not None:
+                keys = self._traced.get("rare shapes", [])
+                print(f"[warm-trace] r{rank} rare shapes: {len(keys)} first loads" + (": " + " ".join(keys) if keys
+                                                                                       else ""), flush=True)
         if self.shared:                                 # kept prompts live in the shared pool (multi.Kept)
             self.e.pool = None
         else:
@@ -413,7 +488,7 @@ class Dsv41Engine:
                 if self.multi.copy is not None:
                     print(f"[tensorfold] copy drafts in concurrent rounds: up to {self.multi.copy.most} (match "
                           f"{self.multi.copy.match} tokens)", flush=True)
-            if warm and os.environ.get("TF_DSV41_WARM_SERVING", "1") != "0":
+            if warm and warm_serving_mode() != "0":
                 self._warm_serving()
                 self._mark("serving warm-up")
             if rank == 0:
@@ -427,6 +502,9 @@ class Dsv41Engine:
             marks = self._boot
             print("[boot] " + ", ".join(f"{name} {t - prev:.1f}s" for (_, prev), (name, t) in zip(marks, marks[1:]))
                   + f"; total {marks[-1][1] - marks[0][1]:.1f}s", flush=True)
+        if self._traced is not None:
+            print(f"[warm-trace] r{rank} kernels first loaded by stage: "
+                  + ", ".join(f"{name} {len(keys)}" for name, keys in self._traced.items()), flush=True)
 
     def _attach_disk(self, engram: Path) -> None:
         """Both ranks: this build's directory of the NVMe tier indexed (``reconcile``), the entry layout checked
@@ -469,6 +547,10 @@ class Dsv41Engine:
         if hasattr(self, "_boot"):
             self.torch.cuda.synchronize()
             self._boot.append((stage, time.perf_counter()))
+        if getattr(self, "_traced", None) is not None:  # (TF_DSV41_WARM_TRACE) the kernels this stage loaded first
+            from tensorfold.cuda import late_kernels
+
+            self._traced.setdefault(stage, []).extend(late_kernels.take())
 
     def _memlog(self, stage: str) -> None:
         """TF_DSV41_MEMLOG=1: what the system and the CUDA allocator hold at a startup stage (both ranks)."""
@@ -605,41 +687,66 @@ class Dsv41Engine:
         decoding while others fill, a sampled reply. Nothing of it stays: its kept states are dropped (not written
         to the NVMe tier) and the decoder's counters restored."""
 
-        import random
+        import hashlib
 
+        from tensorfold.cuda import late_kernels
         from tensorfold.cuda.streams import Stream
         from tensorfold.engine.exact_sampling import Sampling
 
+        from .multi import EVICT
+
         m = self.multi
+        mode = warm_serving_mode()
+        trace = self._traced is not None
         t = time.perf_counter()
         disk, stats = m.disk, dict(m.kstats)
         m.disk = None
+        late_kernels.take()                              # (the stages before: their own marks)
+        loaded: list[str] = []
         if self.rank == 1:
             m.follow()                                   # until rank 0 sends the empty message
         else:
-            rng = random.Random(0)
-
-            def ids(n: int) -> list[int]:
-                return [rng.randrange(1000, 100000) for _ in range(n)]
-
-            doc = ids(3000)
-            waves = [[ids(n)] for n in (1, 7, 16, 100, 2048, 2048 + 33, 2048 + 48)]
-            waves += [[doc], [doc + ids(40)], [doc + ids(2100)], [ids(500), ids(2600), ids(5000)]]
-            waves = [[Stream(p, 12) for p in wave] for wave in waves]
-            waves.append([Stream(ids(300), 12, Sampling(7, 0.7, 20, 0.95, 0.0))])
-            for wave in waves:
+            for i, phase in enumerate(("trim", "full") if mode == "audit" else (mode,)):
+                if i:                                    # (audit) full from a clean pool: nothing of trim's to resume
+                    for k in list(m.kept):
+                        m._send([EVICT, k.kid])
+                        m._drop(k, spill=False)
+                    mark = len(loaded)
+                for label, specs in serving_waves(phase):
+                    t0 = time.perf_counter()
+                    wave = [Stream(p, n, Sampling(7, 0.7, 20, 0.95, 0.0) if sampled else None)
+                            for p, n, sampled in specs]
+                    m.reset_policy()
+                    for s in wave:
+                        m.admit(s)
+                    while not all(s.done for s in wave):
+                        m.finish(m.round())
+                    m.finish([s for s in wave if s.sid in m.streams or s in m.filling])
+                    if trace:
+                        self.torch.cuda.synchronize()
+                        keys = late_kernels.take()
+                        loaded += keys
+                        print(f"[warm-trace] {phase} wave {label}: {time.perf_counter() - t0:.1f}s, {len(keys)} first "
+                              f"loads" + (": " + " ".join(keys) if keys else ""), flush=True)
+            if mode == "audit":
+                miss = loaded[mark:]
+                print(f"[warm-trace] audit: {len(miss)} kernels only the full battery loads"
+                      + (": " + " ".join(miss) if miss else ""), flush=True)
+            if mode != "full":                           # the first request plans from the start estimate
                 m.reset_policy()
-                for s in wave:
-                    m.admit(s)
-                while not all(s.done for s in wave):
-                    m.finish(m.round())
-                m.finish([s for s in wave if s.sid in m.streams or s in m.filling])
             self._share([])                              # rank 1 leaves ``follow``
         for k in list(m.kept):
             m._drop(k, spill=False)
         m.disk, m.kstats = disk, stats
+        if trace:
+            loaded += late_kernels.take()
+            self._traced["serving warm-up"] = loaded
+            digest = hashlib.sha256(" ".join(sorted(loaded)).encode()).hexdigest()[:12]
+            print(f"[warm-trace] r{self.rank} serving warm-up ({mode}): {len(loaded)} kernels first loaded, set "
+                  f"{digest}" + (": " + " ".join(sorted(loaded)) if loaded else ""), flush=True)
         if self.rank == 0:
-            print(f"[tensorfold] serving paths warmed in {time.perf_counter() - t:.1f}s", flush=True)
+            print(f"[tensorfold] serving paths warmed in {time.perf_counter() - t:.1f}s ({mode})" if mode != "full"
+                  else f"[tensorfold] serving paths warmed in {time.perf_counter() - t:.1f}s", flush=True)
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, draft: bool, stop_eos: bool, on_tokens,
              constraint=None) -> dict:
