@@ -1065,11 +1065,11 @@ def mode_jaybench(eng, nccl, args, env) -> SU.Result:
         raise SystemExit(f"--jaybench: unknown workloads {bad} (of {', '.join(JAYBENCH)})")
     tok = Tokenizer.from_file(str(args.model / "tokenizer.json"))
     tmpl = ChatTemplate(args.model)
-    one = _one_exchange(nccl, args.rank)
+    exchange = _one_exchange(nccl, args.rank)          # (not ``one``: the workload runner below is ``one``)
 
     def share(values):
-        if one is not None:
-            return one.share(values)
+        if exchange is not None:
+            return exchange.share(values)
         n = torch.tensor([len(values) if args.rank == 0 else 0], dtype=torch.int64, device="cuda")
         got = torch.empty((2,), dtype=torch.int64, device="cuda")
         nccl.all_gather(n, got)
