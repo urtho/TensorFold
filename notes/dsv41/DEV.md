@@ -103,6 +103,24 @@ verified rows. Measured 2026-10-06 (the draft policy below, no L2 prefetch):
 The window graph is ~89% of a round, the drafter ~10%, host and sync ~1%. Windows at 2048 tokens: 1 / 2 / 4 / 6 rows
 25.2 / 29.9 / 37.9 / 48.5 ms; drafter graph 5.1 ms.
 
+Two switches for the round's communication (both off by default; exact):
+
+- `TF_RDMA_TRACE=1024` stamps every RoCE gather's phases (`gather.cu`: %globaltimer at start, staged, doorbell rung,
+  peer flag seen, copied out, end; `rdma_proxy.c`: CLOCK_REALTIME at doorbell seen, writes posted, flag write acked).
+  `--decode-bench` then prints on both ranks (rank 1 in its log) one `gather trace (us)` line per timed loop
+  (`L=2048 x1`, `L=2048 R=4`, ...): medians of stage (start to doorbell), wait (doorbell to the peer's flag: the proxy,
+  the wire and the peer's lateness; the rank that waits less is the later one), copy, tail, total, p90 total, max wait,
+  and the proxy's post / ack. `TF_RDMA_TRACE_OUT=/tf/out/trace` also writes the raw rings. Without it the kernel is the
+  one before (the same SASS).
+- `TF_DSV41_SEND=one` (`share.py`, both ranks; checked at start): a message to rank 1 is one 64-word exchange from a
+  ring of 4 pinned buffers, without rank 0's host sync (messages of 64+ values add the default's second exchange).
+  `TF_ROUND_PROF`'s send should drop from ~0.3-0.4 ms to under 0.1 ms; the replies and round counts stay the same.
+
+    TF_COMM=rdma TF_RDMA_TRACE=1024 TF_DECODE_ROWS=1,2,4,6 tools/dsv41_run2.sh --cap 131072 --slots 2 --dspark 5 \
+      --graph --decode-bench 2048,32768
+    TF_COMM=rdma TF_ROUND_PROF=1 TF_DSV41_SEND=one tools/dsv41_run2.sh --cap 131072 --slots 2 --dspark 5 --graph \
+      --jaybench code,prose,structured --jb-serial
+
 Draft policy (`multi.py`): each request's acceptance estimates start at `TF_DSV41_DRAFT_PRIOR` (0.8), and a stream that
 stopped drafting drifts back toward it (`TF_DSV41_DRAFT_RELAX`, 0.02 a round without drafts: its estimates only move in
 drafted rounds, so before this a stream that stopped never drafted again). `TF_DSV41_DRAFT_RESET=0` carries the running

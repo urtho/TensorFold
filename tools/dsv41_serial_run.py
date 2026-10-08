@@ -595,12 +595,43 @@ def mode_quality(eng, nccl, args, env) -> SU.Result:
     return SU.Result(name, status, facts, "; ".join(notes), metrics)
 
 
+def _one_exchange(nccl, rank: int):
+    """TF_DSV41_SEND=one: the engine's one-exchange messages (``share.OneExchange``) for the tool's ``share``, else
+    None (the two blocking exchanges below, as ``Dsv41Engine._share`` sends them by default)."""
+
+    if (os.environ.get("TF_DSV41_SEND") or "two") != "one":
+        return None
+    from tensorfold.families.deepseek_v41.cuda.share import OneExchange
+
+    return OneExchange(nccl, rank)
+
+
+def _rdma_tracer(nccl):
+    """The RoCE gather with its TF_RDMA_TRACE rings, else None."""
+
+    rd = getattr(nccl, "rdma", None)
+    return rd if rd is not None and getattr(rd, "trace", None) is not None else None
+
+
+def _trace_report(tr, since: int, label: str, rank: int) -> None:
+    """TF_RDMA_TRACE: the gathers' phase medians since ``since`` on this rank (both ranks print: the rank that waits
+    less is the later one); TF_RDMA_TRACE_OUT=prefix also writes the raw rings to prefix.r<rank>.<label>.json."""
+
+    st = tr.trace_stats(since)
+    body = ", ".join(f"{k} {v:.0f}" if k in ("gathers", "polls") else f"{k} {v:.2f}" for k, v in st.items())
+    print(f"{'' if rank == 0 else '[rank 1] '}decode-bench {label}: gather trace (us) {body}", flush=True)
+    out = os.environ.get("TF_RDMA_TRACE_OUT")
+    if out:
+        tr.trace_dump(f"{out}.r{rank}.{label.replace(' ', '.').replace('=', '')}.json")
+
+
 def mode_decode_bench(eng, nccl, args, env) -> SU.Result:
     """Decode speed at a context length, 1..slots streams."""
 
     base = golden_ids()
     S = args.slots
     facts, metrics = {}, {"ms": {}, "prefill_tps": {}}
+    tracer = _rdma_tracer(nccl)
     with torch.no_grad():
         for rows in range(1, S + 1):
             if rows not in eng.graphs:
@@ -639,6 +670,7 @@ def mode_decode_bench(eng, nccl, args, env) -> SU.Result:
                     if i == warm:
                         nccl.barrier()
                         torch.cuda.synchronize()
+                        since = tracer.trace_seq() if tracer is not None else 0
                         t = time.perf_counter()
                     if n_streams == 1:
                         eng.select_slot(0)
@@ -647,6 +679,8 @@ def mode_decode_bench(eng, nccl, args, env) -> SU.Result:
                         _, pend = eng.step_multi([(s_, pend[s_]) for s_ in range(n_streams)])
                 torch.cuda.synchronize()
                 dt = time.perf_counter() - t
+                if tracer is not None:
+                    _trace_report(tracer, since, f"L={L} x{n_streams}", args.rank)
                 if os.environ.get("TF_DECODE_PROF") and n_streams == 1:   # the step's kernels at this context
                     from torch.profiler import ProfilerActivity, profile
 
@@ -680,6 +714,7 @@ def mode_decode_bench(eng, nccl, args, env) -> SU.Result:
                             vstep()
                         nccl.barrier()
                         torch.cuda.synchronize()
+                        since = tracer.trace_seq() if tracer is not None else 0
                         t = time.perf_counter()
                         for _ in range(32):
                             vstep()
@@ -687,6 +722,8 @@ def mode_decode_bench(eng, nccl, args, env) -> SU.Result:
                         vms = (time.perf_counter() - t) / 32 * 1e3
                         if args.rank == 0:
                             print(f"decode-bench L={L}: verify R={R}: {vms:.2f} ms a step", flush=True)
+                        if tracer is not None:
+                            _trace_report(tracer, since, f"L={L} R={R}", args.rank)
                         if os.environ.get("TF_DECODE_PROF"):
                             with profile(activities=[ProfilerActivity.CUDA]) as prof:
                                 for _ in range(8):
@@ -1028,8 +1065,11 @@ def mode_jaybench(eng, nccl, args, env) -> SU.Result:
         raise SystemExit(f"--jaybench: unknown workloads {bad} (of {', '.join(JAYBENCH)})")
     tok = Tokenizer.from_file(str(args.model / "tokenizer.json"))
     tmpl = ChatTemplate(args.model)
+    one = _one_exchange(nccl, args.rank)
 
     def share(values):
+        if one is not None:
+            return one.share(values)
         n = torch.tensor([len(values) if args.rank == 0 else 0], dtype=torch.int64, device="cuda")
         got = torch.empty((2,), dtype=torch.int64, device="cuda")
         nccl.all_gather(n, got)
@@ -1284,8 +1324,11 @@ def main() -> None:
 
         base = golden_ids()
         doc = (base * (1 + args.step_len // len(base)))[:args.step_len]
+        one = _one_exchange(nccl, args.rank)
 
         def share(values):
+            if one is not None:
+                return one.share(values)
             n = torch.tensor([len(values) if args.rank == 0 else 0], dtype=torch.int64, device="cuda")
             got = torch.empty((2,), dtype=torch.int64, device="cuda")
             nccl.all_gather(n, got)

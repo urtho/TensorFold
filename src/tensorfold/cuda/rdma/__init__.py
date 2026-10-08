@@ -11,6 +11,10 @@ b12x/comm/roce/ at commit 8a99d639410e; Apache License 2.0, Luke Alonso and the 
 MiaAI-Lab's GLM-5.3-Flash TensorFold recipe (patch 0006-cuda-roce-allgather, roce.py; Apache License 2.0, Copyright
 2026 MiaAI-Lab). Reduced to two ranks and one QP; the NCCL_IB_HCA parse, the NCCL fall-through and the connect error
 follow that port.
+
+TF_RDMA_TRACE=N (a power of two; off by default): each gather's phases stamped into rings of N entries, the kernel's
+in %globaltimer ns (``gather.cu``), the proxy's in CLOCK_REALTIME ns (``rdma_proxy.c``); ``RdmaGather.trace_stats``
+reads them as per-phase medians (``tools/dsv41_serial_run.py --decode-bench`` prints them on both ranks).
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ HERE = Path(__file__).parent
 SLOT_ALIGN = 4096
 INFO_WORDS = 7                       # tf_rdma_info: qpn, psn, rkey, addr, mtu, gid_hi, gid_lo
 SPIN = 20_000_000                    # flag polls before a wait gives up (~20 s): the peer died or never sent
+TRACE = int(os.environ.get("TF_RDMA_TRACE") or 0)       # trace ring entries (0: off)
 _LOCK = threading.Lock()
 
 
@@ -60,10 +65,11 @@ def proxy() -> ctypes.CDLL:
                             ("tf_rdma_local", None, [vp, ctypes.POINTER(u64)]),
                             ("tf_rdma_connect", i, [vp, ctypes.POINTER(u64)]), ("tf_rdma_start", i, [vp]),
                             ("tf_rdma_failed", i, [vp]), ("tf_rdma_error", ctypes.c_char_p, [vp]),
-                            ("tf_rdma_counter", u64, [vp, i]), ("tf_rdma_destroy", None, [vp])):
+                            ("tf_rdma_counter", u64, [vp, i]), ("tf_rdma_destroy", None, [vp]),
+                            ("tf_rdma_trace", None, [vp, vp, u64])):
         fn = getattr(lib, name)
         fn.restype, fn.argtypes = res, args
-    if lib.tf_rdma_abi() != 1:
+    if lib.tf_rdma_abi() != 2:
         raise RuntimeError("unexpected RoCE proxy ABI")
     return lib
 
@@ -72,7 +78,7 @@ def proxy() -> ctypes.CDLL:
 def _ext():
     from tensorfold.cuda.build import load
 
-    return load("tensorfold_rdma_gather_v2", [str(HERE / "gather.cpp"), str(HERE / "gather.cu")],
+    return load("tensorfold_rdma_gather_v3", [str(HERE / "gather.cpp"), str(HERE / "gather.cu")],
                 extra_cuda_cflags=["-O3"])
 
 
@@ -174,6 +180,12 @@ class RdmaGather:
         self.region, self.host = _region(total)                               # ctrl and flags start at 0
         self.ctrl = self.region[:64].view(torch.int32).numpy()
         self.state = torch.zeros(4, dtype=torch.int32, device="cuda")          # epoch, arrivals, departures, stopped
+        self.trace = self.ptrace = None
+        if TRACE:                                        # (gather.cu / rdma_proxy.c list the entries' words)
+            if TRACE & (TRACE - 1):
+                raise ValueError(f"TF_RDMA_TRACE={TRACE}: a power of two (the ring's entries)")
+            self.trace = torch.zeros((TRACE, 8), dtype=torch.int64, device="cuda")
+            self.ptrace = torch.zeros((TRACE, 4), dtype=torch.int64)
         self.device = _device()
         err = ctypes.create_string_buffer(256)
         try:
@@ -200,6 +212,8 @@ class RdmaGather:
             self.close()
             raise RuntimeError(f"RoCE all-gather setup failed on a rank: {why}")
         _ext()                                           # build the kernel before the connection's verdict
+        if self.ptrace is not None:
+            lib.tf_rdma_trace(self.ctx, ctypes.c_void_p(self.ptrace.data_ptr()), TRACE)
         peer = rows[1 - rank, :INFO_WORDS].tolist()
         words = (ctypes.c_uint64 * INFO_WORDS)(*[v & 0xFFFFFFFFFFFFFFFF for v in peer])
         ok = lib.tf_rdma_connect(self.ctx, words) == 0 and lib.tf_rdma_start(self.ctx) == 0
@@ -219,9 +233,32 @@ class RdmaGather:
 
     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
         _ext().gather(send, recv, self.region.data_ptr(), self.flag_off, self.send_off, self.recv_off, self.slot_bytes,
-                      self.state, SPIN, self.rank)
+                      self.state, SPIN, self.rank, 0 if self.trace is None else self.trace.data_ptr(), max(TRACE - 1, 0))
         if not torch.cuda.is_current_stream_capturing():
             self.check()
+
+    def trace_seq(self) -> int:
+        """The last completed gather's sequence number (syncs): the start of a ``trace_stats`` window."""
+
+        return int(self.state[0].item())
+
+    def trace_stats(self, since: int) -> dict[str, float] | None:
+        """Per-phase medians of the gathers after ``since`` (TF_RDMA_TRACE; None: off), see ``trace_phases``."""
+
+        if self.trace is None:
+            return None
+        torch.cuda.synchronize()
+        return trace_phases(self.trace.cpu().tolist(), self.ptrace.tolist(), since, self.trace_seq())
+
+    def trace_dump(self, path) -> None:
+        """Both raw rings as JSON (TF_RDMA_TRACE)."""
+
+        import json
+
+        if self.trace is not None:
+            torch.cuda.synchronize()
+            Path(path).write_text(json.dumps({"rank": self.rank, "gpu": self.trace.cpu().tolist(),
+                                              "proxy": self.ptrace.tolist()}))
 
     def check(self) -> None:
         """Raise if a GPU wait gave up (ctrl[4]) or the proxy thread failed (ctrl[3])."""
@@ -236,6 +273,44 @@ class RdmaGather:
         if getattr(self, "ctx", None):
             self.lib.tf_rdma_destroy(self.ctx)
             self.ctx = None
+
+
+def _median(xs: list[float]) -> float:
+    xs = sorted(xs)
+    n = len(xs)
+    return (xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2) if n else float("nan")
+
+
+def trace_phases(gpu: list[list[int]], proxy_ring: list[list[int]], first: int, last: int) -> dict[str, float]:
+    """Median us of each phase over the gathers with first < seq <= last whose entries are whole (the ring's latest
+    lap only). gpu entries: seq, start, staged, rung, flag, copied, end, polls (``gather.cu``); proxy: seq, seen,
+    posted, completed (``rdma_proxy.c``). stage = start..rung (the local shard staged, fences, doorbell); wait =
+    rung..flag (the proxy, the wire and the peer's lateness: the rank that waits less is the later one; below 0 when
+    the peer's flag was in before another block rang); copy = flag..copied (block 0's copy-out); tail = copied..end;
+    post = seen..posted and ack = posted..completed on the proxy (a write's round trip). ``p90_total`` and
+    ``max_wait`` show the outliers."""
+
+    mask = len(gpu) - 1
+    rows = [gpu[q & mask] for q in range(max(first + 1, last - mask), last + 1)]
+    rows = [r for r in rows if r[0] > first and 0 < r[1] <= r[2] <= r[3] and r[2] <= r[4] <= r[5] <= r[6]]
+    out: dict[str, float] = {"gathers": float(len(rows))}
+    if not rows:
+        return out
+    us = 1e-3
+    for name, a, b in (("stage", 1, 3), ("wait", 3, 4), ("copy", 4, 5), ("tail", 5, 6), ("total", 1, 6)):
+        out[name] = _median([(r[b] - r[a]) * us for r in rows])
+    totals = sorted((r[6] - r[1]) * us for r in rows)
+    out["p90_total"] = totals[min(len(totals) - 1, int(0.9 * len(totals)))]
+    out["max_wait"] = max((r[4] - r[3]) * us for r in rows)
+    out["polls"] = _median([float(r[7]) for r in rows])
+    pmask = len(proxy_ring) - 1 if proxy_ring else 0
+    seqs = {r[0] for r in rows}
+    prox = [proxy_ring[q & pmask] for q in seqs] if proxy_ring else []
+    prox = [p for p in prox if p[0] in seqs and 0 < p[1] <= p[2] <= p[3]]
+    if prox:
+        out["post"] = _median([(p[2] - p[1]) * us for p in prox])
+        out["ack"] = _median([(p[3] - p[2]) * us for p in prox])
+    return out
 
 
 class RdmaComm:

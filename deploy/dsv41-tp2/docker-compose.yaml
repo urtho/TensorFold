@@ -83,6 +83,10 @@ services:
       # off (0.3); neither enters the calibration cache's key
       TF_MULTI_COPY: ${TF_MULTI_COPY:-}
       TF_MULTI_COPY_MIN: ${TF_MULTI_COPY_MIN:-}
+      # rank 0's messages to rank 1 in one exchange without a host sync (one) or two blocking ones (empty: two);
+      # the RoCE gathers' phase trace (ring entries, a power of two; empty: off)
+      TF_DSV41_SEND: ${TF_DSV41_SEND:-}
+      TF_RDMA_TRACE: ${TF_RDMA_TRACE:-}
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       TF_DSV41_PREPARED: /prepared                       # read the prepared folder when current (fastboot)
       # the NVMe tier of kept prompts: off unless set (/kvdisk); budget (128 GiB), smallest state written (2048

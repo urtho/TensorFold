@@ -320,7 +320,9 @@ structured 119.31 -> 124.85, c1 106.67 -> 109.60, hard 50.70 -> 53.01 tok/s.
 - [ ] Draft policy: 6-row windows (48.5 ms) vs 4 rows (37.9): a per-k cost model with the drafter's 5 ms and the
       relax / prior under concurrent load (16 clients) not swept
 - [ ] jayleaton's 1-row window 21.7 ms vs ours 24.1 with pacing: his remaining levers (BRANCHES side priority,
-      ROCE_FAST, plan link) not ported
+      ROCE_FAST, plan link) not ported. Landed off, A/B pending (DEV.md): the gather phase trace (`TF_RDMA_TRACE`,
+      the go / no-go for a lean gather: >= 2 us kernel overhead at R=1 or >= 5 us copy-out at R=6) and the
+      one-exchange ROUND send (`TF_DSV41_SEND=one`, his plan link's idea)
 - [ ] Engine vs reference layer-diff (94.5% -> ~99% agreement)
 - [ ] Eager == graph per width
 - [ ] Mapped-table accounting in capacity
