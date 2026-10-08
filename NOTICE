@@ -30,3 +30,12 @@ Copyright 2025-2026 NVIDIA; Copyright 2023-2026 FlashInfer community
 src/tensorfold/families/deepseek_v41/cuda/mqa_fp4.cu adapts Apache-2.0 code of https://github.com/flashinfer-ai/flashinfer
 (csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv41_mixed_h32.cu, commit 2c1c0525, PR #5983); the file states what was
 changed.
+
+TensorFold fork, deepseek-v41-tp2 branch
+Copyright 2026 BertholomusAI (Albert Lee, https://github.com/bertholomus)
+src/tensorfold/families/deepseek_v41/cuda/markov.py adapts, and src/tensorfold/engine/call_gate.py (ThinkLoop) adapts,
+Apache-2.0 code of https://github.com/bertholomus/TensorFold (branch deepseek-v41-tp2, commits bd0024d and dfbe519);
+the kept-prompt trimming in multi.py, the candidate-only reindex (kernels.index_scores_cand, topk MODE 3), the
+prompt-chunk work list (serial.work_list, experts_prompt.cu) and the RoCE gather's registered host memory and
+single fence a block (cuda/rdma) follow ideas of its v0.4 / v0.5 releases, written for this engine. Each file states
+what was changed.

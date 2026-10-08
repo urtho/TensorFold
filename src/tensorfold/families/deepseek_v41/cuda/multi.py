@@ -55,6 +55,13 @@ DRAFT_PRIOR = float(os.environ.get("TF_DSV41_DRAFT_PRIOR") or 0.8)
 # 2026-10-06, single requests (tools/dsv41_serial_run.py --jaybench): prior 0.6 without it (the old start) code 78.0,
 # prose 40.4, structured 109.1, c1 98.7 tok/s; 0.8 + 0.02: 77.3-79.8 / 42.3 / 114.0 / 99.5, hard 38.9 -> 47.4
 DRAFT_RELAX = float(os.environ.get("TF_DSV41_DRAFT_RELAX") or 0.02)
+# a prompt of KEEP_SHRINK_MIN tokens or more is also kept at 3/4 and 7/8 of its length (exact states), and room is made
+# by dropping loose extents' longest kept states before whole extents are evicted (``_trim``): a long document's
+# prefix stays resumable when the pool needs its tail. Policy after bertholomus/TensorFold v0.5 (508bfb3, kept prompts
+# shrink to a 3/4 or 7/8 boundary; Apache License 2.0, Copyright 2026 BertholomusAI); done here with this engine's
+# several kept states an extent and ``_settle``. TF_DSV41_KEEP_SHRINK=0: off
+KEEP_SHRINK = os.environ.get("TF_DSV41_KEEP_SHRINK", "1") != "0"
+KEEP_SHRINK_MIN = int(os.environ.get("TF_DSV41_KEEP_SHRINK_MIN") or 131072)
 
 
 @dataclass(eq=False)
@@ -543,6 +550,12 @@ class MultiDecoder:
             self._resize(s.sid, size)
             return True
         base = self.pool.place(size, ignore=[x])
+        if base is None and self._trim(size, keep_out=[x], free=[x]):
+            if size - x.size <= self.pool.room_after(x):
+                self._send([GROW, s.sid, size])
+                self._resize(s.sid, size)
+                return True
+            base = self.pool.place(size, ignore=[x])
         if base is None:                           # kept states' extents out of the way, the fewest that do
             order = {id(k): i for i, k in enumerate(self.kept)}
             loose = [y for y in self.pool.extents if y.owner is None and y.kept]
@@ -639,6 +652,8 @@ class MultiDecoder:
         from tensorfold.cuda.memory_gate import NoRoom
 
         base = self.pool.place(size)
+        if base is None and self._trim(size, keep_out=protect):
+            base = self.pool.place(size)
         if base is not None:
             return base
         # whole extents of kept states only (dropping a shorter state beside a longer one frees nothing), least
@@ -659,6 +674,35 @@ class MultiDecoder:
                 break
         raise NoRoom(f"the shared cache pool has no {size}-token extent free ({self.pool.free_rows()} of "
                      f"{self.pool.rows} tokens free, largest run {self.pool.largest_gap()})")
+
+    def _trim(self, size: int, keep_out: list, free: list = ()) -> bool:
+        """Rank 0, before whole kept extents are evicted: drop the longest kept states of loose extents (least
+        recently used first, each keeping its shortest; none of ``keep_out``), whose rows ``_settle`` then frees,
+        the fewest until a ``size``-row run opens (``free``: extents that count as free); True when it did. The
+        dropped states go to the NVMe tier as evicted ones do."""
+
+        from .pool import align_up
+
+        if not KEEP_SHRINK:
+            return False
+        order = {id(k): i for i, k in enumerate(self.kept)}
+        out = {id(y) for y in keep_out}
+        loose = [y for y in self.pool.extents if y.owner is None and len(y.kept) > 1 and id(y) not in out]
+        loose.sort(key=lambda y: max(order[id(k)] for k in y.kept))
+        sizes: dict[int, int] = {}
+        plan: list[Kept] = []
+        for y in loose:
+            ks = sorted(y.kept, key=lambda k: -k.n)
+            for j in range(1, len(ks)):
+                plan.append(ks[j - 1])
+                sizes[id(y)] = align_up(ks[j].n)
+                if self.pool.place(size, ignore=free, sizes=sizes) is not None:
+                    for k in plan:
+                        self._send([EVICT, k.kid])
+                        self._drop(k)
+                        self.kstats["trimmed"] = self.kstats.get("trimmed", 0) + 1
+                    return True
+        return False
 
     def _keep(self, s: Stream, x, ids: list[int], vs: int) -> None:
         """Keep stream ``s``'s state of ``ids`` (extent ``x``'s first rows, its slot's rings) as a kept prompt."""
@@ -893,17 +937,21 @@ class MultiDecoder:
                 s.pos, s.cached = cached, cached
             stop = min(n, s.pos + rows)
             # kept at the prompt's end and, for prompts that will share less, at its last chunk start (a long
-            # document asked a long new question resumes there)
-            point = (n - 1) // MAX_ROWS * MAX_ROWS
+            # document asked a long new question resumes there); long prompts also at 3/4 and 7/8 (``_trim``)
             keep = self.kept_on and s.draft
-            split = (keep and point >= KEEP_MIN and s.cached < point < n - (DRING - WINDOW_ROWS)
-                     and s.pos + ROWS < point < stop)        # (no <= ROWS-row call before it: prompt arithmetic)
-            if split:
-                stop = point
-            # (a split call bounds its early chunks by the split point: the state kept there is exact in every layer)
-            logits = e.prefill(s.prompt[s.pos:stop], final=point if split else n)
+            points = [(n - 1) // MAX_ROWS * MAX_ROWS]
+            if KEEP_SHRINK and n >= KEEP_SHRINK_MIN:
+                points += [n * a // b // MAX_ROWS * MAX_ROWS for a, b in ((3, 4), (7, 8))]
+            points = sorted({p for p in points if keep and p >= KEEP_MIN and s.cached < p < n - (DRING - WINDOW_ROWS)})
+            # (no <= ROWS-row call before a split: prompt arithmetic)
+            split = next((p for p in points if s.pos + ROWS < p < stop), None)
+            if split is not None:
+                stop = split
+            # a call bounds its chunks by the next kept point at or after its end, so the state kept there is exact in
+            # every layer (rows' values do not depend on it: the deep layers keep only their windows)
+            logits = e.prefill(s.prompt[s.pos:stop], final=next((p for p in points if p >= stop), n))
             s.pos = stop
-            if split:
+            if split is not None:
                 self._keep(s, self.ext[s.sid], e.state.ids, e.ring_from[s.slot])
             if stop < n:
                 return None

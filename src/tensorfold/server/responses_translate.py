@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 # fields a chat completion reads as they are: OpenAI's and this server's own (top_k, min_p, seed, draft, ...)
 PASSED = ("model", "temperature", "top_p", "top_k", "min_p", "seed", "stream", "parallel_tool_calls", "stop", "draft",
-          "thinking_budget", "ignore_eos", "priority", "return_token_ids", "chat_template_kwargs")
+          "loop_guard", "thinking_budget", "ignore_eos", "priority", "return_token_ids", "chat_template_kwargs")
 REFUSED = {"background": "background responses are not supported: send the request and wait for it",
            "conversation": "conversations are not supported: send previous_response_id or the items",
            "prompt": "prompt templates are not supported: send input and instructions",

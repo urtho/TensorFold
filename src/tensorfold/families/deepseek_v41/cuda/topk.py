@@ -45,12 +45,17 @@ def _topk(S, POS, FLAGS, OUT, FLAGS_OUT, s_stride, f_stride, o_stride, n_keys, r
           MODE: tl.constexpr, BS: tl.constexpr):
     """MODE 0: entries of S (row r, n_keys of them, visible below (pos + 1) // ratio). MODE 1: the same, kept only
     in blocks FLAGS marks. MODE 2: candidate blocks: S holds block maxima (n_keys blocks of ``block`` entries; the
-    newest visible block is pinned), writes FLAGS_OUT [r, block] = 1 for the chosen ones (0 below ``nb_out``)."""
+    newest visible block is pinned), writes FLAGS_OUT [r, block] = 1 for the chosen ones (0 below ``nb_out``).
+    MODE 3: MODE 1 over a compact row: S holds n_keys lanes, lane j entry FLAGS[r, j // block] * block + j % block
+    (FLAGS: int32 block ids, ascending, -1 padded; invisible lanes -inf), untied and written by that entry index:
+    the same lanes in the same order as MODE 1 visits the flagged entries, so the same choice."""
 
     r = tl.program_id(0)
     p = tl.load(POS + r)
     nvis = (p + 1) // ratio
-    if MODE == 2:
+    if MODE == 3:
+        n = n_keys
+    elif MODE == 2:
         n = tl.minimum(n_keys, (nvis + block - 1) // block)
         newest = tl.maximum(nvis - 1, 0) // block
         n = tl.maximum(n, tl.minimum(newest + 1, n_keys))
@@ -69,7 +74,11 @@ def _topk(S, POS, FLAGS, OUT, FLAGS_OUT, s_stride, f_stride, o_stride, n_keys, r
             i = b0 + offs
             inb = i < n
             s = tl.load(row + i, mask=inb, other=float("-inf"))
-            v = _untie(s, i)
+            if MODE == 3:
+                b = tl.load(FLAGS + r * f_stride + i // block, mask=inb, other=-1)
+                v = _untie(s, b * block + i % block)
+            else:
+                v = _untie(s, i)
             if MODE == 2:
                 v = tl.where(i == newest, float("inf"), v)
             ok = inb & (v != float("-inf"))
@@ -98,7 +107,11 @@ def _topk(S, POS, FLAGS, OUT, FLAGS_OUT, s_stride, f_stride, o_stride, n_keys, r
         i = b0 + offs
         inb = i < n
         s = tl.load(row + i, mask=inb, other=float("-inf"))
-        v = _untie(s, i)
+        e = i
+        if MODE == 3:
+            b = tl.load(FLAGS + r * f_stride + i // block, mask=inb, other=-1)
+            e = b * block + i % block
+        v = _untie(s, e)
         if MODE == 2:
             v = tl.where(i == newest, float("inf"), v)
         ok = inb & (v != float("-inf"))
@@ -113,7 +126,7 @@ def _topk(S, POS, FLAGS, OUT, FLAGS_OUT, s_stride, f_stride, o_stride, n_keys, r
         if MODE == 2:
             tl.store(FLAGS_OUT + r * nb_out + i, sel.to(tl.uint8), mask=inb)
         else:
-            tl.store(OUT + r * o_stride + at, i.to(tl.int32), mask=sel)
+            tl.store(OUT + r * o_stride + at, e.to(tl.int32), mask=sel)
         got += tl.sum(sel.to(tl.int32))
         eq += tl.sum(is_eq.to(tl.int32))
     if MODE == 2:
@@ -151,3 +164,27 @@ def candidate_flags(scores: torch.Tensor, pos: torch.Tensor, ratio: int, block: 
     _topk[(R,)](best, pos, flags, flags, flags, best.stride(0), 0, 0, nb, ratio, keep, block, nb, MODE=2, BS=BS,
                 num_warps=8)
     return flags
+
+
+def candidate_ids(flags: torch.Tensor, keep: int) -> torch.Tensor:
+    """int32 [R, keep]: the flagged blocks' ids ascending (``candidate_flags``' choice, at most ``keep`` a row), -1
+    padded. Graph-safe (a cumsum and a scatter: no count read on the host)."""
+
+    R, nb = flags.shape
+    at = torch.cumsum(flags, dim=1, dtype=torch.int32) - 1
+    slot = torch.where(flags != 0, at, keep).long()                   # unflagged: the spare last column
+    ids = torch.full((R, keep + 1), -1, dtype=torch.int32, device=flags.device)
+    ids.scatter_(1, slot, torch.arange(nb, dtype=torch.int32, device=flags.device).expand(R, nb))
+    return ids[:, :keep].contiguous()
+
+
+def top_entries_cand(scores: torch.Tensor, pos: torch.Tensor, ratio: int, topk: int, ids: torch.Tensor,
+                     block: int) -> torch.Tensor:
+    """``top_entries(full scores, flags=...)`` from the compact candidate scores (``kernels.index_scores_cand``):
+    int32 [R, topk] entry indices, ascending, -1 padded."""
+
+    R, C = scores.shape
+    out = torch.empty((R, topk), dtype=torch.int32, device=scores.device)
+    _topk[(R,)](scores, pos, ids, out, out, scores.stride(0), ids.stride(0), out.stride(0), C, ratio, topk, block, 0,
+                MODE=3, BS=BS, num_warps=8)
+    return out

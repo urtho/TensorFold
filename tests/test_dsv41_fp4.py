@@ -655,3 +655,42 @@ def test_kv_mode_defaults_to_fp4():
     assert kv_mode({"TF_DSV41_KV_FP8": "1"}) == "fp4"
     assert kv_mode({"TF_DSV41_KV_FP8": "0"}) == "bf16"
     assert kv_mode({"TF_DSV41_KV": "fp8", "TF_DSV41_KV_FP8": "0"}) == "fp8"
+
+
+@gpu
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_candidate_only_reindex_equals_the_masked_full_width(ratio):
+    """index_scores_cand + top_entries_cand (the layers after the candidate source score only its blocks) == the
+    full-width scores masked to the candidate flags (top_entries with flags): the same scores bit for bit at every
+    candidate entry and the same choice, for rows of several streams (key bases), rows short of the pool (every
+    visible block a candidate), and a row of exact-zero scores (ties untied by entry index)."""
+
+    K = _kernels()
+    from tensorfold.families.deepseek_v41.cuda import topk as TK
+
+    n_keys, block, keep, topk = 20000, 8, 2048, 512             # (> the 16,384-entry pool; 3 streams in _ik's table)
+    keys = _ik(K, 3 * n_keys, 31)
+    g = torch.Generator(device="cuda").manual_seed(5)
+    R = 9
+    kbase = torch.tensor([0, 0, 0, n_keys, n_keys, 2 * n_keys, 2 * n_keys, 2 * n_keys, 0], device="cuda")
+    vis = torch.tensor([19999, 20000, 16384, 19990, 3000, 17000, 19999, 100, 18000], device="cuda")
+    pos = vis * ratio - 1                                         # (pos + 1) // ratio == vis entries visible
+    def rows(scale):
+        iq = (torch.randn((R, 64, 128), generator=g, device="cuda") * scale).to(torch.bfloat16)
+        iq[8] = 0                                                 # every score exactly zero: untied by index
+        return iq, torch.randn((R, 64), generator=g, device="cuda")
+    iq_s, wts_s = rows(0.3)
+    src = K.index_scores(iq_s, wts_s, keys, pos, ratio, kbase=kbase, n_keys=n_keys, shared=True)
+    flags = TK.candidate_flags(src, pos, ratio, block, keep)
+    ids = TK.candidate_ids(flags, keep)
+    assert ids.shape == (R, keep) and bool((torch.diff(ids.long(), dim=1)[ids[:, 1:] >= 0] > 0).all())
+    iq, wts = rows(0.3)
+    full = K.index_scores(iq, wts, keys, pos, ratio, kbase=kbase, n_keys=n_keys, shared=True)
+    ref = TK.top_entries(full, pos, ratio, topk, flags=flags, block=block)
+    cs = K.index_scores_cand(iq, wts, keys, pos, ratio, ids, block, kbase, n_keys)
+    lane = torch.arange(keep * block, device="cuda")
+    entry = ids.long()[:, lane // block] * block + lane % block
+    live = (ids.long()[:, lane // block] >= 0) & (entry < n_keys) & (entry < vis[:, None])
+    assert torch.equal(cs[live], full.gather(1, entry.clamp(0, n_keys - 1))[live])
+    assert bool(torch.isinf(cs[~live]).all())
+    assert torch.equal(TK.top_entries_cand(cs, pos, ratio, topk, ids, block), ref)

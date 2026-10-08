@@ -63,10 +63,12 @@ class Pool:
         self.next_eid = 0
 
     # -- queries ---------------------------------------------------------------------------------------------
-    def gaps(self, ignore: Iterable[Extent] = ()) -> list[tuple[int, int]]:
-        """Free (base, size) runs, ascending; the extents in ``ignore`` count as free."""
+    def gaps(self, ignore: Iterable[Extent] = (), sizes: dict[int, int] | None = None) -> list[tuple[int, int]]:
+        """Free (base, size) runs, ascending; the extents in ``ignore`` count as free, and an extent whose id() is in
+        ``sizes`` as that many rows long (a trim being weighed)."""
 
         skip = {id(x) for x in ignore}
+        sizes = sizes or {}
         out: list[tuple[int, int]] = []
         at = 0
         for x in self.extents:
@@ -74,7 +76,7 @@ class Pool:
                 continue
             if x.base > at:
                 out.append((at, x.base - at))
-            at = max(at, x.end)
+            at = max(at, x.base + sizes.get(id(x), x.size))
         if at < self.rows:
             out.append((at, self.rows - at))
         merged: list[tuple[int, int]] = []
@@ -91,12 +93,12 @@ class Pool:
     def largest_gap(self) -> int:
         return max((size for _, size in self.gaps()), default=0)
 
-    def place(self, size: int, ignore: Iterable[Extent] = ()) -> int | None:
-        """The lowest base with ``size`` free rows (a multiple of ALIGN), or None."""
+    def place(self, size: int, ignore: Iterable[Extent] = (), sizes: dict[int, int] | None = None) -> int | None:
+        """The lowest base with ``size`` free rows (a multiple of ALIGN), or None (``ignore``, ``sizes``: as ``gaps``)."""
 
         if size <= 0 or size % ALIGN:
             raise ValueError(f"an extent of {size} rows: a positive multiple of {ALIGN}")
-        for base, room in self.gaps(ignore):
+        for base, room in self.gaps(ignore, sizes):
             if room >= size:
                 return base
         return None

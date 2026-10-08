@@ -775,6 +775,54 @@ def _index_scores_tile(IQ, WTS, KEYS, POS, OUT, n_keys, ratio, KBASE, KS, R, RB,
                 tl.store(OUT + r * n_keys + sidx, tl.full((BS,), float("-inf"), tl.float32), mask=sidx < n_keys)
 
 
+@triton.jit(do_not_specialize=["n_keys", "ratio", "n_ids", "c_stride"])
+def _index_scores_cand(IQ, WTS, KEYS, POS, IDS, OUT, n_keys, ratio, KBASE, KS, n_ids, c_stride, HI: tl.constexpr,
+                       DI: tl.constexpr, BS: tl.constexpr, BLK: tl.constexpr, HAS_BASE: tl.constexpr):
+    """Program (r, t): compact lanes t * BS .. of row r, lane j the entry i = IDS[r, j // BLK] * BLK + j % BLK (the
+    row's candidate blocks, ascending; -1: none). Exactly _index_scores_tile's per-entry math (the same [HI, BS] dot
+    of the row's q and the decoded keys, ReLU * weight summed over heads, num_warps 4): an entry's score does not
+    depend on the other columns of its tile, so it equals the full-width score bit for bit; -inf where there is no
+    block or the entry is not visible."""
+
+    r = tl.program_id(0)
+    t = tl.program_id(1)
+    n_vis = (tl.load(POS + r) + 1) // ratio
+    j = t * BS + tl.arange(0, BS)
+    blk = tl.load(IDS + r * n_ids + j // BLK, mask=j < n_ids * BLK, other=-1)
+    i = blk.to(tl.int64) * BLK + j % BLK
+    live = (blk >= 0) & (i < n_keys) & (i < n_vis)
+    if tl.max(live.to(tl.int32), axis=0) > 0:
+        h = tl.arange(0, HI)
+        d = tl.arange(0, DI)
+        kbase = tl.load(KBASE + r).to(tl.int64) if HAS_BASE else 0
+        q = tl.load(IQ + (r * HI + h[:, None]) * DI + d[None, :])
+        k = _fp4_rows(KEYS, KS, (kbase + i)[:, None], live[:, None], d, DI, 32, False).to(tl.bfloat16)
+        dots = tl.dot(q, tl.trans(k)).to(tl.float32)
+        w = tl.load(WTS + r * HI + h)
+        score = tl.sum(w[:, None] * tl.maximum(dots, 0.0), axis=0)
+        score = tl.where(live, score, float("-inf"))
+    else:
+        score = tl.full((BS,), float("-inf"), tl.float32)
+    tl.store(OUT + r * c_stride + j, score, mask=j < n_ids * BLK)
+
+
+def index_scores_cand(iq: torch.Tensor, wts: torch.Tensor, keys, pos: torch.Tensor, ratio: int, ids: torch.Tensor,
+                      block: int, kbase: torch.Tensor | None, n_keys: int) -> torch.Tensor:
+    """fp32 [R, ids.shape[1] * block]: ``index_scores`` (FP4 keys) of each row's candidate blocks' entries only
+    (``ids``: int32 [R, blocks], ascending, -1 padded), lane j holding entry ids[r, j // block] * block + j % block."""
+
+    R, HI, DI = iq.shape
+    nb = ids.shape[1]
+    C = nb * block
+    out = torch.empty((R, C), dtype=torch.float32, device=iq.device)
+    BS = 64
+    assert isinstance(keys, Fp4Rows) and BS % block == 0
+    _index_scores_cand[(R, triton.cdiv(C, BS))](iq.contiguous(), wts.contiguous(), keys.q, pos, ids, out, n_keys,
+                                                ratio, kbase if kbase is not None else pos, keys.s, nb, C, HI=HI,
+                                                DI=DI, BS=BS, BLK=block, HAS_BASE=kbase is not None, num_warps=4)
+    return out
+
+
 def index_scores(iq: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos: torch.Tensor, ratio: int,
                  kbase: torch.Tensor | None = None, n_keys: int | None = None, shared: bool | None = None) -> torch.Tensor:
     """fp32 [R, S] indexer scores over every compressed entry, -inf where not yet visible. ``kbase`` (decode rows of
@@ -1138,14 +1186,18 @@ def index_select(iq: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos: t
 
     return top_entries(index_scores(iq, wts, keys, pos, ratio), topk)
 
-@triton.jit
-def _route(L, BIAS, PICK, WTS, scale, E: tl.constexpr, EP: tl.constexpr, K: tl.constexpr, KP: tl.constexpr):
-    """sqrt(softplus) scores; the K best of score + bias (lowest id on ties); weights = scores renormalized x scale."""
+@triton.jit(do_not_specialize=["ns"])
+def _route(L, BIAS, PICK, WTS, scale, ns, E: tl.constexpr, EP: tl.constexpr, K: tl.constexpr, KP: tl.constexpr,
+           KS: tl.constexpr = 1):
+    """sqrt(softplus) scores; the K best of score + bias (lowest id on ties); weights = scores renormalized x scale.
+    KS > 1: L holds the router's K slices [KS, R, E] (``ns`` = R * E apart), added here in _sum_slices' order."""
 
     r = tl.program_id(0)
     e = tl.arange(0, EP)
     ok = e < E
     x = tl.load(L + r * E + e, mask=ok, other=0.0)
+    for s in tl.static_range(1, KS):
+        x += tl.load(L + s * ns + r * E + e, mask=ok, other=0.0)
     sp = tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(tl.minimum(x, 20.0))))
     sc = tl.sqrt(sp)
     choice = tl.where(ok, sc + tl.load(BIAS + e, mask=ok, other=0.0), float("-inf"))
@@ -1164,11 +1216,14 @@ def _route(L, BIAS, PICK, WTS, scale, E: tl.constexpr, EP: tl.constexpr, K: tl.c
 
 
 def route(logits: torch.Tensor, bias: torch.Tensor, k: int, scale: float) -> tuple[torch.Tensor, torch.Tensor]:
-    R, E = logits.shape
+    """``logits`` [R, E], or ``router_logits(..., parts=True)``'s [KS, R, E] slices (summed in the routing kernel)."""
+
+    KS = logits.shape[0] if logits.dim() == 3 else 1
+    R, E = logits.shape[-2:]
     pick = torch.empty((R, k), dtype=torch.int32, device=logits.device)
     wts = torch.empty((R, k), dtype=torch.float32, device=logits.device)
-    _route[(R,)](logits.contiguous(), bias, pick, wts, scale, E=E, EP=triton.next_power_of_2(E), K=k,
-                     KP=triton.next_power_of_2(k), num_warps=4)
+    _route[(R,)](logits.contiguous(), bias, pick, wts, scale, R * E, E=E, EP=triton.next_power_of_2(E), K=k,
+                 KP=triton.next_power_of_2(k), KS=KS, num_warps=4)
     return pick, wts
 
 
@@ -1186,7 +1241,7 @@ def _router_logits(X, W, OUT, R, E: tl.constexpr, D: tl.constexpr, BR: tl.conste
     k = tl.arange(0, BK)
     acc = tl.zeros((BR, BE), dtype=tl.float32)
     for k0 in range(ks * (D // KS), (ks + 1) * (D // KS), BK):
-        x = tl.load(X + r[:, None] * D + k0 + k[None, :], mask=(r < R)[:, None], other=0.0)
+        x = tl.load(X + r[:, None] * D + k0 + k[None, :], mask=(r < R)[:, None], other=0.0).to(tl.float16)
         w = tl.load(W + e[:, None] * D + k0 + k[None, :], mask=(e < E)[:, None], other=0.0)
         acc = tl.dot(x, tl.trans(w), acc)
     tl.store(OUT + (ks * R + r[:, None]) * E + e[None, :], acc, mask=(r < R)[:, None] & (e < E)[None, :])
@@ -1209,18 +1264,21 @@ def _sum_slices(P, OUT, n, KS: tl.constexpr, B: tl.constexpr):
 ROUTER_SLICES = int(__import__("os").environ.get("TF_ROUTER_SLICES") or 8)
 
 
-def router_logits(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """fp32 router logits; x bf16/fp16 [R, D] (bf16 -> fp16 exact for normed rows), w fp16 [E, D]."""
+def router_logits(x: torch.Tensor, w: torch.Tensor, parts: bool = False) -> torch.Tensor:
+    """fp32 router logits; x bf16/fp16 [R, D] (bf16 -> fp16 exact for normed rows, converted as loaded), w fp16
+    [E, D]. ``parts``: the K slices [KS, R, E] unsummed (``route`` adds them in the same order)."""
 
     R, D = x.shape
     E = w.shape[0]
     BR, BE, BK = 16, 32, 64
     KS = ROUTER_SLICES if D % (ROUTER_SLICES * BK) == 0 else 1
     part = torch.empty((KS, R, E), dtype=torch.float32, device=x.device)
-    _router_logits[(triton.cdiv(R, BR), triton.cdiv(E, BE), KS)](x.half().contiguous(), w, part, R, E=E, D=D, BR=BR,
+    _router_logits[(triton.cdiv(R, BR), triton.cdiv(E, BE), KS)](x.contiguous(), w, part, R, E=E, D=D, BR=BR,
                                                                  BE=BE, BK=BK, KS=KS, num_warps=4)
     if KS == 1:
         return part[0]
+    if parts:
+        return part
     out = torch.empty((R, E), dtype=torch.float32, device=x.device)
     _sum_slices[(triton.cdiv(R * E, 1024),)](part, out, R * E, KS=KS, B=1024, num_warps=4)
     return out

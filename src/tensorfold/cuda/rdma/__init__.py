@@ -72,7 +72,7 @@ def proxy() -> ctypes.CDLL:
 def _ext():
     from tensorfold.cuda.build import load
 
-    return load("tensorfold_rdma_gather_v1", [str(HERE / "gather.cpp"), str(HERE / "gather.cu")],
+    return load("tensorfold_rdma_gather_v2", [str(HERE / "gather.cpp"), str(HERE / "gather.cu")],
                 extra_cuda_cflags=["-O3"])
 
 
@@ -132,6 +132,33 @@ def gid_index(device: str, port: int = 1, root: str = "/sys/class/infiniband") -
                        "on its interface?); TF_RDMA_GID_INDEX names one")
 
 
+# TF_RDMA_HOST=register (default): the region is page-aligned anonymous memory, locked and registered with
+# cudaHostRegister. GB10's GPU reaches cudaHostAlloc memory (pin_memory) over an uncached path, registered memory
+# over the coherent cached one (measured by bertholomus/TensorFold bd0024d on 4 MB: loads 6.3 vs 20.4 us, stores 6.2
+# vs 20.7 us), so the gather's stage, flag polls and peer reads wait less behind DRAM traffic. pinned: pin_memory.
+HOST = os.environ.get("TF_RDMA_HOST") or "register"
+
+
+def _region(total: int) -> tuple[torch.Tensor, str]:
+    """The zeroed host region the kernel and the NIC share, and how it was made (``register`` or ``pinned``)."""
+
+    if HOST == "register":
+        import mmap
+
+        mem = mmap.mmap(-1, total, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+        region = torch.frombuffer(mem, dtype=torch.uint8)
+        ptr = region.data_ptr()
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mlock(ctypes.c_void_p(ptr), ctypes.c_size_t(total))         # (the NIC's registration pins it too)
+        if torch.cuda.cudart().cudaHostRegister(ptr, total, 3) == 0:      # Portable | Mapped
+            if _ext().device_pointer(ptr) == ptr:                           # the kernel takes the host address
+                region._tf_keep = mem                                       # the mapping lives as long as the tensor
+                return region, "register"
+            torch.cuda.cudart().cudaHostUnregister(ptr)
+        del region                                    # (the mapping is freed with its last export)
+    return torch.zeros(total, dtype=torch.uint8).pin_memory(), "pinned"
+
+
 class RdmaGather:
     """One rank's pinned region, queue pair and proxy thread; ``all_gather`` launches the gather kernel."""
 
@@ -144,7 +171,7 @@ class RdmaGather:
         lay = (ctypes.c_uint64 * 5)()
         lib.tf_rdma_layout(self.slot_bytes, lay)
         self.flag_off, self.send_off, self.recv_off, total = int(lay[1]), int(lay[2]), int(lay[3]), int(lay[4])
-        self.region = torch.zeros(total, dtype=torch.uint8).pin_memory()      # ctrl and flags start at 0
+        self.region, self.host = _region(total)                               # ctrl and flags start at 0
         self.ctrl = self.region[:64].view(torch.int32).numpy()
         self.state = torch.zeros(4, dtype=torch.int32, device="cuda")          # epoch, arrivals, departures, stopped
         self.device = _device()

@@ -136,6 +136,68 @@ class ThinkBudget:
         self.open = self.open and int(token) != self.think_end
 
 
+class ThinkLoop:
+    """The loop guard (opt-in): a reply still thinking whose ``windows`` windows of ``width`` tokens in a row each have
+    fewer than ``least`` new token ``n``-grams (8-grams no earlier window held) has its thinking closed after the
+    third: the close goes after that window's last token, and the reply goes on to its answer.
+
+    Adapted from bertholomus/TensorFold (deepseek-v41-tp2, commit dfbe519, ``ThinkLoop``; Apache License 2.0,
+    Copyright 2026 BertholomusAI). The signal (the share of new 8-grams a window, a loop after 3 dry windows under
+    2%) is Capicua25x's loop_detector.py (bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10 PR #9), after tonyd2wild's
+    DSpark recipe PR #29. Novelty counts a window's 8-gram positions (repeats inside it count as new); the first
+    window is all new, so the earliest cut ends the fourth window."""
+
+    def __init__(self, close: Sequence[int], think_end: int, width: int = 1024, n: int = 8, least: float = 0.02,
+                 windows: int = 3) -> None:
+        self.close, self.think_end = [int(t) for t in close], int(think_end)
+        self.width, self.n, self.least, self.windows = int(width), int(n), float(least), int(windows)
+        self.open = True
+        self.seen: set = set()                   # every earlier window's n-grams
+        self.tail: list[int] = []                # the n - 1 tokens before this window (n-grams across its edge)
+        self.win: list[int] = []                 # this window's tokens
+        self.dry = 0                             # windows in a row with less than ``least`` new
+        self.fired = False
+
+    def _novelty(self, toks: Sequence[int]) -> float:
+        seq = [*self.tail, *toks]
+        grams = [tuple(seq[j:j + self.n]) for j in range(len(seq) - self.n + 1)]
+        return sum(1 for g in grams if g not in self.seen) / max(1, len(grams))
+
+    def cut(self, tokens: Sequence[int]) -> tuple[int, list[int]] | None:
+        """(index in the next committed ``tokens`` the close goes at: after the window's last token, the close), as
+        ``CallGate.cut``."""
+
+        if not self.open:
+            return None
+        need = self.width - len(self.win)        # tokens until this window ends
+        for i, token in enumerate(tokens):
+            if int(token) == self.think_end:
+                return None
+            if i + 1 == need:
+                rest = [int(t) for t in tokens[:need]]
+                if self.dry + 1 >= self.windows and self._novelty([*self.win, *rest]) < self.least:
+                    return i + 1, list(self.close)
+                return None
+        return None
+
+    def observe(self, token: int) -> None:
+        if not self.open:
+            return
+        if int(token) == self.think_end:
+            self.open = False
+            return
+        self.win.append(int(token))
+        if len(self.win) < self.width:
+            return
+        nov = self._novelty(self.win)
+        seq = [*self.tail, *self.win]
+        self.seen.update(tuple(seq[j:j + self.n]) for j in range(len(seq) - self.n + 1))
+        self.tail, self.win = seq[-(self.n - 1):], []
+        self.dry = self.dry + 1 if nov < self.least else 0
+        if self.dry >= self.windows:                  # the cut's close follows: its </think> closes the gate
+            self.fired = True
+
+
 def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], bool]], Any], prompt: Sequence[int],
                    max_tokens: int, gates: Sequence[Any], on_tokens: Callable[[list[int]], bool]) -> Any:
     """Decode with ``gates``: at a cut go on from the prompt, reply and fix, or (a ``replay`` gate) run the prompt again."""
@@ -184,4 +246,4 @@ def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], boo
     return stats
 
 
-__all__ = ["CallGate", "ThinkBudget", "call_format", "generate_gated"]
+__all__ = ["CallGate", "ThinkBudget", "ThinkLoop", "call_format", "generate_gated"]

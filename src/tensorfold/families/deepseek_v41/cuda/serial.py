@@ -202,6 +202,7 @@ REUSE_MIN = 64               # shorter common prefixes start fresh
 FUSE_HC = True               # prompt chunks: hc post + the next sublayer's pre in two launches (post_pre)
 PAR_DECODE = os.environ.get("TF_PAR", "1") == "1"            # decode/verify rows: independent linears on side streams (Par)
 PROMPT_ZB = tuple(int(v) for v in os.environ.get("TF_ZB", "121,101").split(","))       # v4 with bf16 Z (gate/up config, down config); None: fp32 Z (PROMPT_V3)
+PROMPT_MTP4 = {101: 4, 103: 4, 108: 4, 118: 4, 105: 2, 107: 2, 120: 1, 121: 2, 122: 1}   # v4 configs' m tiles (experts_prompt.cu)
 PROMPT_ROTX = True           # gate/up: rotate the token rows inside the expert kernel (no rot_in copies)
 PROMPT_ZDT = torch.float16   # Z element type (fp16 stores acc / 64; bf16 also works)
 PROMPT_BLOCKS = 2            # row blocks of the overlapped prompt all-gathers
@@ -232,6 +233,13 @@ BOUNDED_TAIL = os.environ.get("TF_DSV41_BOUNDED_TAIL", "1") != "0"
 # decode / verify selection: the bounded radix-select top-k (topk.py) over each row's visible entries instead of
 # full-width torch topk / sort / mask chains (the same entries; ties of equal non-zero scores go to the lower index)
 FAST_TOPK = os.environ.get("TF_DSV41_FAST_TOPK", "1") != "0"
+# decode / verify rows past the candidate pool (candidate_topk_blocks x candidate_block_size entries): the layers after
+# the candidate source score only its chosen blocks' entries (kernels.index_scores_cand, topk.top_entries_cand), not
+# every visible one masked afterwards: the same scores and choice, ~16K entries a layer instead of the context's.
+# Idea after bertholomus/TensorFold v0.5 (508bfb3, candidate-only reindex; Apache License 2.0, Copyright 2026
+# BertholomusAI) and coolbho3k's DeepSeek-v4.1-Flash-2x-DGX-Spark (1d8ac64); written for this engine's FP4 keys and
+# radix select. TF_DSV41_CAND_ONLY=0: off
+CAND_ONLY = os.environ.get("TF_DSV41_CAND_ONLY", "1") != "0"
 
 
 def entry_bytes(dim: int = 512, kdim: int = 128, rope: int = 64, mode: str | None = None) -> tuple[int, int]:
@@ -368,6 +376,57 @@ def group_members(pick: torch.Tensor, E: int, s) -> tuple[torch.Tensor, torch.Te
     return ids, members
 
 
+# prompt chunks: the grouping tables and the grouped kernel's work list built on the device (``group_device``,
+# ``work_list``), no host read of the busiest expert or the used count (three syncs a layer, each draining the launch
+# queue); the same programs run the same arithmetic. Work list after bertholomus/TensorFold v0.5 (508bfb3,
+# ``work_list_kernel``; Apache License 2.0, Copyright 2026 BertholomusAI), the counts without bincount's host read
+# after jayleaton/deepseek-v41-tensorfold-spark PR #17. TF_DSV41_GROUP_LIST=0: group_members and the old grid
+GROUP_LIST = os.environ.get("TF_DSV41_GROUP_LIST", "1") != "0"
+
+
+def group_device(pick: torch.Tensor, E: int, s, R: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``group_members``' tables without a host read: expert ids ascending (count in ``s.count``), members [maxu, R]
+    (row * 32 + slot, pick order, -1 padded), and each place's member count [maxu]."""
+
+    dev = pick.device
+    slots = pick.shape[1]
+    flat = pick.reshape(-1).long()
+    P = flat.numel()
+    maxu = min(P, E)
+    counts = torch.zeros((E,), dtype=torch.int64, device=dev).scatter_add_(0, flat, torch.ones_like(flat))
+    used = counts > 0
+    place = torch.cumsum(used, 0) - 1                          # an expert's place among the used ones, ascending
+    spare = torch.where(used, place, maxu)                     # (unused: a spare last entry)
+    ids_full = getattr(s, "ids_full", None)
+    if ids_full is None or ids_full.numel() < maxu + 1:
+        ids_full = s.ids_full = torch.zeros((max(maxu, E) + 1,), dtype=torch.int32, device=dev)
+    ids_full.scatter_(0, spare, torch.arange(E, dtype=torch.int32, device=dev))
+    s.count.copy_(used.sum().view(1))
+    order = torch.sort(flat, stable=True).indices              # entries grouped by expert, pick order within
+    experts = flat[order]
+    start = torch.cumsum(counts, 0) - counts
+    rank = torch.arange(P, device=dev) - start[experts]
+    members = s.members_buf[:maxu * R].view(maxu, R)
+    members.fill_(-1)
+    members[place[experts], rank] = ((order // slots) * 32 + order % slots).int()
+    cnt = torch.zeros((maxu + 1,), dtype=torch.int64, device=dev).scatter_(0, spare, counts)[:maxu]
+    return ids_full, members, cnt
+
+
+def work_list(cnt: torch.Tensor, rows: int, P: int) -> torch.Tensor:
+    """int32 [L, 2]: every (place, member group of ``rows``) the grouped kernel runs, places ascending, then the
+    out-of-range place (its programs exit); L bounds them from the shape alone (P members in at most maxu places)."""
+
+    maxu = cnt.numel()
+    L = (P + maxu * (rows - 1)) // rows
+    g = (cnt + rows - 1) // rows
+    end = torch.cumsum(g, 0)
+    q = torch.arange(L, device=cnt.device)
+    p = torch.searchsorted(end, q, right=True)                 # == maxu past the last group
+    j = q - (end - g)[p.clamp(max=maxu - 1)]
+    return torch.stack([p, j], dim=1).int()
+
+
 def decode_slots(m, top_k: int) -> int:
     """Expert slots a decode / verify row takes: its routed picks, and the shared expert when folded in."""
 
@@ -382,7 +441,15 @@ def routed_prompt(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor, ex, s,
     D, I, E = ex.dims, ex.width, ex.count
     slots = s.slots
     P = R * slots
-    ids, members = group_members(pick, E, s)
+    listed = GROUP_LIST and PROMPT_ZB is not None
+    if listed:
+        ids, members, cnt = group_device(pick, E, s, R)
+        rows_gu, rows_d = (16 * PROMPT_MTP4[c] for c in PROMPT_ZB)
+        work_gu = work_list(cnt, rows_gu, P)
+        work_d = work_gu if rows_d == rows_gu else work_list(cnt, rows_d, P)
+    else:
+        ids, members = group_members(pick, E, s)
+        work_gu = work_d = None
     if os.environ.get("TF_ROUTE_STATS") and R == MAX_ROWS:
         cnt = torch.bincount(pick.flatten().long(), minlength=E).float()
         q = torch.quantile(cnt, torch.tensor([0.1, 0.5, 0.9, 0.99], device=cnt.device)).tolist()
@@ -404,13 +471,13 @@ def routed_prompt(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor, ex, s,
         if rotx:                                    # token rows rotated per expert while staged (no xg / xu)
             xc = x.contiguous()
             pe.grouped_prompt4(xc, xc, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, _ZB, 2,
-                               D, I, P, slots, ex.cb, PROMPT_ZB[0], ex.suh_g, ex.suh_u)
+                               D, I, P, slots, ex.cb, PROMPT_ZB[0], ex.suh_g, ex.suh_u, work=work_gu)
         else:
             pe.grouped_prompt4(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, _ZB,
-                               2, D, I, P, slots, ex.cb, PROMPT_ZB[0])
+                               2, D, I, P, slots, ex.cb, PROMPT_ZB[0], work=work_gu)
         pe.gateup_epilogue_b(_ZB, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, P, I, E, float(limit))
         pe.grouped_prompt4(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, _ZB, 1,
-                           I, D, P, slots, ex.cb, PROMPT_ZB[1])
+                           I, D, P, slots, ex.cb, PROMPT_ZB[1], work=work_d)
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
         pe.down_combine_b(_ZB, pick, ex.svh_d, wts, out, R, D, slots, E)
         return out
@@ -1480,14 +1547,25 @@ class SerialEngine:
         src = max(s for s in c.kv_source_layer_ids if s <= L)
         keys = self.state.ik[src]
         if static:                                                      # each row scores its own stream's keys
-            scores = K.index_scores(iq, wts, self.big.ik[src], pos, a.ratio, kbase=self._ebase(src),
-                                    n_keys=min(self.entries[src], self._width // a.ratio + 1))
+            n_keys = min(self.entries[src], self._width // a.ratio + 1)
+            pool = c.candidate_topk_blocks * c.candidate_block_size
+            if (L > c.candidate_source_layer_id and getattr(self, "cand_listed", False) and n_keys > pool
+                    and isinstance(self.big.ik[src], K.Fp4Rows)):      # only the candidate blocks' entries scored
+                from . import topk as TK
+
+                scores = K.index_scores_cand(iq, wts, self.big.ik[src], pos, a.ratio, self.cand_ids,
+                                             c.candidate_block_size, self._ebase(src), n_keys)
+                return TK.top_entries_cand(scores, pos, a.ratio, c.index_topk, self.cand_ids, c.candidate_block_size)
+            scores = K.index_scores(iq, wts, self.big.ik[src], pos, a.ratio, kbase=self._ebase(src), n_keys=n_keys)
             if FAST_TOPK:                                               # bounded radix select (topk.py)
                 from . import topk as TK
 
                 if L == c.candidate_source_layer_id:
                     self.cand_flags = TK.candidate_flags(scores, pos, a.ratio, c.candidate_block_size,
                                                          c.candidate_topk_blocks)
+                    self.cand_listed = CAND_ONLY and n_keys > pool       # (this step's ids for the layers after)
+                    if self.cand_listed:
+                        self.cand_ids = TK.candidate_ids(self.cand_flags, c.candidate_topk_blocks)
                 elif L > c.candidate_source_layer_id:
                     return TK.top_entries(scores, pos, a.ratio, c.index_topk, flags=self.cand_flags,
                                           block=c.candidate_block_size)
@@ -1594,7 +1672,8 @@ class SerialEngine:
             scratch = self.scratch[layer.index] if R <= PROMPT_ROWS else self.scratch_prompt
 
         def route():                                                # a row's bits never depend on the row count
-            return K.route(K.router_logits(x, m.gate), m.bias, top_k or c.num_experts_per_tok, c.routed_scaling_factor)
+            return K.route(K.router_logits(x, m.gate, parts=True), m.bias, top_k or c.num_experts_per_tok,
+                           c.routed_scaling_factor)
 
         def shared_act() -> torch.Tensor:
             g = m.shared[0](x, out_dtype=F32)

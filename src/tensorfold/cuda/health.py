@@ -86,6 +86,10 @@ class Health:
                                "prefilling": len(getattr(decoder, "filling", ())), "max": scheduler.max_streams}
         body.update(progress(scheduler, decoder))
         body["ok"] = body["fatal"] is None and not body["stalled"]
+        from tensorfold.cuda.late_kernels import late
+
+        if late:                                        # Triton kernels first loaded after ready (rank 0's)
+            body["late_kernel_loads"] = sum(late.values())
         window = getattr(app, "effective_context_window", None)
         if window:
             body["context_length"] = int(window)

@@ -274,6 +274,31 @@ def test_eviction_only_when_it_makes_room():
     assert any(x.owner is not None for x in d0.pool.extents)
 
 
+def test_long_prompt_trimmed_before_evicted(monkeypatch):
+    """A long prompt is kept at 3/4 and 7/8 too; a request needing room drops its longest states first (the extent
+    shrinks to the longest kept), no whole extent is evicted, and its prefix still resumes."""
+
+    monkeypatch.setattr(M, "KEEP_SHRINK_MIN", 6000)
+    d0, d1 = pair(rows=8 * ALIGN, span=6 * ALIGN, banks=8)
+    rng = random.Random(4)
+    a = [rng.randrange(2, 1000) for _ in range(8000)]
+    s = Stream(list(a), 20)
+    run(d0, s)
+    d0.finish([s])
+    same(d0, d1)
+    assert sorted(k.n for k in d0.kept) == [4096, 6144, 8000]    # 3/4, 7/8 (= the last chunk start) and the end
+    b = Stream([rng.randrange(2, 1000) for _ in range(10000)], 20)  # 10240 rows: only free once a's end goes
+    run(d0, b)
+    same(d0, d1)
+    assert d0.kstats.get("trimmed") == 1 and d0.kstats["evictions"] == 0
+    assert sorted(k.n for k in d0.kept if k.ids[0] == a[0] and list(k.ids) == a[:k.n]) == [4096, 6144]
+    d0.finish([b])
+    c = Stream(list(a[:7000]) + [7] * 30, 20)                  # a's prefix: resumes from the 7/8 state
+    run(d0, c)
+    assert c.cached == 6144
+    same(d0, d1)
+
+
 def test_random_traffic_stays_in_step():
     from tensorfold.cuda.memory_gate import NoRoom
 
@@ -413,6 +438,7 @@ def test_disk_spill_on_eviction_and_restore_on_admission(tmp_path, monkeypatch):
     d0.sent.clear()
     s = Stream(list(p) + [5] * 40, 20)
     run(d0, s)                                  # the pool holds p[:1200]; the disk p's 3000 tokens: restored
+    d1.sync()                                   # (rank 1's counters below: after it replayed the restore)
     assert len(ops(d0, M.RESTORE)) == 1 and ops(d0, M.RESTORE)[0] < ops(d0, M.ADMIT)[0]
     assert s.cached == 3000 and d0.kstats["disk_hits"] == d1.kstats["disk_hits"] == 1
     assert d0.kstats["takeovers"] == 1 and d0.kstats["disk_bad"] == 0
@@ -430,6 +456,7 @@ def test_disk_failed_restore_on_one_rank(tmp_path, monkeypatch, bad):
     d0.sent.clear()
     s = Stream(list(p) + [5] * 40, 20)
     run(d0, s)
+    d1.sync()
     assert len(ops(d0, M.RESTORE)) == 1
     assert d0.kstats["disk_bad"] == d1.kstats["disk_bad"] == 1 and d0.kstats["disk_hits"] == 0
     assert key not in disk[0].index and key not in disk[1].index

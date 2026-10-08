@@ -529,16 +529,24 @@ __global__ void __launch_bounds__(W * 32) grouped_prompt4_kernel(
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     ZT* __restrict__ Z, int K, int N, int P, int maxm, int slots, const half* __restrict__ SUH0 = nullptr,
-    const half* __restrict__ SUH1 = nullptr) {
+    const half* __restrict__ SUH1 = nullptr, const int* __restrict__ work = nullptr) {
     constexpr int ROWS = 16 * MTP, STRIDE = KC * 16 + 8;
     __shared__ __align__(16) half xs[2][ROWS * STRIDE];
     __shared__ int rows_sh[ROWS];
-    const int u = blockIdx.y;                              // grid: (member group x n group, expert, mat)
-    if (u >= ucount[0]) return;
-    const int MG = (maxm + ROWS - 1) / ROWS;
-    const int ngroups = gridDim.x / MG;
-    const int mgroup = blockIdx.x / ngroups;               // a busy expert's member groups run side by side:
-    const int ngrp = blockIdx.x - mgroup * ngroups;        // its weights shared in L2 (as X across n groups)
+    int u, mgroup, ngrp;
+    if (work != nullptr) {                                 // grid: (n group, work item, mat); an item (expert place,
+        u = work[2 * blockIdx.y];                          // member group) built on the device: past the list's
+        if (u >= ucount[0]) return;                        // end the place is out of range
+        mgroup = work[2 * blockIdx.y + 1];
+        ngrp = blockIdx.x;
+    } else {
+        u = blockIdx.y;                                    // grid: (member group x n group, expert, mat)
+        if (u >= ucount[0]) return;
+        const int MG = (maxm + ROWS - 1) / ROWS;
+        const int ngroups = gridDim.x / MG;
+        mgroup = blockIdx.x / ngroups;                     // a busy expert's member groups run side by side:
+        ngrp = blockIdx.x - mgroup * ngroups;              // its weights shared in L2 (as X across n groups)
+    }
     const int mat = blockIdx.z;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
@@ -829,8 +837,10 @@ void grouped_prompt4(const at::Tensor& X0, const at::Tensor& X1, const at::Tenso
                      const at::Tensor& K2_0, const at::Tensor& K2_1, const at::Tensor& uids, const at::Tensor& ucount,
                      const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
                      int64_t slots, int64_t cb, int64_t config, const c10::optional<at::Tensor>& suh0,
-                     const c10::optional<at::Tensor>& suh1) {
+                     const c10::optional<at::Tensor>& suh1, const c10::optional<at::Tensor>& work) {
     const bool rotx = suh0.has_value();                    // X0/X1: raw bf16 token rows, rotated per expert on stage
+    const int* wk = work.has_value() ? work->data_ptr<int>() : nullptr;   // [items, 2]: (place, member group)
+    if (wk) TORCH_CHECK(work->scalar_type() == at::kInt && work->is_contiguous() && work->dim() == 2, "work: int32 [n, 2]");
     if (rotx) TORCH_CHECK(X0.scalar_type() == at::kBFloat16 && suh1.has_value() && Z.scalar_type() == at::kHalf,
                           "rotating stage: bf16 token rows, both suh, fp16 Z");
     const half* s0 = rotx ? reinterpret_cast<const half*>(suh0->data_ptr()) : nullptr;
@@ -847,12 +857,13 @@ void grouped_prompt4(const at::Tensor& X0, const at::Tensor& X1, const at::Tenso
         reinterpret_cast<const half*>(X0.data_ptr()), reinterpret_cast<const half*>(X1.data_ptr()),                 \
         TP0.data_ptr<int64_t>(), TP1.data_ptr<int64_t>(), K2_0.data_ptr<int>(), K2_1.data_ptr<int>(),               \
         uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), reinterpret_cast<ZT_*>(Z.data_ptr()), \
-        (int)K, (int)N, (int)P, maxm, (int)slots, s0, s1)
+        (int)K, (int)N, (int)P, maxm, (int)slots, s0, s1, wk)
 #define TF_V4B(ID, NT_, W_, MTP_, KC_, PF_)                                                                        \
     case ID: {                                                                                                     \
         const int MG = (maxm + 16 * MTP_ - 1) / (16 * MTP_);                                                        \
         const int ngroups = (int)((N / 16 + NT_ * W_ - 1) / (NT_ * W_));                                            \
-        dim3 grid((unsigned)(ngroups * MG), (unsigned)uids.numel(), (unsigned)mats);                                \
+        dim3 grid = wk ? dim3((unsigned)ngroups, (unsigned)work->size(0), (unsigned)mats)                          \
+                       : dim3((unsigned)(ngroups * MG), (unsigned)uids.numel(), (unsigned)mats);                    \
         if (rotx)                                                                                                  \
             TF_V4B_LAUNCH(half, NT_, W_, MTP_, KC_, PF_, grid, true);                                              \
         else if (zh)                                                                                               \
@@ -914,7 +925,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_prompt4", &grouped_prompt4, py::arg("X0"), py::arg("X1"), py::arg("TP0"), py::arg("TP1"),
           py::arg("K2_0"), py::arg("K2_1"), py::arg("uids"), py::arg("ucount"), py::arg("members"), py::arg("Z"),
           py::arg("mats"), py::arg("K"), py::arg("N"), py::arg("P"), py::arg("slots"), py::arg("cb"),
-          py::arg("config"), py::arg("suh0") = py::none(), py::arg("suh1") = py::none());
+          py::arg("config"), py::arg("suh0") = py::none(), py::arg("suh1") = py::none(),
+          py::arg("work") = py::none());
     m.def("gateup_epilogue_b", &gateup_epilogue_b);
     m.def("down_combine_b", &down_combine_b);
     m.def("grouped_prompt3", &grouped_prompt3);

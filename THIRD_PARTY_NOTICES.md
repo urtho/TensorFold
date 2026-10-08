@@ -281,6 +281,24 @@ recipe, Apache License 2.0, Copyright 2026 MiaAI-Lab. Its NOTICE line is in our 
 Each adapted file states what was changed. `tests/test_dsv41_pool.py`, `tests/test_dsv41_kept.py` and
 `tests/test_copy_drafts.py` are written for TensorFold.
 
+## DeepSeek-V4.1-Flash TP2 fork (BertholomusAI)
+
+Apache License 2.0, Copyright 2026 BertholomusAI (Albert Lee), https://github.com/bertholomus/TensorFold, branch
+deepseek-v41-tp2:
+
+- `src/tensorfold/families/deepseek_v41/cuda/markov.py`: the drafter's Markov steps as kernels with a vocabulary split
+  and cached bias rows, adapted from its `markov.py` (bd0024d); changed: fp32 bias (this engine's loop), no PDL, its
+  own token list (`tools/dsv41_markov_tokens.py`) and comm.
+- `src/tensorfold/engine/call_gate.py` `ThinkLoop` and its server hook (`TF_LOOP_GUARD`, the request's "loop_guard"):
+  adapted from dfbe519. The signal (the share of new 8-grams a window, a loop after 3 dry windows under 2%) is
+  Capicua25x's loop_detector.py (bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10 PR #9, Apache-2.0), after tonyd2wild's
+  DeepSeek-V4-Flash DSpark recipe PR #29.
+- Ideas, re-implemented here: kept prompts shrunk to 3/4 and 7/8 boundaries before being forgotten (v0.5, 508bfb3);
+  candidate-only reindex scoring (v0.5; also coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark 1d8ac64); the prompt-chunk
+  expert work list built on the device (v0.5, `work_list_kernel`); RoCE gather rings in cudaHostRegister'd memory with
+  one system fence a block and the own slice copied early (bd0024d). The counts without bincount's host read follow
+  jayleaton/deepseek-v41-tensorfold-spark PR #17 (Apache-2.0).
+
 ## Ideas from AGPL-licensed recipes (no code included)
 
 - The GB10 display carveout (`src/tensorfold/cuda/carveout.py`, `TF_CARVEOUT=1`, counted by `capacity.available_bytes`)

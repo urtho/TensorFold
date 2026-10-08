@@ -158,6 +158,14 @@ def narrow_graphs(streams: int, limit: int) -> int:
     return PROMPT_ROWS * len([w for w in WIDTHS if w < limit]) if streams > 1 else 0
 
 
+def markov_bytes(world: int = 2) -> int:
+    """The drafter's cached Markov bias rows a rank (``markov.py``): fp32 rows of the rank's vocabulary part."""
+
+    from . import markov
+
+    return markov.CACHE_ROWS * 129280 // world * 4 if markov.ON else 0
+
+
 def pool_tokens(free: int, streams: int, limit: int, carve: int = 0) -> int:
     """Shared-pool rows (a multiple of ``pool.ALIGN``) that fit ``free`` bytes beside ``streams`` slots' rings, a
     ``limit``-token window's buffers (RoPE tables, selection, the decode graphs' score buffers) and the kept-prompt
@@ -167,7 +175,7 @@ def pool_tokens(free: int, streams: int, limit: int, carve: int = 0) -> int:
     from .pool import ALIGN, align_up
 
     room = (free - int((FIXED_GIB + RESERVE_GIB) * 2 ** 30) - (streams - 1 + KEPT_ENTRIES) * SLOT_BYTES
-            - narrow_graphs(streams, limit) * GRAPH_EXEC_BYTES
+            - narrow_graphs(streams, limit) * GRAPH_EXEC_BYTES - markov_bytes()
             - (TOKEN_BYTES - CACHE_BYTES + GRAPH_BYTES_PER_LIMIT_TOKEN) * limit)
     cap = streams * align_up(limit)
     best = max(0, min(room // CACHE_BYTES, cap)) // ALIGN * ALIGN
@@ -380,10 +388,16 @@ class Dsv41Engine:
                 curve = " ".join(f"{v:.0f}" for v in self.multi.costs)
                 print(f"[tensorfold] verify ms by rows 1..{len(self.multi.costs)}: {curve}; a draft "
                       f"{self.multi.draft_ms:.1f} ms", flush=True)
+            if warm and os.environ.get("TF_DSV41_WARM_SERVING", "1") != "0":
+                self._warm_serving()
+                self._mark("serving warm-up")
             if rank == 0:
                 self.scheduler = Scheduler(self.multi, max_streams=self.streams)
                 print(f"[tensorfold] {self.streams} concurrent streams of up to {cap} tokens each", flush=True)
         self._mark("ready")
+        from tensorfold.cuda import late_kernels
+
+        late_kernels.arm()                              # a Triton kernel first loaded from here on is printed
         if rank == 0:
             marks = self._boot
             print("[boot] " + ", ".join(f"{name} {t - prev:.1f}s" for (_, prev), (name, t) in zip(marks, marks[1:]))
@@ -510,7 +524,7 @@ class Dsv41Engine:
             return
         if rank == 0:
             print(f"[tensorfold] all-gathers up to {self.nccl.rdma.slot_bytes >> 10} KiB over RoCE "
-                  f"({self.nccl.rdma.device}), larger ones over NCCL", flush=True)
+                  f"({self.nccl.rdma.device}, {self.nccl.rdma.host} memory), larger ones over NCCL", flush=True)
 
     def _gather_ints(self, values: list[int]) -> list[list[int]]:
         torch = self.torch
@@ -555,6 +569,50 @@ class Dsv41Engine:
             print(f"[tensorfold] warmed in {time.perf_counter() - t:.0f}s; GPU memory {torch.cuda.memory_allocated() / 2 ** 30:.1f} "
                   f"GiB in use, {reserved / 2 ** 30:.1f} GiB was reserved; {available_bytes() / 2 ** 30:.1f} GiB left",
                   flush=True)
+
+    def _warm_serving(self) -> None:
+        """Both ranks, after calibration: requests through the concurrent decoder (the path every request takes) whose
+        shapes the startup warm-up's one prompt leaves out, so the Triton kernels they specialize load now, not
+        mid-serving (``late_kernels`` reports any that still do): prompts of 1 to 32 rows (the decode arithmetic),
+        last chunks of 33 / 48 rows and whole ones, a kept prompt resumed with a short and a long tail, streams
+        decoding while others fill, a sampled reply. Nothing of it stays: its kept states are dropped (not written
+        to the NVMe tier) and the decoder's counters restored."""
+
+        import random
+
+        from tensorfold.cuda.streams import Stream
+        from tensorfold.engine.exact_sampling import Sampling
+
+        m = self.multi
+        t = time.perf_counter()
+        disk, stats = m.disk, dict(m.kstats)
+        m.disk = None
+        if self.rank == 1:
+            m.follow()                                   # until rank 0 sends the empty message
+        else:
+            rng = random.Random(0)
+
+            def ids(n: int) -> list[int]:
+                return [rng.randrange(1000, 100000) for _ in range(n)]
+
+            doc = ids(3000)
+            waves = [[ids(n)] for n in (1, 7, 16, 100, 2048, 2048 + 33, 2048 + 48)]
+            waves += [[doc], [doc + ids(40)], [doc + ids(2100)], [ids(500), ids(2600), ids(5000)]]
+            waves = [[Stream(p, 12) for p in wave] for wave in waves]
+            waves.append([Stream(ids(300), 12, Sampling(7, 0.7, 20, 0.95, 0.0))])
+            for wave in waves:
+                m.reset_policy()
+                for s in wave:
+                    m.admit(s)
+                while not all(s.done for s in wave):
+                    m.finish(m.round())
+                m.finish([s for s in wave if s.sid in m.streams or s in m.filling])
+            self._share([])                              # rank 1 leaves ``follow``
+        for k in list(m.kept):
+            m._drop(k, spill=False)
+        m.disk, m.kstats = disk, stats
+        if self.rank == 0:
+            print(f"[tensorfold] serving paths warmed in {time.perf_counter() - t:.1f}s", flush=True)
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, draft: bool, stop_eos: bool, on_tokens,
              constraint=None) -> dict:

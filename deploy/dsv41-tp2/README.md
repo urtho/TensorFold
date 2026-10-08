@@ -43,6 +43,18 @@ libraries, device): a new image starts empty, and the old directories can be del
 bounds the space, least recently used first; `TF_DSV41_DISK_MIN` (2048) is the smallest state written;
 `TF_DSV41_DISK_STAGE_MIB` (1024) of pinned memory a rank stage the copies. `/models` may share the NVMe (Engram reads).
 
+## Loop guard, late kernel loads
+
+`TF_LOOP_GUARD=1` (`.env`) makes the loop guard the server default: a thinking reply whose last three windows of 1,024
+tokens each held under 2% new token 8-grams has its thinking closed (`\n</think>\n\n` after the window), and the reply
+goes on to its answer; the log says `loop guard: ...` and the reply's stats carry `"loop_guard": true`. A request's
+`"loop_guard": true / false` overrides the default; replies under a grammar or a `thinking_budget` are never cut.
+
+After the start-up warm-ups (the serving-path one sends prompts of 1-32 rows, odd and 16-multiple tails, a resumed kept
+prompt and concurrent streams through the decoder) any Triton kernel loaded for the first time is printed
+(`late kernel load ...`) and counted in `/health` (`late_kernel_loads`): such a load mid-serving once failed with CUDA
+800 in a peer engine. A count above zero names a shape the warm-up should cover.
+
 ## Watchdog
 
 `watchdog.sh` checks the pair once a minute from a systemd user timer (`make watch-install`; the user must linger

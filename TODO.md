@@ -221,6 +221,41 @@ copy none of it into this Apache-2.0 tree.
 - [x] Shared-tile fp4 indexer (`_index_scores_tile`, `TF_DSV41_SHARED_IK`, default on): MXFP4 key tile decoded once
       per stream for all its rows, tiles past visible keys skipped; torch.equal to the per-row kernel
 
+## Phase 8 — adopted from the peer recipes (2026-10-08, notes/dsv41/PEERS.md)
+
+Every item exact (replies' token sha unchanged; quick tier fingerprints equal to 9695a8b's), each behind a switch.
+Jaybench on 9695a8b -> this tree (single requests, 3 reps, the same shas): code 82.80 -> 86.34, prose 45.30 -> 47.31,
+structured 119.31 -> 124.85, c1 106.67 -> 109.60, hard 50.70 -> 53.01 tok/s.
+
+- [x] Drafter Markov steps as kernels (`markov.py`, after bertholomus bd0024d; `TF_DSV41_MARKOV`): each rank scores its
+      vocabulary half, one 16-byte-a-row gather a step, 256 cached fp32 bias rows (`markov_tokens.py`: 58% of a code +
+      English sample); the fp32 bias equals cuBLAS's bit for bit (tests/test_dsv41_markov.py), the same drafts.
+      Drafter graph 5.00 -> 3.32 ms; +66 MB a rank (charged in `engine.pool_tokens`)
+- [x] RoCE gather (`TF_RDMA_HOST=register`): the region mmap'ed, locked and cudaHostRegister'ed (GB10 reaches
+      cudaHostAlloc memory uncached), one system fence a block, the own shard copied before the wait, four peer loads
+      in flight. Windows 1 / 2 / 4 / 6 rows vs pinned: 23.45 / 27.83 / 35.69 / 40.08 -> 23.08 / 27.35 / 35.53 / 40.01 ms;
+      `TF_RDMA_MAX_KB=4352` (the head over RoCE at every width): no gain, stays 704
+- [x] Router: the K slices summed inside `_route` (one launch less a layer), bf16 rows converted as loaded (no
+      `.half()` copy); tests/test_dsv41_router.py
+- [x] Prompt chunks without host syncs (`TF_DSV41_GROUP_LIST`): `serial.group_device` + `work_list` (after bertholomus
+      v0.5 and jayleaton PR #17) replace bincount / `int(max)` / nonzero (3 syncs a layer); the grouped kernel walks the
+      device-built (place, member group) list; tables equal group_members' (tests/test_dsv41_group_list.py).
+      Prefill 8K 1726 -> 1749, 64K 2314 -> 2313 tok/s (chunk-prefill fingerprint unchanged)
+- [x] Candidate-only reindex (`TF_DSV41_CAND_ONLY`, past the 16,384-entry pool): layers 24-36 score only layer 20's
+      2048 blocks (`kernels.index_scores_cand`, `topk` MODE 3); scores and choice equal the masked full width's
+      (tests/test_dsv41_fp4.py). Long tier vs 9695a8b: decode after 128K 29.90 -> 27.05 ms a step (32K 25.90 ->
+      25.51), needles 6/6, tf-compare equal on the shared documents
+- [x] Late Triton loads (`cuda/late_kernels.py`): a kernel first loaded after ready is printed and counted in /health
+      (`late_kernel_loads`; bertholomus#1: such a load failed with CUDA 800 after 15.5 h); the serving-path warm-up
+      (`engine._warm_serving`, `TF_DSV41_WARM_SERVING`): 1-32-row prompts, 33 / 48-row tails, a resumed kept prompt,
+      streams decoding while others fill, a sampled reply
+- [x] Loop guard (`call_gate.ThinkLoop`, `TF_LOOP_GUARD`, the request's "loop_guard"; after bertholomus dfbe519):
+      3 dry 1,024-token windows (< 2% new 8-grams) close the thinking; tests/test_loop_guard.py
+- [x] Kept-prompt trimming (`TF_DSV41_KEEP_SHRINK`, default on): prompts >= 128K also kept (exactly) at 3/4 and 7/8;
+      room is made by dropping loose extents' longest states (`multi._trim`) before whole extents are evicted
+- [ ] Verify-window levers still open (bertholomus bd0024d): dead fp32 scratch discarded from L2, the mHC finish split
+      with its Sinkhorn on a side stream, wo_a's rotation folded into the attention merge, norm + rot_in fusion
+
 ## Open (2026-10-05)
 
 - [x] RoCE GID index robustness (70abae0): no fixed index; NCCL (`NCCL_IB_ADDR_FAMILY=AF_INET`, RoCE v2, 10.42.0.0/15)

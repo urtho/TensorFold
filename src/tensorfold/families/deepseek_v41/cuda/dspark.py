@@ -54,6 +54,10 @@ class DSpark:
         self.noise = torch.full((tokens - 1,), c.dspark_noise_token_id, dtype=torch.long, device=self.dev)
         self.taps: list[torch.Tensor] = []
         self.graph = None
+        from . import markov as MK
+
+        # the Markov steps as kernels on this rank's vocabulary part, frequent tokens' bias rows cached (markov.py)
+        self.mk = MK.Markov(self.dw, eng.comm, c.vocab_size) if MK.ON and "nomarkov" not in VARIANT else None
 
     @property
     def swa(self) -> list[torch.Tensor]:
@@ -102,7 +106,13 @@ class DSpark:
             f = eng.moe(block, x, N, top_k=c.dspark_num_experts_per_tok, scratch=self.scratch[j])
         X = hcf.post(f, X, post, comb)
         h = K.rmsnorm((pre[:, :, None] * X.float()).sum(1).to(BF), dw.norm, c.rms_norm_eps)
-        base = eng.comm.gather_last(eng.w.head(h, out_dtype=F32))            # [N, V]
+        local = eng.w.head(h, out_dtype=F32)                                 # this rank's vocabulary part
+        if self.mk is not None:
+            out = torch.empty((1, N + 1), dtype=torch.long, device=self.dev)
+            out[:, 0] = anchor
+            self.mk.steps(local, out, N, N)
+            return out[0, 1:]
+        base = eng.comm.gather_last(local)                                    # [N, V]
         prev, out = anchor, []
         for j in range(N):                                                    # sequential Markov stage
             if "nomarkov" in VARIANT:
@@ -192,7 +202,13 @@ class DSpark:
             f = eng.moe(block, x, M * N, top_k=c.dspark_num_experts_per_tok, scratch=self.scratch_multi[j])
         X = hcf.post(f, X, post, comb)
         h = K.rmsnorm((pre[:, :, None] * X.float()).sum(1).to(BF), dw.norm, c.rms_norm_eps)
-        logits = eng.comm.gather_last(eng.w.head(h, out_dtype=F32)).view(M, N, -1)
+        local = eng.w.head(h, out_dtype=F32)                                 # [M * N, this rank's vocabulary part]
+        if self.mk is not None:
+            out = torch.empty((M, N + 1), dtype=torch.long, device=self.dev)
+            out[:, 0] = anchor
+            self.mk.steps(local, out, N, N)
+            return out[:, 1:]
+        logits = eng.comm.gather_last(local).view(M, N, -1)
         prev, out = anchor, []
         for j in range(N):                                                    # sequential Markov stage, batched
             bias = torch.mm(dw.markov_embed[prev].half(), dw.markov_head.T, out_dtype=F32)

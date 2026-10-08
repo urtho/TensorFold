@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 import threading
 import time
 import uuid
@@ -19,7 +20,7 @@ from tensorfold.server.probabilities import TokenBytes, probability_options
 from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
 from tensorfold.server.stopping import stop_options
 from tensorfold.server.tool_policy import ToolCallPolicy
-from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
+from tensorfold.engine.call_gate import CallGate, ThinkBudget, ThinkLoop, call_format, generate_gated
 from tensorfold.engine.tool_draft import ToolCallStreamer
 from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
@@ -51,6 +52,10 @@ class PreparedRequest:
     vision: Any = None
     grammar: Any = None     # (spec, compiled grammar) of the request's response_format, or None
     think_budget: int = 0   # reply tokens before the server closes a think block the reply leaves open (0: no limit)
+
+
+# the loop guard's server default (``ThinkLoop``; a request's "loop_guard": true / false overrides it)
+LOOP_GUARD = os.environ.get("TF_LOOP_GUARD", "0") == "1"
 
 
 def _native_context(model_dir: Path) -> int:
@@ -496,6 +501,7 @@ class App:
         shaped = prepared.grammar is not None or prepared.think_budget > 0
         think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
         budget = self._think_budget(prepared, think_end)
+        loop = self._think_loop(body, prepared, chat and thinking)
         # priority "background" (or a session-title request): after the others, as on the Mac
         background = body.get("priority") == "background" or (chat and is_title_request(body.get("messages"), tools))
         concurrent = getattr(self.engine, "concurrent", False)
@@ -504,7 +510,7 @@ class App:
             options["background"] = True            # the engine's scheduler orders its lanes and prompts
         # one engine at a time: a background reply yields between rounds (not on two ranks, which decode to the end)
         yielding = background and turns is not None and getattr(self.engine, "tp", 1) == 1
-        gates = [g for g in (gate, budget, Yield(turns) if yielding else None) if g is not None]
+        gates = [g for g in (gate, budget, loop, Yield(turns) if yielding else None) if g is not None]
 
         cached: list[int] = []              # the prompt tokens the first run found cached (usage's cached_tokens)
 
@@ -570,6 +576,10 @@ class App:
             if tail:
                 final["content"] = tail
             finish = "tool_calls" if calls else ended
+        if loop is not None and loop.fired:
+            print(f"[tensorfold] loop guard: the reasoning stopped saying anything new; thinking closed after "
+                  f"{reasoning_count(out, loop.think_end)} reasoning tokens", flush=True)
+            stats = {**stats, "loop_guard": True}
         print_done(len(prompt), (cached or [0])[0], thinking, out, finish, stats, request)
         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
@@ -600,6 +610,21 @@ class App:
         if prepared.grammar is None:
             close += self.tok.encode("\n\n", add_special_tokens=False).ids
         return ThinkBudget(prepared.think_budget, close, think_end)
+
+    def _think_loop(self, body: dict[str, Any], prepared: PreparedRequest, thinking: bool) -> ThinkLoop | None:
+        """The loop guard for a thinking chat reply (TF_LOOP_GUARD, or the request's "loop_guard"); none under a
+        grammar or a thinking budget (their own closes)."""
+
+        asked = body.get("loop_guard")
+        if not (LOOP_GUARD if asked is None else asked is True) or not thinking or prepared.grammar is not None \
+                or prepared.think_budget > 0:
+            return None
+        end = self.tok.token_to_id("</think>")
+        if end is None:
+            return None
+        close = [*self.tok.encode("\n", add_special_tokens=False).ids, end,
+                 *self.tok.encode("\n\n", add_special_tokens=False).ids]
+        return ThinkLoop(close, end)
 
     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:
         """The gate a required tool call needs, from this template's call markup and the rendered prompt."""

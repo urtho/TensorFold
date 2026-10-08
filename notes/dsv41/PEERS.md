@@ -41,6 +41,10 @@ hardware (2026-10-04, fp4 KV, 16 × 614K, 6.5M pool tokens): C1 98 tok/s, PP8192
 
 ## Leads to check against ours
 
+Adopted 2026-10-08 (TODO.md Phase 8): the drafter Markov kernels, the RoCE gather's registered memory, the
+prompt-chunk work list, candidate-only reindex, late-load reporting and the serving warm-up, the loop guard and
+kept-prompt trimming. Still open: the verify-window levers (L2 discard, mHC split, merge / norm fusions).
+
 - TF32 (bertholomus 741a507, recipe #6): NGC PyTorch containers set `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`, so fp32
   cuBLAS GEMMs (router logits, indexer weights, mHC mixes) run in TF32. Seeded replies then differ from the reference,
   and one reported long agentic turn looped to the 32K cap. Our serving container has the variable set and

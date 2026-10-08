@@ -1163,7 +1163,7 @@ def main() -> None:
 
         nccl = RdmaComm(nccl, args.rank)
         if args.rank == 0:
-            print(f"[rank 0] all-gathers up to {nccl.rdma.slot_bytes >> 10} KiB over RoCE ({nccl.rdma.device})", flush=True)
+            print(f"[rank 0] all-gathers up to {nccl.rdma.slot_bytes >> 10} KiB over RoCE ({nccl.rdma.device}, {nccl.rdma.host} memory)", flush=True)
     t0 = time.time()
     draft = want_draft(args)
     w = W.load(args.model, rank=args.rank, log=lambda *a, **k: None, draft=draft)

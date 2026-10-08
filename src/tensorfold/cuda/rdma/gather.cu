@@ -10,12 +10,13 @@
 // device state tensor, stop on timeout in place of the poison record.
 //
 // One launch of GRID blocks:
-//   1. every block copies its share of the local shard into the pinned send slot (seq & 1), then fences system-wide;
+//   1. every block copies its share of the local shard into the send slot (seq & 1) and to its own place in the
+//      output, then one fence a block (system-wide, after the block's barrier);
 //   2. the last block to arrive (a free-running counter, compared modulo GRID) stores the slot's byte count and rings
 //      ctrl.seq for the proxy thread, which RDMA-writes the slot and then a flag to the peer;
 //   3. each block waits for the peer's flag of this slot to read seq (system-scope acquire loads; a bounded wait
 //      records the sequence in ctrl[4] and stops further launches);
-//   4. every block copies both shards to the output in rank order (its own from the input, the peer's from recv);
+//   4. every block copies the peer's shard from recv to the output (four loads in flight a thread);
 //   5. the last block to leave advances the device epoch, so a CUDA graph replays the exchange with the next seq.
 #include <ATen/ATen.h>
 #include <torch/types.h>
@@ -63,10 +64,15 @@ __global__ void __launch_bounds__(256) gather_kernel(const uint4* __restrict__ i
     const int index = blockIdx.x * blockDim.x + tid, stride = gridDim.x * blockDim.x;
 
     uint4* send = reinterpret_cast<uint4*>(region + send_off + slot * slot_bytes);           // 1. stage
-    for (int i = index; i < packs; i += stride) send[i] = in[i];
-    __threadfence_system();
-    __syncthreads();
+    uint4* mine_out = out + (long long)rank * packs;
+    for (int i = index; i < packs; i += stride) {     // (the own shard goes out now, while the peer's is on the wire)
+        const uint4 v = in[i];
+        send[i] = v;
+        mine_out[i] = v;
+    }
+    __syncthreads();                                  // the block's stores, then one system fence for them all
     if (tid == 0) {                                                                           // 2. doorbell
+        __threadfence_system();
         const uint32_t prior = atomicAdd(state + 1, 1u);
         if ((prior + 1u) % gridDim.x == 0u) {
             __threadfence_system();
@@ -88,12 +94,17 @@ __global__ void __launch_bounds__(256) gather_kernel(const uint4* __restrict__ i
     __syncthreads();
     if (ok) {                                                                                 // 4. copy out
         const uint4* peer = reinterpret_cast<const uint4*>(region + recv_off + slot * slot_bytes);
-        uint4* mine_out = out + (long long)rank * packs;
         uint4* peer_out = out + (long long)(1 - rank) * packs;
-        for (int i = index; i < packs; i += stride) {
-            mine_out[i] = in[i];
-            peer_out[i] = ld_sys_v4(peer + i);
+        int i = index;
+        for (; i + 3 * stride < packs; i += 4 * stride) {     // four loads in flight a thread
+            const uint4 a = ld_sys_v4(peer + i), b = ld_sys_v4(peer + i + stride);
+            const uint4 c = ld_sys_v4(peer + i + 2 * stride), d = ld_sys_v4(peer + i + 3 * stride);
+            peer_out[i] = a;
+            peer_out[i + stride] = b;
+            peer_out[i + 2 * stride] = c;
+            peer_out[i + 3 * stride] = d;
         }
+        for (; i < packs; i += stride) peer_out[i] = ld_sys_v4(peer + i);
     }
     __threadfence();                                                                          // 5. epoch
     __syncthreads();
