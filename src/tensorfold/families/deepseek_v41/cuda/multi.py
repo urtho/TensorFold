@@ -32,7 +32,7 @@ from tensorfold.cuda.copy_drafts import CopyDrafts, CopySettings
 from tensorfold.cuda.sampling import sample_rows
 from tensorfold.cuda.streams import Stream, next_fill
 
-from .serial import DRING, MAX_ROWS, WINDOW_ROWS, SerialEngine
+from .serial import DRING, MAX_ROWS, PREFILL_AHEAD, WINDOW_ROWS, SerialEngine
 
 ADMIT, FILL, ROUND, DONE, EVICT, GROW, MOVE, RESTORE, PERSIST, IDLE = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10  # rank 0's messages
 FRESH, TAKEOVER, COPY = 0, 1, 2            # how an admitted stream gets its extent (a kept prompt's, or new rows)
@@ -1219,7 +1219,7 @@ class MultiDecoder:
             # every layer (rows' values do not depend on it: the deep layers keep only their windows)
             logits = e.prefill(s.prompt[s.pos:stop], final=next((p for p in points if p >= stop), n))
             s.pos = stop
-            if stop < n:                                    # (PREFILL_AHEAD: the next step's first chunk, read now)
+            if PREFILL_AHEAD and stop < n:                  # the next step's first chunk, read now
                 nxt = min(n, stop + rows, next((p for p in points if stop + ROWS < p), n))
                 e.read_ahead(list(e.state.ids) + list(s.prompt[stop:nxt]), len(e.state.ids), min(MAX_ROWS, nxt - stop))
             if split is not None:
