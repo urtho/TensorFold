@@ -23,10 +23,10 @@ import triton
 import triton.language as tl
 
 BS = 1024           # entries a block of the scan
-# MODE 3 scans only the lanes of the row's listed blocks (TF_DSV41_CAND_BOUND=1; 0, the default: all n_keys lanes):
+# MODE 3 scans only the lanes of the row's listed blocks (TF_DSV41_CAND_BOUND, default 1; 0: all n_keys lanes):
 # the ids are packed first and -1 padded, every lane past them -inf, so the same choice. At 2K context 2048 of the
 # 16384 lanes (the 65536-key graphs keep the candidate path on at every context)
-CAND_BOUND = os.environ.get("TF_DSV41_CAND_BOUND", "0") == "1"
+CAND_BOUND = os.environ.get("TF_DSV41_CAND_BOUND", "1") != "0"          # (default since 2026-10-09)
 # the radix select's digit width (TF_DSV41_TOPK_DIGITS: 8, the default, four passes; 11: 11 / 11 / 10 bits, one full
 # pass over the row fewer): the same k-th key, so the same entries
 TOPK_DIGITS = int(os.environ.get("TF_DSV41_TOPK_DIGITS") or 8)

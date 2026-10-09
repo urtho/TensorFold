@@ -22,24 +22,24 @@ K2_SUPPORTED = tuple(range(2, 17))
 GLM_GATEUP = (8, 4, 4, 1)
 GLM_DOWN = (8, 4, 1, 1)
 
-# TF_DSV41_L2_DISCARD with "moe" (or "all"; a comma list, default none): routed() with wts drops its dead scratch from L2
+# TF_DSV41_L2_DISCARD with "moe" (or "all"; a comma list; default "moe" (on by default since 2026-10-09: with the other Phase 10 levers, jaybench code +1.8%, structured +2.6%, c1 +3%, edit / docs +2.5%, 4-6-row windows -0.7 ms; out/perf/ab8-*), "none": off): routed() with wts drops its dead scratch from L2
 # without the write-back: gate/up Z past the down Z, xg / xu (gateup_epilogue), the down Z and xd (down_combine), and
 # stores no y. No value changes. y stays stored under TF_SKIP_SHARED=1 (timing: its skipped slots read y rows).
 # Exact only while no weighted pick is >= E (down_combine reads y rows for those): route() never makes one.
-_L2 = {t.strip() for t in os.environ.get("TF_DSV41_L2_DISCARD", "").split(",")} - {""}
+_L2 = {t.strip() for t in (os.environ.get("TF_DSV41_L2_DISCARD") or "moe").split(",")} - {"", "0", "none"}
 if _L2 - {"po", "moe", "all", "lin"}:                         # (the same check as deepseek_v41/cuda/mqa_fp4.py)
     raise ValueError(f"TF_DSV41_L2_DISCARD: unknown {sorted(_L2 - {'po', 'moe', 'all', 'lin'})}")
 DISCARD = bool(_L2 & {"moe", "all"})
-# ... only in calls of at least this many rows, or "lo-hi" rows (TF_DSV41_L2_DISCARD_ROWS; empty, the default: every
-# call, as before): the 2026-10-08 A/B measured moe discard at R=1 +0.4 ms, R=6 -0.9 ms; gated to >= 4 rows, the R=1
+# ... only in calls of at least this many rows, or "lo-hi" rows (TF_DSV41_L2_DISCARD_ROWS; default 4-32, decode and
+# verify rounds; 0: every call, as before): the 2026-10-08 A/B measured moe discard at R=1 +0.4 ms, R=6 -0.9 ms; gated to >= 4 rows, the R=1
 # windows still ran +3 ms after prompt chunks had discarded. Only a cache hint: no value changes
-_rows = (os.environ.get("TF_DSV41_L2_DISCARD_ROWS") or "0").split("-")
+_rows = (os.environ.get("TF_DSV41_L2_DISCARD_ROWS") or "4-32").split("-")       # (default: decode / verify)
 DISCARD_ROWS = int(_rows[0])
 DISCARD_MAX_ROWS = int(_rows[1]) if len(_rows) > 1 else 1 << 30
-# the grouping kernel's member lists one thread a pick (TF_EXPERT_GROUP=par; empty, the default: a serial fill an
+# the grouping kernel's member lists one thread a pick (TF_EXPERT_GROUP: par, the default; serial: a fill an
 # expert), in decode-sized calls (rows x slots <= GROUP_PAR_PICKS: each pick counts its earlier picks); the same uids,
 # count and members
-GROUP_PAR = os.environ.get("TF_EXPERT_GROUP", "") == "par"
+GROUP_PAR = (os.environ.get("TF_EXPERT_GROUP") or "par") == "par"         # (default since 2026-10-09; serial: off)
 GROUP_PAR_PICKS = 16 * 7
 SKIP_SHARED = os.environ.get("TF_SKIP_SHARED") == "1"
 

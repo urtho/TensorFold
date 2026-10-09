@@ -232,8 +232,9 @@ PROMPT_CFG = [1, 1]          # prompt expert kernel config for gate/up and down 
 # decode/verify rows at most (row-invariant kernels; a round of streams up to it); above: prompt chunks
 PROMPT_ROWS = int(os.environ.get("TF_DSV41_DECODE_ROWS") or 32)
 # decode / verify rows: the indexer's q (after q's, on its branch) and head weights (a fourth branch) made beside the
-# window KV and the compressor instead of after the join (TF_DSV41_IDX_FORK=1; default 0). The same kernels and inputs
-IDX_FORK = os.environ.get("TF_DSV41_IDX_FORK", "0") == "1"
+# window KV and the compressor instead of after the join (TF_DSV41_IDX_FORK, default 1; 0: after). The same kernels
+# and inputs
+IDX_FORK = os.environ.get("TF_DSV41_IDX_FORK", "1") != "0"              # (default since 2026-10-09)
 # each prefill call's wait on its Engram row reads, first chunk and the rest (TF_DSV41_PREFILL_PROF=1; a diagnostic)
 PREFILL_PROF = os.environ.get("TF_DSV41_PREFILL_PROF", "0") == "1"
 # decode graphs are captured at these key widths (tokens) besides the full limit; a step replays the narrowest that

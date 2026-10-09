@@ -36,11 +36,11 @@ SLOT_ALIGN = 4096
 INFO_WORDS = 7                       # tf_rdma_info: qpn, psn, rkey, addr, mtu, gid_hi, gid_lo
 SPIN = 20_000_000                    # flag polls before a wait gives up (~20 s): the peer died or never sent
 TRACE = int(os.environ.get("TF_RDMA_TRACE") or 0)       # trace ring entries (0: off)
-# the copy-out of the peer's shard (TF_RDMA_COPY): "pred", all of a thread's guarded loads then the stores; empty, the
-# default: groups of four then a serial tail. A plain copy either way
-COPY = os.environ.get("TF_RDMA_COPY", "")
-if COPY not in ("", "pred"):
-    raise ValueError(f"TF_RDMA_COPY={COPY}: pred or empty")
+# the copy-out of the peer's shard (TF_RDMA_COPY): "pred" (the default), all of a thread's guarded loads then the
+# stores; "plain": groups of four then a serial tail. A plain copy either way
+COPY = os.environ.get("TF_RDMA_COPY") or "pred"                          # (default since 2026-10-09)
+if COPY not in ("plain", "pred"):
+    raise ValueError(f"TF_RDMA_COPY={COPY}: pred or plain")
 _LOCK = threading.Lock()
 
 

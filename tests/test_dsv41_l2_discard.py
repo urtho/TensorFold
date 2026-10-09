@@ -34,7 +34,8 @@ def reload(monkeypatch):
         importlib.reload(m)
 
 
-@pytest.mark.parametrize("value,po,moe", [("", False, False), ("po", True, False), ("moe", False, True),
+@pytest.mark.parametrize("value,po,moe", [("", False, True), ("none", False, False), ("0", False, False),
+                                          ("po", True, False), ("moe", False, True),
                                           ("po,moe", True, True), ("all", True, True), ("lin", False, False),
                                           ("po, moe", True, True), (" moe ,", False, True)])
 def test_switch_tokens(reload, value, po, moe):
@@ -48,11 +49,15 @@ def test_switch_rejects_unknown(reload, mod):
         reload(mqa_fp4 if mod == "mqa_fp4" else ex3, TF_DSV41_L2_DISCARD="po,moee")
 
 
-def test_defaults_off(monkeypatch, reload):
+def test_defaults(monkeypatch, reload):
+    """Unset: the moe discard on (since 2026-10-09, in 4-32-row calls), the partials' off."""
+
     monkeypatch.delenv("TF_DSV41_L2_DISCARD", raising=False)
+    monkeypatch.delenv("TF_DSV41_L2_DISCARD_ROWS", raising=False)
     monkeypatch.delenv("TF_DSV41_RES_FOLD", raising=False)
     assert reload(mqa_fp4).DISCARD is False
-    assert reload(ex3).DISCARD is False
+    m = reload(ex3)
+    assert m.DISCARD is True and (m.DISCARD_ROWS, m.DISCARD_MAX_ROWS) == (4, 32)
     src = (ROOT / "src/tensorfold/families/deepseek_v41/cuda/serial.py").read_text()
     assert 'RES_FOLD = os.environ.get("TF_DSV41_RES_FOLD") == "1"' in src
 
@@ -115,6 +120,7 @@ def test_routed_flags(monkeypatch, discard, skip, with_wts):
     rec = _Ext()
     monkeypatch.setattr(ex3, "_ext", lambda: rec)
     monkeypatch.setattr(ex3, "DISCARD", discard)
+    monkeypatch.setattr(ex3, "DISCARD_ROWS", 0)                  # (the row gate: tested in tests/cuda)
     monkeypatch.setattr(ex3, "SKIP_SHARED", skip)
     monkeypatch.setitem(ex3.x3ld.CFG, "on", False)
     x = torch.zeros((R, D), dtype=torch.bfloat16)

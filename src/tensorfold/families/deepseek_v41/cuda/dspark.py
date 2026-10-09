@@ -24,9 +24,9 @@ from .weights import LayerW
 
 BF, F32 = torch.bfloat16, torch.float32
 VARIANT = set(filter(None, __import__("os").environ.get("DSPARK_VARIANT", "").split(",")))
-# (exact, empty: off) TF_DSV41_DRAFT_GROUP=1: the draft blocks' wo_a slices as one grouped launch (rot_in route only:
+# (exact; 0: off) TF_DSV41_DRAFT_GROUP (default 1): the draft blocks' wo_a slices as one grouped launch (rot_in route only:
 # TF_EXL3_ROT_FUSE keeps the slices) and wq_a beside wkv on the engine's Par streams
-GROUP = __import__("os").environ.get("TF_DSV41_DRAFT_GROUP") == "1"
+GROUP = __import__("os").environ.get("TF_DSV41_DRAFT_GROUP", "1") != "0"   # (default since 2026-10-09)
 
 
 class DSpark:
