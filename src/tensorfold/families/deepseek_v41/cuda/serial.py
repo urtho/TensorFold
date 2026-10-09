@@ -241,10 +241,11 @@ PROMPT_ROWS = int(os.environ.get("TF_DSV41_DECODE_ROWS") or 32)
 IDX_FORK = os.environ.get("TF_DSV41_IDX_FORK", "1") != "0"              # (default since 2026-10-09)
 # each prefill call's wait on its Engram row reads, first chunk and the rest (TF_DSV41_PREFILL_PROF=1; a diagnostic)
 PREFILL_PROF = os.environ.get("TF_DSV41_PREFILL_PROF", "0") == "1"
-# a prompt's next prefill call's first chunk read while this call runs (TF_DSV41_PREFILL_AHEAD=1; default 0): each
-# call otherwise waits on its first chunk's Engram reads (2026-10-09 cold 8K prompt: two calls, 340-495 + 398-414 ms
-# of 6.2 s TTFT). The same rows; a call that starts elsewhere reads as before
-PREFILL_AHEAD = os.environ.get("TF_DSV41_PREFILL_AHEAD", "0") == "1"
+# a prompt's next prefill call's first chunk read while this call runs (TF_DSV41_PREFILL_AHEAD, default 1 since
+# 2026-10-09; 0: off): each call otherwise waits on its first chunk's Engram reads (cold 8K prompt: two calls,
+# 340-495 + 398-414 ms). Served, uncached 8K TTFT 6.24 -> 5.71 s and 6.09 -> 5.69 s (a third run even), reply shas
+# equal. The same rows; a call that starts elsewhere reads as before
+PREFILL_AHEAD = os.environ.get("TF_DSV41_PREFILL_AHEAD", "1") != "0"
 # the attention-site L2 prefetch also takes the first MiB of the next layer's wq_b words (TF_L2_ATTN_WQB_MB, default 8
 # since 2026-10-09: c1 +0.8%, with lanes +2%, out/perf/ab9-* / ab10-*; 0: none). A prefetch writes nothing
 L2_ATTN_WQB_MB = float(os.environ.get("TF_L2_ATTN_WQB_MB") or 8)
