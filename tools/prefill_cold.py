@@ -2,15 +2,18 @@
 a unique first line each so no cached prefix resumes; TTFT and prompt tok/s per length.
 
 build (where tensorfold is installed): python3 tools/prefill_cold.py build MODEL_DIR PROMPTS.json
-run (any client):                      python3 tools/prefill_cold.py run URL MODEL PROMPTS.json OUT.json"""
+run (any client):                      python3 tools/prefill_cold.py run URL MODEL PROMPTS.json OUT.json
+(TF_API_KEY: the server's key; PREFILL_LENGTHS: a comma list of lengths)"""
 
 import json
+import os
 import statistics
 import sys
 import time
 import urllib.request
 
-LENGTHS = (2048, 8192, 16384, 32768, 65536)
+LENGTHS = tuple(int(v) for v in os.environ.get("PREFILL_LENGTHS", "2048,8192,16384,32768,65536").split(","))
+KEY = os.environ.get("TF_API_KEY", "")               # the server's key, from the environment only
 REPS = 3
 ASK = "\nSay in one sentence what the code above does."
 
@@ -64,7 +67,8 @@ def one(url: str, model: str, m) -> dict:
     body = {"model": model, "messages": m, "max_tokens": 2, "temperature": 0, "stream": True,
             "stream_options": {"include_usage": True}, "chat_template_kwargs": {"enable_thinking": False}}
     req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          **({"Authorization": f"Bearer {KEY}"} if KEY else {})})
     sent, first, usage = time.perf_counter(), None, {}
     with urllib.request.urlopen(req, timeout=3600) as resp:
         for raw in resp:
