@@ -3,6 +3,10 @@
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
 Each model family supplies its own kernels and draft verification.
 
+**This fork (`dsv41-cuda`)** serves DeepSeek-V4.1-Flash with tensor parallel 2 on two DGX Sparks (GB10): see the
+[benchmark](BENCHMARK.md) for its decode, prefill and concurrency numbers and how they were measured, and
+[deploy/dsv41-tp2](deploy/dsv41-tp2) for the two-node setup.
+
 ```bash
 python -m pip install git+https://github.com/ashhart/TensorFold.git
 tensorfold serve Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
