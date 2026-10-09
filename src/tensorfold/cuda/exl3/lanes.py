@@ -14,6 +14,8 @@ Rules (each one can change tokens if broken):
 - convert before anything holds strips decodes or kernels: CUDA graph captures, warm-ups, prefill workspaces
   (``Workspace.held``) — ``convert`` is called at the top of the engine's constructor;
 - set identically on both ranks (deploy compose, tools/dsv41_run2.sh, tools/dsv41_serve2.sh);
+- TF_EXL3_LANES_TWO (default off) picks lanes.cu's two-group kernel for 17-32-row calls (same bits), taken by the
+  extension at load; set it identically on both ranks too (the engine checks);
 - never with PDL around these kernels (jayleaton saw DENSE_V3 + PDL not bit-exact); lanes.cu has no griddepcontrol.
 """
 
@@ -32,6 +34,9 @@ from .linear import _ext as _strips_ext
 # out/perf/ab10-*); TF_EXL3_LANES=0: strips as before
 ENABLED = os.environ.get("TF_EXL3_LANES", "1") != "0"
 HEAD = os.environ.get("TF_EXL3_LANES_HEAD", "0") == "1"     # the vocabulary head too (off: it stays on strips)
+# 17-32-row calls in one pass of two 16-row groups: each weight tile read and decoded once for both (lanes.cu NG 2;
+# same bits; default off until measured on GB10)
+TWO = os.environ.get("TF_EXL3_LANES_TWO", "0") == "1"
 K2S = (4, 6, 8, 10, 12)                                      # lanes.cu's widths (even, take_bits' 64-bit reach)
 WKS = (4, 8)
 
@@ -41,9 +46,11 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_lanes_v1", sources=[str(here / "lanes.cpp"), str(here / "lanes.cu")],
-                extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
-                verbose=False)
+    ext = load(name="tensorfold_exl3_lanes_v2", sources=[str(here / "lanes.cpp"), str(here / "lanes.cu")],
+               extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+               verbose=False)
+    ext.set_two(TWO)
+    return ext
 
 
 def why_not(k2: int, k: int, split: tuple[int, int] | None) -> str | None:

@@ -275,11 +275,11 @@ def _ints_f64(lo: int, hi: int) -> float:
 
 
 def _lanes_words() -> list[int]:
-    """TF_EXL3_LANES / TF_EXL3_LANES_HEAD (cuda/exl3/lanes.py): the two ranks must agree."""
+    """TF_EXL3_LANES / TF_EXL3_LANES_HEAD / TF_EXL3_LANES_TWO (cuda/exl3/lanes.py): the two ranks must agree."""
 
     from tensorfold.cuda.exl3 import lanes
 
-    return [int(lanes.ENABLED), int(lanes.HEAD)]
+    return [int(lanes.ENABLED), int(lanes.HEAD), int(lanes.TWO)]
 
 
 class Dsv41Engine:

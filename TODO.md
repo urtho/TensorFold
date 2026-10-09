@@ -346,8 +346,13 @@ for a whole process regardless of switches: judged on jaybench and repeats.
       call waited on its first chunk's Engram reads (8K: 2 calls, ~0.8 s of 6.2 s TTFT). `TF_DSV41_PREFILL_AHEAD`
       reads the next call's first chunk during this call's last (waits -> 0 ms, reply shas equal); TTFT 6.14 -> 5.71
       s (8K) in one run, within the ~1-3 s run-to-run noise in another: off until a longer A/B
-- [ ] Two RoCE rails; dense two-group pass for 17-32-row rounds; draft-cost curve still over-prices 5-6 rows (no
-      throughput effect measured)
+- [ ] Two RoCE rails; draft-cost curve still over-prices 5-6 rows (no throughput effect measured)
+- [ ] Dense two-group pass for 17-32-row rounds: built on the lanes kernel (`TF_EXL3_LANES_TWO=1`, default off;
+      extension tensorfold_exl3_lanes_v2; branch gap/lanes-two): each weight tile decoded once for both 16-row
+      groups, the same per-group epilogue in pass order, bit-identical to per-pass and strips (tests/cuda,
+      RTX 5070). ptxas sm_121: 4 warps 235-255, 8 warps 245-255 registers, no spills (NG 1 unchanged 151-166 /
+      181-243). RTX 5070 per call (dsv41 5-bit shapes, cold): wq_b -11..-14%, wo_b -7..-11%, wo_a slice / shared w1
+      0..-14%, wq_a|wkv (8 splits) 0..+6% at 17 rows. GB10 A/B with 16 clients pending
 
 ## Open (2026-10-05)
 

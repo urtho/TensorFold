@@ -11,6 +11,8 @@ void exl3_lanes_linear_cuda(const at::Tensor&, const at::Tensor&, int64_t, int64
                             const c10::optional<at::Tensor>&, const c10::optional<at::Tensor>&, int64_t);
 void exl3_lanes_relayout_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, bool);
 void exl3_lanes_unpack_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+void exl3_lanes_set_two(bool);
+bool exl3_lanes_get_two();
 
 static bool width_ok(int64_t K2) { return K2 == 4 || K2 == 6 || K2 == 8 || K2 == 10 || K2 == 12; }
 
@@ -110,4 +112,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("linear_rot_out", &linear_rot_out);
     m.def("relayout", &relayout);
     m.def("unpack", &unpack);
+    // TF_EXL3_LANES_TWO: 17-32-row linears in one pass of two 16-row groups (lanes.cu NG 2; same bits)
+    m.def("set_two", &exl3_lanes_set_two);
+    m.def("get_two", &exl3_lanes_get_two);
 }

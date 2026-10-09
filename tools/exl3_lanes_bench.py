@@ -1,8 +1,11 @@
 """TF_EXL3_LANES microbenchmark: one synthetic EXL3 layer, linear.cu (strips) vs lanes.cu (lanes), the same plan;
-microseconds a call and weight GB/s for each row count, and whether the outputs are bit-identical.
+microseconds a call and weight GB/s for each row count, and whether the outputs are bit-identical. Rows 17-32 also
+time lanes' two-group kernel (TF_EXL3_LANES_TWO: each weight tile decoded once for both 16-row groups) against its
+per-pass kernel ("two" column, its change vs per-pass lanes).
 
     python tools/exl3_lanes_bench.py --k 4096 --n 8192 --bits 5 3 --rows 1 2 6 16
     python tools/exl3_lanes_bench.py --dsv41            # DSV4.1's per-rank dense shapes at 5 bits
+    python tools/exl3_lanes_bench.py --dsv41 --rows 16 17 24 32      # per-pass vs two-group lanes
 
 Cold weights: a scratch buffer larger than L2 is rewritten between calls (``--hot`` skips it)."""
 
@@ -70,14 +73,25 @@ def main() -> None:
             print(f"{nm:12s} {bits:g}b split {a.split}: strips only ({why})")
             continue
         mb = a.nbytes() / 1e6
+        ext = lanes._ext()
+        was = ext.get_two()
         for m in args.rows:
             x = torch.randn((m, k), device="cuda").half()
+            ext.set_two(False)
             ya, yc = a(x), c(x)
             same = torch.equal(ya, yc)
             ta = time_us(lambda a=a, x=x, ya=ya: a(x, out=ya), args.reps, flush)
             tc = time_us(lambda c=c, x=x, yc=yc: c(x, out=yc), args.reps, flush)
+            two = ""
+            if 16 < m <= 32:
+                ext.set_two(True)
+                yt = c(x)
+                same = same and torch.equal(yt, ya)
+                tt = time_us(lambda c=c, x=x, yt=yt: c(x, out=yt), args.reps, flush)
+                two = f"  two {tt:7.1f} us {mb / tt * 1e3:6.1f} GB/s ({(tt - tc) / tc * 100:+5.1f}% vs lanes)"
+            ext.set_two(was)
             print(f"{nm:12s} {bits:g}b split {a.split} rows {m:3d}: strips {ta:7.1f} us {mb / ta * 1e3:6.1f} GB/s"
-                  f"  lanes {tc:7.1f} us {mb / tc * 1e3:6.1f} GB/s  ({(tc - ta) / ta * 100:+5.1f}%)"
+                  f"  lanes {tc:7.1f} us {mb / tc * 1e3:6.1f} GB/s  ({(tc - ta) / ta * 100:+5.1f}%){two}"
                   f"  bit-identical {same}")
 
 
