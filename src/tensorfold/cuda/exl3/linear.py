@@ -296,6 +296,17 @@ def rot_mode() -> int | None:
     return None
 
 
+def _words_ext(layer) -> object:
+    """The extension whose linear / linear_rot_out / unpack read ``layer``'s words: lanes.py's for words repacked by
+    TF_EXL3_LANES (``layout == "lanes"``), else this module's strips kernels (same arguments, same bits)."""
+
+    if getattr(layer, "layout", "strips") == "lanes":
+        from . import lanes
+
+        return lanes._ext()
+    return _ext()
+
+
 def linear_rotated(layer: Exl3Linear, xh: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """``layer(x, out_dtype=...)`` from x's rotated rows xh fp16 [M, K] (rot_in(x, layer.suh)): the same linear
     launch, so the same bits."""
@@ -307,8 +318,9 @@ def linear_rotated(layer: Exl3Linear, xh: torch.Tensor, out_dtype: torch.dtype) 
     out = torch.empty((m, layer.n), dtype=out_dtype, device=xh.device)
     sk, wk = layer.split
     z = torch.empty((sk * m * layer.n,), dtype=torch.float32, device=xh.device) if sk > 1 else None
-    _ext().linear(xh, layer.words, *layer.strides, layer.svh, layer.bias, out, z, layer.counters, layer.k2,
-                  CODEBOOK_IDS[layer.codebook], sk, wk, 0, 0)
+    ext = _words_ext(layer)
+    ext.linear(xh, layer.words, *layer.strides, layer.svh, layer.bias, out, z, layer.counters, layer.k2,
+               CODEBOOK_IDS[layer.codebook], sk, wk, 0, 0)
     return out
 
 
@@ -331,7 +343,7 @@ def grouped_rotated(g: GroupedLinear, xh: torch.Tensor | None, out_dtype: torch.
     out = torch.empty((m, N), dtype=out_dtype, device=xh.device)
     sk, wk = g.split
     z = torch.empty((sk * m * N,), dtype=torch.float32, device=xh.device) if sk > 1 else None
-    ext = _ext()
+    ext = _words_ext(g)
     if rot_out is None:
         ext.linear(xh, g.words, *g.strides, g.svh, None, out, z, g.counters, g.k2, CODEBOOK_IDS[g.codebook], sk, wk,
                    g.k, g.n)

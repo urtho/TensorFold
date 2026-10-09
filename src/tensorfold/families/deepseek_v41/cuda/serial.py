@@ -567,6 +567,23 @@ class _Fixed:
         pass
 
 
+def _to_lanes(w: Weights, rank: int) -> None:
+    """TF_EXL3_LANES=1 (cuda/exl3/lanes.py; default off; set it identically on both ranks): the dense EXL3 linears'
+    words repacked in place to the lanes layout, first thing in the engine (before the L2 tables, warm-ups, graph
+    captures and any prefill workspace), after the tree is loaded or read back from a prepared folder (which keeps
+    strips: the transform is never stored). The vocabulary head stays on strips unless TF_EXL3_LANES_HEAD=1. Refused
+    with PDL (jayleaton saw DENSE_V3 + PDL not bit-exact). Idempotent: converted objects are skipped."""
+
+    from tensorfold.cuda.exl3 import lanes
+
+    if not lanes.ENABLED:
+        return
+    if K.PDL or os.environ.get("TF_X3LD_PDL", "") == "1":
+        raise ValueError("TF_EXL3_LANES=1 is not combined with PDL (TF_DSV41_PDL / TF_X3LD_PDL): set one of them off")
+    lanes.convert(w, exclude=() if lanes.HEAD else (w.head,),
+                  log=lambda msg, **kw: print(f"[rank {rank}] {msg}", **kw))
+
+
 class SerialEngine:
     _deq_comp = None              # ((kv source, visible entries), bf16 decode) for the layers of one prompt chunk
     _ebc = None                   # a decode graph piece's index tensors (IDX_BASE, ``_round_bases``), else None
@@ -579,6 +596,7 @@ class SerialEngine:
     def __init__(self, w: Weights, comm: Comm, engram_dir: str, tokenizer_json: str, *, cap: int = 4096,
                  device: str = "cuda", slots: int = 1, pool_tokens: int | None = None) -> None:
         self.w, self.c, self.comm, self.dev = w, w.cfg, comm, torch.device(device)
+        _to_lanes(w, comm.rank)
         # ``slots`` streams' caches side by side: prompt chunks run in one slot (``state``, views), decode graphs take
         # rows of any slots (``_sid``: each row's slot, so a row reads and writes only its own stream's caches)
         self.slots, self.slot, self._sid = int(slots), 0, None

@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .linear import CODEBOOK_IDS, Exl3Linear, _ext
+from .linear import CODEBOOK_IDS, Exl3Linear, _ext, _words_ext
 
 HAD_SCALE = 0.08838834764831845          # 1 / sqrt(128)
 BN = 128                                  # a program's columns: one Hadamard block
@@ -97,7 +97,8 @@ def matmul(layer: Exl3Linear, x: torch.Tensor, out: torch.Tensor, ws: Workspace,
     ext.rot_in(x if x.stride(1) == 1 else x.contiguous(), layer.suh, xh)
     wq = ws._grow("w", k * n, x.device)[:k * n].view(k, n)
     if ws.held is not layer:
-        ext.unpack(layer.words, wq, *layer.strides, layer.k2, CODEBOOK_IDS[layer.codebook])
+        # (TF_EXL3_LANES: lanes words decode through lanes.cu's unpack, the same W_q values)
+        _words_ext(layer).unpack(layer.words, wq, *layer.strides, layer.k2, CODEBOOK_IDS[layer.codebook])
         ws.held = layer
     bm, bk, warps, stages, group = tiles(k, n)
     bias = layer.bias if layer.bias is not None else layer.svh

@@ -210,6 +210,15 @@ Parts of the DeepSeek-V4.1 serving path are adapted from Jay Leaton's
   (`TF_X3LD_ORDER`), deeper load rings and a 4..6 width instance, more probe instances. `x3ld.py` drops the PDL launch
   and renames the switch to `TF_EXPERT_LOADS`. The license is included in `LICENSES/JayLeaton-MIT.txt`;
   each file keeps its SPDX line and states what was changed.
+- The dense linears' "lanes" layout (`src/tensorfold/cuda/exl3/lanes.cu`, `lanes.cpp`, used by `lanes.py` under
+  `TF_EXL3_LANES`) adapts its DeepSeek-V4.1 family's `dense3.cu` and `dense3.cpp` (DENSE_V3: the per-strip bit
+  permutation, the relayout kernels, `take_bits` / `pair_frags` / `load_group`, the k loop with the next group and the
+  next A fragment loaded ahead, the lanes unpack kernel; `patches/0002-deepseek-v41-family.patch`), MIT License,
+  Copyright (c) 2026 Jay Leaton. Changed: it is built on our `linear.cu` `linear_kernel` (column groups, bias, the
+  rotated-output epilogue, every codebook, its statements after the k loop verbatim), launched without PDL, and the
+  layout is applied in place after the weights load (never stored in a prepared folder). `tests/test_exl3_lanes_emu.py`
+  adapts its `tests/dsv41_dense3_emu.py` and checks the states against our `decode.cuh`. The license is included in
+  `LICENSES/JayLeaton-MIT.txt`; each file keeps its SPDX line and states what was changed.
 - The prepared per-rank weight folders (`src/tensorfold/families/deepseek_v41/cuda/fastboot.py`, used by `make prepare`
   and `TF_DSV41_PREPARED` in `deploy/dsv41-tp2/`) adapt its DeepSeek-V4.1 family's `fastboot.py` (`patches/0002`): the
   key, the manifest and `data.bin` layout, the parallel O_DIRECT reader with per-chunk SHA-256, and the `prepare` /

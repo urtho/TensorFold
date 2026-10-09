@@ -274,6 +274,14 @@ def _ints_f64(lo: int, hi: int) -> float:
     return struct.unpack("<d", struct.pack("<ii", int(lo), int(hi)))[0]
 
 
+def _lanes_words() -> list[int]:
+    """TF_EXL3_LANES / TF_EXL3_LANES_HEAD (cuda/exl3/lanes.py): the two ranks must agree."""
+
+    from tensorfold.cuda.exl3 import lanes
+
+    return [int(lanes.ENABLED), int(lanes.HEAD)]
+
+
 class Dsv41Engine:
     """Both ranks build the same engine (weights split by ``split.py``); ``generate`` on rank 0, ``follow`` on rank 1."""
 
@@ -324,12 +332,12 @@ class Dsv41Engine:
         self.streams = max(1, int(parallel))
         mine = [cap, int(bool(drafts)), int(explicit), self.streams, int(SHARED_POOL and self.streams > 1),
                 KEPT_ENTRIES, *_widths_words(), *_keep_words(), *_disk_words(), *_kv_words(),
-                *_copy_words(), int(SEND == "one")]
+                *_copy_words(), int(SEND == "one"), *_lanes_words()]
         both = self._gather_ints(mine)
         if both[0] != both[1]:
             raise RuntimeError(f"the two ranks were started with different settings (context, drafts, parallel, "
                                f"TF_DSV41_DISK*, TF_DSV41_KV and its knobs, TF_MULTI_COPY / TF_COPY_*, "
-                               f"TF_DSV41_SEND): rank 0 {both[0]}, rank 1 {both[1]}; give both the same flags")
+                               f"TF_DSV41_SEND, TF_EXL3_LANES*): rank 0 {both[0]}, rank 1 {both[1]}; give both the same flags")
         started = time.perf_counter()
         self._boot = [("start", started)]
         self._traced: dict[str, list[str]] | None = None
