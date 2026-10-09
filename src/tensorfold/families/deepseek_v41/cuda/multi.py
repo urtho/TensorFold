@@ -1217,11 +1217,12 @@ class MultiDecoder:
                 stop = split
             # a call bounds its chunks by the next kept point at or after its end, so the state kept there is exact in
             # every layer (rows' values do not depend on it: the deep layers keep only their windows)
+            if PREFILL_AHEAD and stop < n:                  # the next step's first chunk, read during this one's last
+                nxt = min(n, stop + rows, next((p for p in points if stop + ROWS < p), n))
+                p1 = len(e.state.ids) + stop - s.pos
+                e.ahead_next = (list(e.state.ids) + list(s.prompt[s.pos:nxt]), p1, min(MAX_ROWS, nxt - stop))
             logits = e.prefill(s.prompt[s.pos:stop], final=next((p for p in points if p >= stop), n))
             s.pos = stop
-            if PREFILL_AHEAD and stop < n:                  # the next step's first chunk, read now
-                nxt = min(n, stop + rows, next((p for p in points if stop + ROWS < p), n))
-                e.read_ahead(list(e.state.ids) + list(s.prompt[stop:nxt]), len(e.state.ids), min(MAX_ROWS, nxt - stop))
             if split is not None:
                 self._keep(s, self.ext[s.sid], e.state.ids, e.ring_from[s.slot])
             if stop < n:

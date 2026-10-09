@@ -669,6 +669,7 @@ class SerialEngine:
         self._pin_done: dict = {}                        # pinned Engram buffer -> event after its last copy out
         self._pool = None
         self._carry = None                              # (key, future): the next prefill call's first rows (AHEAD)
+        self.ahead_next = None                          # (ids, p0, R): that read, started at this call's last chunk
         self.adaptive = True
         self.taps: list[torch.Tensor] = []
         self.cap = cap
@@ -1995,7 +1996,9 @@ class SerialEngine:
         ids = list(self.state.ids) + list(prompt)
         ends = starts[1:] + [base + len(prompt)]
         carry, self._carry = self._carry, None
-        if carry is not None and carry[0] == self._carry_key(ids, starts[0], ends[0] - starts[0]):
+        key = self._carry_key(ids, starts[0], ends[0] - starts[0])
+        took = carry is not None and carry[0] == key
+        if took:
             ahead = carry[1]                                    # (read while the previous call ran)
         else:
             ahead = self.prefetch(ids, starts[0], ends[0] - starts[0], 0)
@@ -2009,11 +2012,15 @@ class SerialEngine:
                 waits.append(1e3 * (time.perf_counter() - t0))
             if i + 1 < len(starts):
                 ahead = self.prefetch(ids, starts[i + 1], ends[i + 1] - starts[i + 1], (i + 1) % 2)
+            elif self.ahead_next is not None:                   # (AHEAD: the next call's, while this chunk runs)
+                self.read_ahead(*self.ahead_next)
+                self.ahead_next = None
             encode = BOUNDED_TAIL and final is not None and ends[i] <= final - self.tail_min and R > PROMPT_ROWS
             logits = self.forward(ids[p0:p0 + R], last_only=True, raw=raw, prompt=True, encode=encode)
         if PREFILL_PROF and self.comm.rank == 0:
+            miss = "" if carry is None or took else f" (read ahead {carry[0][:3]}, wanted {key[:3]})"
             print(f"[prefill] {len(prompt)} tokens from {base}, {len(starts)} chunk(s): Engram read wait first "
-                  f"{waits[0]:.0f} ms, later {sum(waits[1:]):.0f} ms", flush=True)
+                  f"{waits[0]:.0f} ms{' (read ahead)' if took else miss}, later {sum(waits[1:]):.0f} ms", flush=True)
         return logits
 
     @torch.no_grad()
