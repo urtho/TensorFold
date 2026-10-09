@@ -241,6 +241,9 @@ PREFILL_PROF = os.environ.get("TF_DSV41_PREFILL_PROF", "0") == "1"
 # call otherwise waits on its first chunk's Engram reads (2026-10-09 cold 8K prompt: two calls, 340-495 + 398-414 ms
 # of 6.2 s TTFT). The same rows; a call that starts elsewhere reads as before
 PREFILL_AHEAD = os.environ.get("TF_DSV41_PREFILL_AHEAD", "0") == "1"
+# the attention-site L2 prefetch also takes the first MiB of the next layer's wq_b words (TF_L2_ATTN_WQB_MB; 0, the
+# default: none). A prefetch writes nothing: the same values
+L2_ATTN_WQB_MB = float(os.environ.get("TF_L2_ATTN_WQB_MB") or 0)
 # decode graphs are captured at these key widths (tokens) besides the full limit; a step replays the narrowest that
 # covers its rows' positions, so indexer scores, block choice and top-k run over [R, width // ratio] instead of the
 # limit's (the same entries are chosen: past a row's position every score is -inf). Each width's 32 graphs cost
@@ -631,8 +634,11 @@ class SerialEngine:
                     self._pf_moe[lw.index] = table([m.gate, *sh])
                 if i + 1 < len(w.layers) and on("attn"):
                     a = w.layers[i + 1].attn
-                    self._pf_attn[lw.index] = table([a.wq_a.suh, a.wq_a.words, a.wkv.suh, a.wkv.words] if L2_BULK
-                                                    else [a.wq_a.words, a.wkv.words])
+                    ts = [a.wq_a.suh, a.wq_a.words, a.wkv.suh, a.wkv.words] if L2_BULK else [a.wq_a.words, a.wkv.words]
+                    if L2_ATTN_WQB_MB > 0:                              # (and a prefix of the next wq_b's words)
+                        wq = a.wq_b.words.reshape(-1)
+                        ts.append(wq[:min(wq.numel(), int(L2_ATTN_WQB_MB * 2 ** 20) // wq.element_size())])
+                    self._pf_attn[lw.index] = table(ts)
         if L2_BULK and comm.rank == 0:
             mib = {n: sum(int(t[1].sum()) for t in d.values()) / 2 ** 20 / max(len(d), 1)
                    for n, d in (("moe", self._pf_moe), ("attn", self._pf_attn), ("woa", self._pf_woa)) if d}
