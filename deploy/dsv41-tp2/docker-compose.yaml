@@ -113,6 +113,7 @@ services:
       TF_DSV41_PREFILL_PROF: ${TF_DSV41_PREFILL_PROF:-} # 1: each prefill call logs its Engram read waits
       TF_DSV41_PREFILL_AHEAD: ${TF_DSV41_PREFILL_AHEAD:-} # 1: a prompt's next prefill step's first Engram rows read ahead
       TF_L2_ATTN_WQB_MB: ${TF_L2_ATTN_WQB_MB:-}       # MiB of the next wq_b prefetched at the attention site (0: none)
+      TF_DSV41_PROMPT_CHUNK: ${TF_DSV41_PROMPT_CHUNK:-} # prompt rows a call (a multiple of 2048; default 2048)
       # 1: dense EXL3 linears over the repacked "lanes" layout (same bits; both ranks alike; refused with PDL);
       # _HEAD=1: the vocabulary head too
       TF_EXL3_LANES: ${TF_EXL3_LANES:-}

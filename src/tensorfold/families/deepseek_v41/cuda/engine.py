@@ -34,7 +34,8 @@ FIXED_GIB = float(os.environ.get("TF_DSV41_FIXED_GIB") or "4")      # engine buf
 # left to the OS (unified memory: an OOM wedges); 2.5 left 2.8-2.9 GiB available after warm-up on aiai, under the
 # dev loop's 3 GiB floor (notes/dsv41/DEV.md)
 RESERVE_GIB = float(os.environ.get("TF_DSV41_RESERVE_GIB") or "3")
-PROMPT_TRANSIENT_GIB = 1.5       # a prompt chunk's buffers beyond the context's (expert Z, GEMM workspace, ...)
+PROMPT_TRANSIENT_GIB = 1.5 * int(os.environ.get("TF_DSV41_PROMPT_CHUNK") or 2048) / 2048   # a prompt chunk's buffers
+#                                beyond the context's (expert Z, GEMM workspace, ...), at 2048 rows a chunk
 
 
 def warm_serving_mode() -> str:

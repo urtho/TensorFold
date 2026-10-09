@@ -32,8 +32,12 @@ BF, F32 = torch.bfloat16, torch.float32
 
 def triton_cdiv(a: int, b: int) -> int:
     return -(-a // b)
-MAX_ROWS = 2048              # rows of one call (prompt chunks); every expert's weights are read once a chunk
-RING = 4096                  # prompt staging rings: a 2048-row chunk plus the 127-token window
+# rows of one call (prompt chunks); every expert's weights are read once a chunk (TF_DSV41_PROMPT_CHUNK, a multiple
+# of 2048; default 2048): a chunk's rows past PROMPT_ROWS take the same values whatever the chunk's length
+MAX_ROWS = int(os.environ.get("TF_DSV41_PROMPT_CHUNK") or 2048)
+if MAX_ROWS % 2048:
+    raise ValueError(f"TF_DSV41_PROMPT_CHUNK={MAX_ROWS}: a multiple of 2048")
+RING = max(4096, 2 * MAX_ROWS)  # prompt staging rings: a chunk plus the 127-token window
 DRING = 256                  # a stream slot's decode rings: the 128-token window, a round's rows, margin
 WINDOW_ROWS = 130            # ring rows a stream carries between prefill and decode (window + compressor pair)
 
