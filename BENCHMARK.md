@@ -13,6 +13,7 @@ All numbers below are taken over HTTP from the running server, the way any clien
 | Model | DeepSeek-V4.1-Flash, Mia-AI-Lab EXL3 2.9 bpw quant |
 | Engine | this TensorFold fork, CUDA graphs, FP4 KV cache, DSpark speculative drafter (up to 5 drafts a round) |
 | Server | `deploy/dsv41-tp2` compose: `--parallel 16 --context 614400 --reasoning-effort low`, every other switch at its default |
+| KV cache | one shared FP4 pool of **5,150,720 tokens** for 16 streams of up to 614,400 tokens each (+ 8 GiB of kept prompt states on NVMe) |
 
 Every speed change in this fork is exact: a drafted reply has the same tokens as plain greedy decode, and the
 quick-tier fingerprint suite is unchanged across changes.
