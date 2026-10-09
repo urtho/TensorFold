@@ -1219,6 +1219,9 @@ class MultiDecoder:
             # every layer (rows' values do not depend on it: the deep layers keep only their windows)
             logits = e.prefill(s.prompt[s.pos:stop], final=next((p for p in points if p >= stop), n))
             s.pos = stop
+            if stop < n:                                    # (PREFILL_AHEAD: the next step's first chunk, read now)
+                nxt = min(n, stop + rows, next((p for p in points if stop + ROWS < p), n))
+                e.read_ahead(list(e.state.ids) + list(s.prompt[stop:nxt]), len(e.state.ids), min(MAX_ROWS, nxt - stop))
             if split is not None:
                 self._keep(s, self.ext[s.sid], e.state.ids, e.ring_from[s.slot])
             if stop < n:

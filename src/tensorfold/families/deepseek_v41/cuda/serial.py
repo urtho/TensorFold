@@ -237,6 +237,10 @@ PROMPT_ROWS = int(os.environ.get("TF_DSV41_DECODE_ROWS") or 32)
 IDX_FORK = os.environ.get("TF_DSV41_IDX_FORK", "1") != "0"              # (default since 2026-10-09)
 # each prefill call's wait on its Engram row reads, first chunk and the rest (TF_DSV41_PREFILL_PROF=1; a diagnostic)
 PREFILL_PROF = os.environ.get("TF_DSV41_PREFILL_PROF", "0") == "1"
+# a prompt's next prefill call's first chunk read while this call runs (TF_DSV41_PREFILL_AHEAD=1; default 0): each
+# call otherwise waits on its first chunk's Engram reads (2026-10-09 cold 8K prompt: two calls, 340-495 + 398-414 ms
+# of 6.2 s TTFT). The same rows; a call that starts elsewhere reads as before
+PREFILL_AHEAD = os.environ.get("TF_DSV41_PREFILL_AHEAD", "0") == "1"
 # decode graphs are captured at these key widths (tokens) besides the full limit; a step replays the narrowest that
 # covers its rows' positions, so indexer scores, block choice and top-k run over [R, width // ratio] instead of the
 # limit's (the same entries are chosen: past a row's position every score is -inf). Each width's 32 graphs cost
@@ -664,6 +668,7 @@ class SerialEngine:
         self._pinned: list = []
         self._pin_done: dict = {}                        # pinned Engram buffer -> event after its last copy out
         self._pool = None
+        self._carry = None                              # (key, future): the next prefill call's first rows (AHEAD)
         self.adaptive = True
         self.taps: list[torch.Tensor] = []
         self.cap = cap
@@ -1027,6 +1032,18 @@ class SerialEngine:
 
             self._pool = ThreadPoolExecutor(max_workers=1)
         return self._pool.submit(self.read_rows, list(ids), p0, R, slot)
+
+    def _carry_key(self, ids: list[int], p0: int, R: int) -> tuple:
+        n = self.c.engram_max_ngram_size - 1                # the rows' n-gram history and tokens
+        return self.slot, p0, R, tuple(ids[max(0, p0 - n):p0 + R])
+
+    def read_ahead(self, ids: list[int], p0: int, R: int) -> None:
+        """PREFILL_AHEAD: start reading the Engram rows of positions p0 .. p0 + R - 1 of ``ids`` (a later prefill
+        call's first chunk) into pinned buffer 2, used only for this; the call takes them if it starts there with
+        the same tokens, else reads as before."""
+
+        if PREFILL_AHEAD and R > 0:
+            self._carry = (self._carry_key(ids, p0, R), self.prefetch(ids, p0, R, 2))
 
     def engram_rows(self, tokens: list[int], raw: torch.Tensor | None = None) -> torch.Tensor:
         """Commit the tokens and read their Engram rows (or take ``raw`` read ahead): fp32 [layers, R, 24, 256]."""
@@ -1977,7 +1994,11 @@ class SerialEngine:
             starts[-1] = base + len(prompt) - small              # (the chunk before stays > PROMPT_ROWS)
         ids = list(self.state.ids) + list(prompt)
         ends = starts[1:] + [base + len(prompt)]
-        ahead = self.prefetch(ids, starts[0], ends[0] - starts[0], 0)
+        carry, self._carry = self._carry, None
+        if carry is not None and carry[0] == self._carry_key(ids, starts[0], ends[0] - starts[0]):
+            ahead = carry[1]                                    # (read while the previous call ran)
+        else:
+            ahead = self.prefetch(ids, starts[0], ends[0] - starts[0], 0)
         logits = None
         waits = []
         for i, p0 in enumerate(starts):
