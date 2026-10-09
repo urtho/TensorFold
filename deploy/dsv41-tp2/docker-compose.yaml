@@ -113,6 +113,10 @@ services:
       TF_DSV41_PREFILL_PROF: ${TF_DSV41_PREFILL_PROF:-} # 1: each prefill call logs its Engram read waits
       TF_DSV41_PREFILL_AHEAD: ${TF_DSV41_PREFILL_AHEAD:-} # 1: a prompt's next prefill step's first Engram rows read ahead
       TF_L2_ATTN_WQB_MB: ${TF_L2_ATTN_WQB_MB:-}       # MiB of the next wq_b prefetched at the attention site (0: none)
+      # 1: dense EXL3 linears over the repacked "lanes" layout (same bits; both ranks alike; refused with PDL);
+      # _HEAD=1: the vocabulary head too
+      TF_EXL3_LANES: ${TF_EXL3_LANES:-}
+      TF_EXL3_LANES_HEAD: ${TF_EXL3_LANES_HEAD:-}
       # copy drafts in concurrent rounds (empty / 0: off, 1: on; exact) and the kept share under which a stream backs
       # off (0.3); neither enters the calibration cache's key
       TF_MULTI_COPY: ${TF_MULTI_COPY:-}
