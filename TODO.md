@@ -284,8 +284,8 @@ merged-off / on, alternating x2; the quick tier with every switch on gives bbc5e
     16.8 s vs 26.7 (boot 61.5 s vs 92), 15-minute soak (288 requests, 0 errors, 0 sha splits) + stress clean, no
     late kernel loads. `TF_DSV41_WARM_SERVING=full` keeps the old battery. Not run: a >128K request after a trim
     boot (warm_rare's shapes), encode (BOUNDED_TAIL) chunks in either battery
-- [ ] `TF_DSV41_SEND=one` (one exchange a message) and `TF_RDMA_TRACE`: measure on the served path
-- [ ] Still open from the design: norm + rot_in fusion, dense-lane EXL3 decode, RoCE two rails, first-start PP dip
+- [x] `TF_DSV41_SEND=one`, `TF_RDMA_TRACE`, norm + rot_in fusion, dense lanes, RoCE two rails, first-start PP dip:
+      measured or built in Phase 10 below
 - [x] Grammar-constrained streams draft (`TF_DSV41_DRAFT_GRAMMAR`, 6542b0d; on in the deployment): before, every
       response_format / tool-grammar reply verified one row a round, its reasoning included (accepted=0/0). Served:
       the same replies (12 verdicts' tokens and content equal; structured schemas PASS), ~55% of drafts kept, but at 6
@@ -299,8 +299,61 @@ merged-off / on, alternating x2; the quick tier with every switch on gives bbc5e
       room for the answer) turns those into answers
 
 
+## Phase 10 — peer decode gap and the remaining TODO levers (2026-10-09, out/perf/)
+
+Gap analysis vs bertholomus (6-row verify 36.8 vs our 39.7 ms): out/perf/gap-plan.md, gap.json (44-agent design
+workflow), gap-attn.md (attention / indexer pass). Every lever exact, behind a switch, GPU unit tests on GB10, quick
+tier fingerprints equal; A/Bs alternating, jaybench reply shas equal. Decode-bench windows sometimes read ~3 ms high
+for a whole process regardless of switches: judged on jaybench and repeats.
+
+- [x] On by default (2f88d69), confirmation A/B out/perf/ab8-* (3 reps): code 84.3-85.0 -> 85.9-86.6, structured
+      122.4-123.3 -> 125.8-126.7, c1 105.8-106.3 -> 108.6-110.2, edit 178.8-180.4 -> 184.1-184.9, docs 116.5-116.9 ->
+      119.3-120.0 tok/s; 4 / 6-row windows 35.0 / 39.7 -> 34.3 / 38.9-39.1 ms:
+  - moe L2 discard in 4-32-row calls (`TF_DSV41_L2_DISCARD` default moe, `_ROWS` 4-32): the main window gain
+  - candidate top-k bound (`TF_DSV41_CAND_BOUND`): 65536-key graphs scanned 16384 candidate lanes at any context
+  - indexer q / weights beside the attention branches (`TF_DSV41_IDX_FORK`)
+  - predicated gather copy-out (`TF_RDMA_COPY=pred`), parallel expert grouping (`TF_EXPERT_GROUP=par`), grouped
+    drafter linears (`TF_DSV41_DRAFT_GROUP`): neutral alone, in the winning set
+- [x] Calibration rows 1..8 best-of-16 (c4402f9): at best-of-4 the 4-6-row costs varied per process (row 4
+      38.98-40.31 ms) enough to plan one draft fewer for a process's life (structured 112 vs 124 tok/s, same tokens);
+      the server caches the curve per revision, so one bad timing held for a whole deployment
+- [x] Built, exact, no gain, left off: `TF_X3LD_PDL`, `TF_DSV41_ROUTE_WARPS=1`, `TF_ROUTER_BE=16`,
+      `TF_DSV41_COST_CURVE` (measured curve: none; flat: -15% prose/docs), `TF_DSV41_DRAFT_BORROW`, `TF_DSV41_SEND=one`
+- [x] Rejected: `TF_DSV41_TOPK_DIGITS=11` (2048-bin histograms cost more than the pass saved: code -3%)
+- [x] Dense lanes (`TF_EXL3_LANES`, jayleaton's DENSE_V3 layout, own extension tensorfold_exl3_lanes_v1; 1b5cc22
+      on by default) + `TF_L2_ATTN_WQB_MB=8` (the next layer's wq_b prefix at the attention site, default 8): GB10
+      A/B out/perf/ab10-* (3 reps, on top of the set above) code 86.9-87.3 -> 88.5-88.9, structured 126.3-126.9 ->
+      129.2-129.4, c1 109.7-110.1 -> 111.9-112.3, docs 119.5-120.0 -> 121.4-122.1; lanes alone about half. The gate:
+      an isolated 5-bit 4096x8192 layer ran 194 GB/s (3-bit 154) flat over 1-6 rows, so the time was in the k loop.
+      Per call bit-identical, wo_a slices -10%, wq_b -4.5%, wo_b -2..-6.5%; 319 matrices (2.1 GiB) repacked at load,
+      47 kept on strips (odd k steps a warp, 8-bit); quick-tier fingerprints equal. Never with PDL (refused). Served
+      on the defaults (image 56916dd8): fingerprints equal, 15-minute soak 297 requests 0 errors 0 sha splits, stress
+      ok. Boot 115.6 s: the repack adds ~19 s ("caches" 21.2 vs 2.3 s; worth doing at prepare time)
+- [x] Measured, closed: narrow widths 16384 (no gain at 2K, ~1.2 GB); mHC row sharing (`_pre_partial` flat 1.5-1.7 ms
+      over 1-6 rows); RoCE MTU (4096 already); 16 clients served: copy drafts on/off 127.3-127.6 / 127.9-128.1, fp4
+      127.3-128.1 vs fp8 124.3-125.6 (the old fp8 lead was a stale baseline); norm + rot_in fusion (ROT_FUSE's 80
+      launches unmeasurable, this targets less)
+- [x] Gather trace (TF_RDMA_TRACE, out/perf/m8/trace.txt): per gather at R=1 2K stage 3.2, wait 12.5, copy 0.9 us;
+      R=6 copy 1.7, ack 14 (R=1 5.9). Copy-out gate failed (matches its null A/B); two rails would save <= ~0.25 ms a
+      6-row window / ~2% at 16 clients for an ABI + proxy change: deferred. The wait is protocol latency on both
+      ranks (no skew)
+- [x] Node trace (nsys, out/perf/m8/nsys_step.sqlite): rot_in -> linear_kernel gaps 0.19 us median (the replay
+      floor): dense PDL (D2) closed
+- [x] Weight-traffic audit (notes/dsv41/WEIGHT_TRAFFIC.md): dense 16 -> 17 rows +3.7 ms a round (dense +4.4; 17-32
+      rows, concurrency only); a two-group pass needs > 255 registers (hot instances 213-235 + 64 accumulators):
+      deferred to a kernel restructure. Expert member tiles > 16: concurrency only
+- [x] Cold prefill (`TF_DSV41_PREFILL_PROF`): no first-start penalty left (6.3 vs 5.9-6.2 s at 8K); every prefill
+      call waited on its first chunk's Engram reads (8K: 2 calls, ~0.8 s of 6.2 s TTFT). `TF_DSV41_PREFILL_AHEAD`
+      reads the next call's first chunk during this call's last (waits -> 0 ms, reply shas equal); TTFT 6.14 -> 5.71
+      s (8K) in one run, within the ~1-3 s run-to-run noise in another: off until a longer A/B
+- [ ] Two RoCE rails; dense two-group pass for 17-32-row rounds; draft-cost curve still over-prices 5-6 rows (no
+      throughput effect measured)
+
 ## Open (2026-10-05)
 
+- [x] Decode weight-traffic audit (done in Phase 10): distinguish unique weights, repeated load requests and actual DRAM reads;
+      test dense 16→17-row passes, expert member tiles, mHC row sharing and prefetch effectiveness.
+      Findings and measurement plan: [notes/dsv41/WEIGHT_TRAFFIC.md](notes/dsv41/WEIGHT_TRAFFIC.md) (2026-10-09).
 - [x] RoCE GID index robustness (70abae0): no fixed index; NCCL (`NCCL_IB_ADDR_FAMILY=AF_INET`, RoCE v2, 10.42.0.0/15)
       and the RoCE all-gather find the IPv4 RoCE v2 GID per device (a reboot under a live QP moved aiai2's to 4)
 - [x] FP4 prefill gap (67d6b36, bit-identical): row-tiled segment scores, one tie-keyed pick a pass, prompt entries
