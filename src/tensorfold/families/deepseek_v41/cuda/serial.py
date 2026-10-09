@@ -241,9 +241,9 @@ PREFILL_PROF = os.environ.get("TF_DSV41_PREFILL_PROF", "0") == "1"
 # call otherwise waits on its first chunk's Engram reads (2026-10-09 cold 8K prompt: two calls, 340-495 + 398-414 ms
 # of 6.2 s TTFT). The same rows; a call that starts elsewhere reads as before
 PREFILL_AHEAD = os.environ.get("TF_DSV41_PREFILL_AHEAD", "0") == "1"
-# the attention-site L2 prefetch also takes the first MiB of the next layer's wq_b words (TF_L2_ATTN_WQB_MB; 0, the
-# default: none). A prefetch writes nothing: the same values
-L2_ATTN_WQB_MB = float(os.environ.get("TF_L2_ATTN_WQB_MB") or 0)
+# the attention-site L2 prefetch also takes the first MiB of the next layer's wq_b words (TF_L2_ATTN_WQB_MB, default 8
+# since 2026-10-09: c1 +0.8%, with lanes +2%, out/perf/ab9-* / ab10-*; 0: none). A prefetch writes nothing
+L2_ATTN_WQB_MB = float(os.environ.get("TF_L2_ATTN_WQB_MB") or 8)
 # decode graphs are captured at these key widths (tokens) besides the full limit; a step replays the narrowest that
 # covers its rows' positions, so indexer scores, block choice and top-k run over [R, width // ratio] instead of the
 # limit's (the same entries are chosen: past a row's position every score is -inf). Each width's 32 graphs cost
@@ -582,7 +582,8 @@ def _to_lanes(w: Weights, rank: int) -> None:
     if not lanes.ENABLED:
         return
     if K.PDL or os.environ.get("TF_X3LD_PDL", "") == "1":
-        raise ValueError("TF_EXL3_LANES=1 is not combined with PDL (TF_DSV41_PDL / TF_X3LD_PDL): set one of them off")
+        raise ValueError("TF_EXL3_LANES (on by default) is not combined with PDL (TF_DSV41_PDL / TF_X3LD_PDL): set "
+                         "TF_EXL3_LANES=0 or the PDL switch off")
     lanes.convert(w, exclude=() if lanes.HEAD else (w.head,),
                   log=lambda msg, **kw: print(f"[rank {rank}] {msg}", **kw))
 

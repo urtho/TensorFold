@@ -28,7 +28,9 @@ import torch
 from .linear import CODEBOOK_IDS, Exl3Linear, GroupedLinear
 from .linear import _ext as _strips_ext
 
-ENABLED = os.environ.get("TF_EXL3_LANES", "0") == "1"
+# on by default since 2026-10-09 (DeepSeek-V4.1 converts at load; jaybench +1%, with TF_L2_ATTN_WQB_MB=8 +1.7-2%,
+# out/perf/ab10-*); TF_EXL3_LANES=0: strips as before
+ENABLED = os.environ.get("TF_EXL3_LANES", "1") != "0"
 HEAD = os.environ.get("TF_EXL3_LANES_HEAD", "0") == "1"     # the vocabulary head too (off: it stays on strips)
 K2S = (4, 6, 8, 10, 12)                                      # lanes.cu's widths (even, take_bits' 64-bit reach)
 WKS = (4, 8)
