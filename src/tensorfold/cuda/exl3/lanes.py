@@ -14,7 +14,7 @@ Rules (each one can change tokens if broken):
 - convert before anything holds strips decodes or kernels: CUDA graph captures, warm-ups, prefill workspaces
   (``Workspace.held``) — ``convert`` is called at the top of the engine's constructor;
 - set identically on both ranks (deploy compose, tools/dsv41_run2.sh, tools/dsv41_serve2.sh);
-- TF_EXL3_LANES_TWO (default off) picks lanes.cu's two-group kernel for 17-32-row calls (same bits), taken by the
+- TF_EXL3_LANES_TWO (default on since 2026-10-09: GB10 windows 17 / 24 / 32 rows -1.5 / -1.5 / -2.5 ms; 0: off) picks lanes.cu's two-group kernel for 17-32-row calls (same bits), taken by the
   extension at load; set it identically on both ranks too (the engine checks);
 - never with PDL around these kernels (jayleaton saw DENSE_V3 + PDL not bit-exact); lanes.cu has no griddepcontrol.
 """
@@ -36,7 +36,7 @@ ENABLED = os.environ.get("TF_EXL3_LANES", "1") != "0"
 HEAD = os.environ.get("TF_EXL3_LANES_HEAD", "0") == "1"     # the vocabulary head too (off: it stays on strips)
 # 17-32-row calls in one pass of two 16-row groups: each weight tile read and decoded once for both (lanes.cu NG 2;
 # same bits; default off until measured on GB10)
-TWO = os.environ.get("TF_EXL3_LANES_TWO", "0") == "1"
+TWO = os.environ.get("TF_EXL3_LANES_TWO", "1") != "0"
 K2S = (4, 6, 8, 10, 12)                                      # lanes.cu's widths (even, take_bits' 64-bit reach)
 WKS = (4, 8)
 

@@ -99,9 +99,9 @@ copy none of it into this Apache-2.0 tree.
 - [x] Round costs from real tokens (capture zeros understated multi-row verify); policy picks k by true costs
 - [x] Split Engram reads across ranks (bit-identical; 16 clients 114.9 -> 117.1 tok/s)
 - [x] Shared expert folded into the grouped call: implemented, measured slower (35.0 vs 36.0 serial), off (`TF_FOLD_SHARED=1`)
-- [ ] Serial decode >= 40 tok/s (now ~37.8 with x3ld + fast top-k + RoCE, GPU-bound 96 %): EXL3 decode GEMV toward ~240 GB/s (now ~215 large,
+- [x] Serial decode >= 40 tok/s (2026-10-09: 1-row window 22.0 ms = 45 tok/s with the Phase 9/10 defaults; was ~37.8 with x3ld + fast top-k + RoCE, GPU-bound 96 %): EXL3 decode GEMV toward ~240 GB/s (now ~215 large,
       110-180 small, 199 routed), fuse input rotation into the linear kernel, HC pre/post into one, router + route
-  - [ ] x3ld expert-major order (dead slots last) + pd 3/4 rings on a 4..6 width instance: built, off until A/B
+  - [x] (measured Phase 9: -0.1..-0.5 ms, marginal, left off) x3ld expert-major order (dead slots last) + pd 3/4 rings on a 4..6 width instance: built, off until A/B
         (`TF_X3LD_ORDER=expert`, `TF_EXPERT_LOADS_CFG=4,4/4,3`; same Z; `TF_X3LD_PROBE=3` times the load path alone)
 - [x] Decode graphs at narrow key widths on one graph memory pool (`TF_DSV41_WIDTHS`, default one 64K width;
       4.05 GiB for 32 graphs -> 0.27 GiB for 128): 16 clients at 16 × 614400 101.2 -> 122.5 tok/s (2026-10-03)
@@ -346,16 +346,13 @@ for a whole process regardless of switches: judged on jaybench and repeats.
       call waited on its first chunk's Engram reads (8K: 2 calls, ~0.8 s of 6.2 s TTFT). `TF_DSV41_PREFILL_AHEAD`
       reads the next call's first chunk during this call's last (waits -> 0 ms, reply shas equal); TTFT 6.14 -> 5.71
       s (8K) in one run, within the ~1-3 s run-to-run noise in another: off until a longer A/B
-- [ ] Two RoCE rails; draft-cost curve still over-prices 5-6 rows (no throughput effect measured)
-- [ ] Dense two-group pass for 17-32-row rounds: built on the lanes kernel (`TF_EXL3_LANES_TWO=1`, default off;
-      extension tensorfold_exl3_lanes_v2; branch gap/lanes-two): each weight tile decoded once for both 16-row
-      groups, the same per-group epilogue in pass order, bit-identical to per-pass and strips (tests/cuda,
-      RTX 5070). ptxas sm_121: 4 warps 235-255, 8 warps 245-255 registers, no spills (NG 1 unchanged 151-166 /
-      181-243). RTX 5070 per call (dsv41 5-bit shapes, cold): wq_b -11..-14%, wo_b -7..-11%, wo_a slice / shared w1
-      0..-14%, wq_a|wkv (8 splits) 0..+6% at 17 rows. GB10 A/B with 16 clients pending
-
-## Open (2026-10-05)
-
+- [x] Two RoCE rails: closed (one port, see Open). Draft-cost curve over-pricing: closed (TF_DSV41_COST_CURVE with the
+      measured curve gave no throughput change, out/perf/ab4-*)
+- [x] Dense two-group pass for 17-32-row rounds (`TF_EXL3_LANES_TWO`, on by default): the lanes kernel decodes each
+      tile once for two 16-row accumulator groups (lanes_v2; 4 warps 235-255 registers, no spills). GB10: exact
+      (229 tests, fingerprints equal), per call -5..-12% vs per-pass lanes at 17-32 rows; windows 17 / 24 / 32 rows
+      79.2 / 98.9 / 124.3 -> 77.7 / 97.4 / 121.8 ms, 16 rows unchanged (out/perf/two/); served 16 clients within
+      noise (most rounds <= 16 rows)
 - [x] Decode weight-traffic audit (done in Phase 10): distinguish unique weights, repeated load requests and actual DRAM reads;
       test dense 16→17-row passes, expert member tiles, mHC row sharing and prefetch effectiveness.
       Findings and measurement plan: [notes/dsv41/WEIGHT_TRAFFIC.md](notes/dsv41/WEIGHT_TRAFFIC.md) (2026-10-09).
@@ -372,7 +369,7 @@ for a whole process regardless of switches: judged on jaybench and repeats.
       26.2-26.6 ms vs fp8 26.8-27.0, verify R=2/3/4 30.4/35.8/41.1 vs 31.1/36.3/41.5, drafter 5.0-5.1 both, ~70
       fewer launches a step; server, 6 fixed prompts greedy: fp4 101.2 / fp8 98.2 tok/s; bench_decode C1 (temperature
       0.2: trials 80-104 on one server) fp4 103.3 / fp8 101.6 and 93.0
-- [ ] FP4 tensor-core indexer: parked (not bit-exact against the reference order)
+- [x] FP4 tensor-core indexer: closed (not bit-exact against the reference order; the exactness rule)
 - [x] Dev loop (notes/dsv41/DEV.md): one-load suites and tiers (`tools/dsv41_suite2.sh quick`: 168 s vs 499 s as
       fresh runs), prepared weights in dev runs (22-24 s loads), OOM guard (torch cap + per-run memwatch, start
       refusal), `make hot` / `make cold` (119 s, no image build)
@@ -389,15 +386,18 @@ for a whole process regardless of switches: judged on jaybench and repeats.
 - [ ] Tool-eval fp4 vs fp8: 2-3 repeats each to settle the 6-point gap
 - [x] Dev runs: expandable segments on by default in `dsv41_run2.sh` (4c9b2a3; quick tier fingerprints unchanged)
 - [ ] Draft PR #342: description predates FP4, the CUDA kernels, the dev loop and the doorbell
-- [ ] Serial decode >= 40 tok/s (now ~37.8; see Phase 3)
-- [ ] Copy drafts in concurrent rounds: written behind `TF_MULTI_COPY` (off; CPU tests in
+- [x] Serial decode >= 40 tok/s (45 tok/s, see Phase 3)
+- [x] Copy drafts in concurrent rounds (on by default, 26570cc; Phase 9): written behind `TF_MULTI_COPY` (CPU tests in
       tests/test_dsv41_multi_copy.py); GPU A/B pending (--decoder-test, --jaybench edit,docs,... 0 vs 1)
-- [ ] RoCE two rails
+- [x] RoCE two rails: closed (Phase 10, tools/rdma_bench.py): NCCL over both HCAs = over one (20 KB 20.0 vs 20.8 us,
+      640 KB 199 vs 205 us): the two "rails" are halves of one port; our one-rail gather beats both at every size
 - [x] Triton kernels: `TRITON_CACHE_DIR` / `CUDA_CACHE_PATH` in the cache volume, shared by prebuild and every
       container (efb3911): boot 87 -> 44 s, none compiled on the first start after `make image`; a changed kernel
       compiles once on the first start that runs it (prebuild does not run kernels)
-- [ ] Exact-chunk TTFT mode
-- [ ] More narrow decode widths (each width's graphs cost ~40 MB a graph of driver memory)
+- [x] Exact-chunk TTFT mode (Phase 10): prompt chunks of 4096 rows (`TF_DSV41_PROMPT_CHUNK`, exact: fingerprints
+      equal) prefill 32K at 2214 / 2021 vs 2225 / 2151 tok/s with 2048: no gain. The TTFT lever was the per-call Engram
+      read wait: `TF_DSV41_PREFILL_AHEAD` (on by default, uncached 8K TTFT -0.45 s)
+- [x] More narrow decode widths: no gain at 2K (Phase 10) (each width's graphs cost ~40 MB a graph of driver memory)
 - [x] L2 prefetch sweep: unpaced bulk sites alone / in pairs / together within 0.4 ms of off; paced at 150 GB/s
       (`l2pace.cu`, after jayleaton's G14; all sites, joined at the step's end) the default: 1 / 2 / 4-row windows
       25.2 / 29.9 / 37.9 -> 24.1 / 28.5 / 36.5 ms, single requests code +3.6%, prose +5%, structured +2.6%, c1 +2.3%
@@ -409,9 +409,11 @@ for a whole process regardless of switches: judged on jaybench and repeats.
       81.2 / 44.7 / 117.8 / 45.8 (jayleaton G19 84.7 / 46.8 / 121.3), same replies, identical round counts across reps;
       C1 100.2 -> 106.0, C2 139.3, C3 154.7 -> 164.2, C4 154.2 -> 152.9, hard 38.3 -> 49.4, PP8192 1658 -> 1635,
       100K prefill 2569 -> 2497 (decode 44.0), 16 clients 122.6 -> 124.4 (first start; PP / 100K prefill untouched)
-- [ ] Draft policy: 6-row windows (48.5 ms) vs 4 rows (37.9): a per-k cost model with the drafter's 5 ms and the
+- [x] (Phase 10: the measured cost curve gave no throughput change, ab4; 16 clients prior 0.6 / 0.8 / 0.9 and relax 0 /
+      0.02 all 127.2-129.9 tok/s, out/perf/served17.txt: defaults kept) Draft policy: 6-row windows (48.5 ms) vs 4 rows (37.9): a per-k cost model with the drafter's 5 ms and the
       relax / prior under concurrent load (16 clients) not swept
-- [ ] jayleaton's 1-row window 21.7 ms vs ours 24.1 with pacing: his remaining levers (BRANCHES side priority,
+- [x] (ours now 22.0; Phase 10: priorities ignored in graphs, SEND=one null, copy-out pred in the default set, the
+      lean gather's remaining stage cost is the system fence) jayleaton's 1-row window 21.7 ms vs ours 24.1 with pacing: his remaining levers (BRANCHES side priority,
       ROCE_FAST, plan link) not ported. Landed off, A/B pending (DEV.md): the gather phase trace (`TF_RDMA_TRACE`,
       the go / no-go for a lean gather: >= 2 us kernel overhead at R=1 or >= 5 us copy-out at R=6) and the
       one-exchange ROUND send (`TF_DSV41_SEND=one`, his plan link's idea)
@@ -428,15 +430,15 @@ for a whole process regardless of switches: judged on jaybench and repeats.
       0-1% / ~11 W idle, outputs and latency unchanged
 - [x] Server MemAvailable after warm-up was 2.8-2.9 GiB: TF_DSV41_RESERVE_GIB 2.5 -> 3 (3.86 / 3.91 GiB; pool 6.52M -> 6.41M)
 - [ ] Old `tf-dev-old-*` containers on both nodes can go (keep the `tf-dev-snapshot:*` images: tf-dev runs on them)
-- [ ] Global top-k indices rebuilt every compressed layer in the multi-stream path (`serial.py` attention's static
+- [x] (TF_DSV41_IDX_BASE on by default, Phase 9) Global top-k indices rebuilt every compressed layer in the multi-stream path (`serial.py` attention's static
       branch: idx + the stream's entry base, 6 small ops a layer, ~0.4 ms a step): built once per (index source, kv
       source) with the round's ring / entry bases once a graph piece behind `TF_DSV41_IDX_BASE=1` (default 0 until
       the GPU A/B: quick-tier fingerprints, decode-bench R=1..6, jaybench sha). Passing the base into `K.mqa`
       (idea: vLLM #57659) dropped: ~0.05 ms more for an ext bump
-- [ ] First-start PP8192 dip still seen with zero Triton compiles (1473-1523, then 1830-1856 a minute later): cause open
+- [x] (Phase 10: none left; per-call Engram read wait fixed by PREFILL_AHEAD) First-start PP8192 dip still seen with zero Triton compiles (1473-1523, then 1830-1856 a minute later): cause open
 - [ ] Server MemAvailable 2.7-2.9 GiB under load (3.8 idle) with RESERVE 3: decide whether the 3 GiB floor applies
       under load
-- [ ] 16 clients fp4 122.6 vs fp8 128.0 (~4%): uninvestigated
+- [x] 16 clients fp4 122.6 vs fp8 128.0: now fp4 127.3-128.1 vs fp8 124.3-125.6 (Phase 10; stale baseline)
 - [ ] Triton cache in the serve volume never evicts (98 entries, 42 MB) and is root-owned under ~/.cache
 - [ ] Review test gaps: shared-tile many-stream test never mixes visible bounds within a run at capacities 4096/4100;
       suite2.sh baseline copy handles only `--suite-baseline PATH` under /tf/out
