@@ -328,7 +328,9 @@ for a whole process regardless of switches: judged on jaybench and repeats.
       Per call bit-identical, wo_a slices -10%, wq_b -4.5%, wo_b -2..-6.5%; 319 matrices (2.1 GiB) repacked at load,
       47 kept on strips (odd k steps a warp, 8-bit); quick-tier fingerprints equal. Never with PDL (refused). Served
       on the defaults (image 56916dd8): fingerprints equal, 15-minute soak 297 requests 0 errors 0 sha splits, stress
-      ok. Boot 115.6 s: the repack adds ~19 s ("caches" 21.2 vs 2.3 s; worth doing at prepare time)
+      ok. Boot 115.6 s on that first start ("caches" 21.2 s); the next image (read-ahead + two-group on) booted in
+      76.3 s with "caches" 2.9 s, so the repack itself is cheap. Final served check on the complete defaults: fingerprints
+      equal, soak 315 requests 0 errors 0 sha splits, stress ok
 - [x] Measured, closed: narrow widths 16384 (no gain at 2K, ~1.2 GB); mHC row sharing (`_pre_partial` flat 1.5-1.7 ms
       over 1-6 rows); RoCE MTU (4096 already); 16 clients served: copy drafts on/off 127.3-127.6 / 127.9-128.1, fp4
       127.3-128.1 vs fp8 124.3-125.6 (the old fp8 lead was a stale baseline); norm + rot_in fusion (ROT_FUSE's 80
