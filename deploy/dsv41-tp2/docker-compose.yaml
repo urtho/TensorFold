@@ -122,6 +122,8 @@ services:
       # off (0.3); neither enters the calibration cache's key
       TF_MULTI_COPY: ${TF_MULTI_COPY:-}
       TF_MULTI_COPY_MIN: ${TF_MULTI_COPY_MIN:-}
+      TF_DSV41_DRAFT_PRIOR: ${TF_DSV41_DRAFT_PRIOR:-}   # a request's starting draft acceptance estimate (default 0.8)
+      TF_DSV41_DRAFT_RELAX: ${TF_DSV41_DRAFT_RELAX:-}   # pull toward it each undrafted round (default 0.02)
       # rank 0's messages to rank 1 in one exchange without a host sync (one) or two blocking ones (empty: two);
       # the RoCE gathers' phase trace (ring entries, a power of two; empty: off)
       TF_DSV41_SEND: ${TF_DSV41_SEND:-}
