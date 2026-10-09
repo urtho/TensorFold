@@ -2,7 +2,8 @@
 linear.cu's on the same trellis, bit for bit (torch.equal) — every codebook and even width the kernel builds, 1 to 32
 rows, every lanes split plan, split-K counters reused, bias, output dtypes, grouped linears with their slices, the
 module paths (linear_rotated, grouped_rotated with the rotated-output epilogue, the prompt GEMM's unpack), and the
-in-place conversion rules (data pointer kept, once per storage, exclusions, idempotent)."""
+in-place conversion rules (data pointer kept, once per storage, exclusions, idempotent); TF_EXL3_LANES_TWO's
+two-group kernel against the per-pass one and strips at 1 to 32 rows."""
 
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ if not torch.cuda.is_available():
 
 COMBOS = [("3inst", b) for b in (2, 3, 4, 5, 6)] + [("mcg", b) for b in (2, 3, 4, 6)] \
     + [("mul1", b) for b in (2, 3, 4, 5, 6)]
-ROWS = (1, 2, 6, 16, 17, 32)
+ROWS = (1, 2, 6, 16, 17, 20, 24, 31, 32)
 SPLITS = [(1, 4), (2, 4), (4, 4), (8, 4), (1, 8), (2, 8), (4, 8)]      # K = 1024: per_warp 16 .. 2, all even
 
 
@@ -192,3 +193,118 @@ def test_dsv41_linear_subclass_and_the_prompt_gemm():
         assert torch.equal(c(x[:40]), a(x[:40]))
     finally:
         W.Linear.prompt_mode = False
+
+
+# -- TF_EXL3_LANES_TWO: 17-32 rows in one pass of two 16-row groups (lanes.cu NG 2) ---------------------------------
+TWO_ROWS = tuple(range(1, 33))                    # 1..16 never take NG 2; 17..32 do
+
+
+class _two:
+    """lanes.cu's TF_EXL3_LANES_TWO switch on (or off) inside the block, restored after."""
+
+    def __init__(self, on: bool):
+        self.on = on
+
+    def __enter__(self):
+        self.was = lanes._ext().get_two()
+        lanes._ext().set_two(self.on)
+
+    def __exit__(self, *exc):
+        lanes._ext().set_two(self.was)
+
+
+def _both(fn, *args, **kw):
+    """fn(*args, **kw) with the per-pass kernel, then with the two-group kernel."""
+
+    with _two(False):
+        per = fn(*args, **kw)
+    with _two(True):
+        two = fn(*args, **kw)
+    return per, two
+
+
+@pytest.mark.parametrize("codebook,bits", COMBOS)
+@pytest.mark.parametrize("split", SPLITS)
+def test_two_group_equals_per_pass_and_strips(codebook: str, bits: float, split: tuple[int, int]):
+    """Every codebook, lanes width and split plan, rows 1..32: two-group == per-pass == strips, bit for bit, called
+    repeatedly (split-K counters reset by the last arriver of each 16-row group and reused)."""
+
+    a, c = _pair(codebook, bits, split=split, bias=True)
+    x = torch.randn((32, a.k), device="cuda").half()
+    for m in TWO_ROWS:
+        ref = a(x[:m])
+        for _ in range(3):
+            per, two = _both(c, x[:m])
+            assert torch.equal(per, ref), f"per-pass {m} rows"
+            assert torch.equal(two, ref), f"two-group {m} rows"
+        assert int(c.counters.abs().sum()) == 0, f"counters left non-zero at {m} rows"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_two_group_dtypes(dtype):
+    a, c = _pair("mul1", 5, kt=80, nt=32, bias=True)             # K = 1280 (wq_b's), plan's own split
+    x = torch.randn((32, a.k), device="cuda").to(dtype)
+    for m in (17, 20, 24, 31, 32):
+        for od in (None, torch.float32, torch.bfloat16):
+            ref = a(x[:m], out_dtype=od)
+            per, two = _both(c, x[:m], out_dtype=od)
+            assert torch.equal(per, ref) and torch.equal(two, ref), (m, od)
+
+
+def test_two_group_model_like_shapes():
+    for k, n, bits in ((5120, 1024, 5), (1280, 2048, 5), (4096, 1024, 5), (5120, 1152, 4), (5120, 512, 6)):
+        a, c = _pair("mul1", bits, kt=k // 16, nt=n // 16, seed=k + n)
+        if not lanes.lanes_ok(a.k2, a.k, a.split):
+            continue
+        x = torch.randn((32, k), device="cuda").half()
+        for m in (16, 17, 20, 24, 31, 32):
+            ref = a(x[:m])
+            per, two = _both(c, x[:m])
+            assert torch.equal(per, ref) and torch.equal(two, ref), (k, n, bits, m)
+
+
+def _rot_out_call(g, x: torch.Tensor, suh: torch.Tensor, mode: int):
+    """grouped_rotated with the rotated-output epilogue into a NaN-filled xo: (y, xo)."""
+
+    xo = torch.full((x.shape[0], g.groups * g.n), float("nan"), dtype=torch.float16, device="cuda")
+    return linear.grouped_rotated(g, None, torch.float32, x=x, rot_out=(suh, xo, mode)), xo
+
+
+def test_two_group_grouped_and_rotated_output():
+    """wo_a: the grouped linear (column groups, XS row stride), grouped_rotated, and the rotated-output epilogue
+    (store_rot) at 17..32 rows with the two-group kernel; linear_rotated too."""
+
+    _, ga = _group()
+    _, gc = _group()
+    lanes.convert(gc, log=None)
+    x = torch.randn((32, ga.groups * ga.k), device="cuda").half()
+    mode = linear.rot_mode()
+    suh = torch.from_numpy((np.random.default_rng(5).standard_normal(ga.groups * ga.n) * 0.05).astype(np.float16)).cuda()
+    for m in (17, 20, 24, 31, 32):
+        ref = ga(x[:m])
+        per, two = _both(gc, x[:m])
+        assert torch.equal(per, ref) and torch.equal(two, ref), m
+        ref = linear.grouped_rotated(ga, None, torch.float32, x=x[:m])
+        per, two = _both(linear.grouped_rotated, gc, None, torch.float32, x=x[:m])
+        assert torch.equal(per, ref) and torch.equal(two, ref), m
+        if mode is not None:
+            xo_a = torch.empty((m, ga.groups * ga.n), dtype=torch.float16, device="cuda")
+            ya = linear.grouped_rotated(ga, None, torch.float32, x=x[:m], rot_out=(suh, xo_a, mode))
+
+            (yp, xp), (yt, xt) = _both(_rot_out_call, gc, x[:m], suh, mode)
+            assert torch.equal(yp, ya) and torch.equal(yt, ya), m
+            assert torch.equal(xp, xo_a) and torch.equal(xt, xo_a), m
+    a, c = _pair("mul1", 5, kt=64, nt=32)
+    xs = torch.randn((32, a.k), device="cuda").half()
+    xh = torch.empty((32, a.k), dtype=torch.float16, device="cuda")
+    linear._ext().rot_in(xs, a.suh, xh)
+    for m in (17, 24, 32):
+        ref = linear.linear_rotated(a, xh[:m].contiguous(), torch.float32)
+        per, two = _both(linear.linear_rotated, c, xh[:m].contiguous(), torch.float32)
+        assert torch.equal(per, ref) and torch.equal(two, ref), m
+
+
+def test_two_group_env_switch():
+    """TF_EXL3_LANES_TWO sets the extension's switch at load (default off)."""
+
+    assert lanes._ext().get_two() == lanes.TWO

@@ -118,6 +118,9 @@ services:
       # _HEAD=1: the vocabulary head too
       TF_EXL3_LANES: ${TF_EXL3_LANES:-}
       TF_EXL3_LANES_HEAD: ${TF_EXL3_LANES_HEAD:-}
+      # 1: 17-32-row dense linears in one pass of two 16-row groups, each weight tile decoded once (same bits;
+      # both ranks alike; empty / 0: per 16-row pass)
+      TF_EXL3_LANES_TWO: ${TF_EXL3_LANES_TWO:-}
       # copy drafts in concurrent rounds (empty / 0: off, 1: on; exact) and the kept share under which a stream backs
       # off (0.3); neither enters the calibration cache's key
       TF_MULTI_COPY: ${TF_MULTI_COPY:-}
