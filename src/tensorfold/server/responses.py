@@ -171,6 +171,9 @@ def _run_chat(handler: Any, body: dict[str, Any], wire: Wire) -> None:
     inner.headers = http.client.HTTPMessage()
     inner.headers["Content-Type"] = "application/json"
     inner.headers["Content-Length"] = str(len(data))
+    for name in ("Authorization", "X-API-Key"):      # the chat handler checks the server key again
+        if (value := handler.headers.get(name)) is not None:
+            inner.headers[name] = value
     inner.log_request = lambda *args: None          # the request logs once, as itself
     inner.do_POST()
 

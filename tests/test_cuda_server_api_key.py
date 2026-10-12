@@ -37,6 +37,10 @@ def test_a_server_key_guards_every_route_but_health(tmp_path):
         assert call(port, "GET", "/v1/models", headers={"X-API-Key": "s3cret"})[0] == 200
         status, body = call(port, "POST", "/v1/chat/completions", request, {"Authorization": "bearer s3cret"})
         assert status == 200 and body["choices"][0]["message"]["content"] is not None
+        assert call(port, "POST", "/v1/responses", {"input": "hi", "max_output_tokens": 2})[0] == 401
+        for headers in ({"Authorization": "Bearer s3cret"}, {"X-API-Key": "s3cret"}):
+            status, body = call(port, "POST", "/v1/responses", {"input": "hi", "max_output_tokens": 2}, headers)
+            assert status == 200 and body["object"] == "response", body
 
 
 def test_no_server_key_means_open_routes(tmp_path):
