@@ -71,6 +71,23 @@ PREFILL_LENGTHS=8192,32768,65536,131072 TF_API_KEY=... \
 TF_API_KEY=... python3 tools/dsv41_clients.py 16 120
 ```
 
+## DeepSeek-V4.1-Flash-1017 (2026-10-19)
+
+The deployment moved to DeepSeek-V4.1-Flash-1017 (LibertAIDAI EXL3 2.9 bpw, the same tensor widths as the release
+above, with the same Keys `wo_b` overlay the old deployment served), same engine and settings. Same tools, the day of
+the cutover; the old row was measured just before it:
+
+| | earlier release | 1017 |
+|---|---|---|
+| TG code / prose / structured / c1_hard | 89.5 / 48.7 / 132.9 / 51.4 | 82.4 / 49.8 / 135.4 / 54.7 |
+| PP 8K / 32K / 64K / 128K | 1,449 / 2,121 / 2,249 / 2,146 | 1,449 / 2,075 / 2,228 / 2,077 |
+| 16 clients, aggregate | 126.9 | 126.0 |
+| KV pool (FP4 tokens) | 5,150,720 | 5,820,416 |
+
+Prefill and concurrency match within noise (the same engine). The code workload's drop is the drafter, not the step:
+1017's reply takes 109 rounds at 3.52 tokens each against 95 at 4.04 (c1_hard moves the other way, 2.01 against 1.68).
+Served on 1017: a 15-minute soak (318 requests, 0 errors, 0 sha splits) and the stress run were clean.
+
 ## Notes for comparing
 
 - TG excludes prefill (first-to-last content chunk); PP includes the first token. Both are per request, one request
